@@ -1,0 +1,205 @@
+<Window x:Class="ROROROblox.App.Plugins.ConsentSheet"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:loc="clr-namespace:ROROROblox.App.Localization"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{loc:Loc ConsentSheet_InstallPlugin}"
+        Width="560"
+        SizeToContent="Height"
+        MaxHeight="620"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource BgBrush}"
+        Icon="/ROROROblox.App;component/Tray/Resources/tray-on.ico">
+
+    <!-- F-120: the FOOTER is laid out first, and that ordering is the fix. This was a six-row Grid,
+         all rows Auto, buttons in the last row — and when ur-mcp's manifest (the tallest in the
+         family: longest description, six capabilities) pushed desired height past the window's
+         MaxHeight, WPF clipped bottom rows first. The Install button fell off a NoResize window
+         with nothing reporting it; Enter reached it only because it is IsDefault. A DockPanel
+         measures docked children in declaration order, so the buttons and the starts-now note —
+         declared first, docked Bottom — always get their space, and the flexible content above
+         absorbs any shortfall instead. The one thing a dialog footer must never do is lose. -->
+    <DockPanel Margin="32,28" LastChildFill="True">
+
+        <!-- Footer buttons — first in declaration, bottom of the window, unclippable (F-120). -->
+        <StackPanel DockPanel.Dock="Bottom"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button x:Name="CancelButton" Content="{loc:Loc ConsentSheet_Cancel}"
+                    Padding="18,8" Margin="0,0,8,0"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    IsCancel="True"
+                    Click="OnCancelClick" />
+            <Button x:Name="InstallButton" Style="{StaticResource CtaButtonStyle}" Content="{loc:Loc ConsentSheet_Install}"
+                    Padding="22,8"
+                    IsDefault="True"
+                    Click="OnInstallClick" />
+        </StackPanel>
+
+        <!-- Starts-now hint. The plugin process launches immediately once consent is granted;
+             the per-row Autostart toggle on the Plugins page governs future RoRoRo launches. -->
+        <Border DockPanel.Dock="Bottom"
+                Margin="0,14,0,0"
+                Padding="12,8"
+                Background="{DynamicResource RowBgBrush}"
+                BorderBrush="{DynamicResource CyanBrush}"
+                BorderThickness="0,0,0,2"
+                CornerRadius="6">
+            <TextBlock Text="{loc:Loc ConsentSheet_ThisPluginStartsAsSoon}"
+                       Foreground="{DynamicResource WhiteBrush}"
+                       FontSize="{DynamicResource BodyFontSize}"
+                       TextWrapping="Wrap"
+                       Opacity="0.9" />
+        </Border>
+
+        <!-- Everything that can flex fills what the footer left. -->
+        <Grid>
+            <!-- F-115 (amended by F-120): the list row is the star row now. F-115 feared a star row
+                 under SizeToContent would collapse the list, so it capped the Border instead; the
+                 cap stays (MaxHeight below), and under an infinite measure a star row is treated as
+                 Auto anyway, so a short manifest still gets a compact sheet. What the star adds is
+                 the CONSTRAINED case: when the window hits its MaxHeight, this row receives what is
+                 actually left after the docked footer, and the ScrollViewer takes over — which is
+                 what it was always for. MinHeight keeps a pathological description from squeezing
+                 the list to nothing; ConsentSheetFooterTests holds both ends of the bargain. -->
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- Header — plugin name + version -->
+            <StackPanel Grid.Row="0">
+            <TextBlock x:Name="HeaderTitle"
+                       FontSize="20" FontWeight="Bold"
+                       Foreground="{DynamicResource WhiteBrush}"
+                       TextWrapping="Wrap" />
+            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                <TextBlock x:Name="HeaderVersion"
+                           FontFamily="{DynamicResource MonoFontFamily}"
+                           FontSize="{DynamicResource MetaFontSize}"
+                           Foreground="{DynamicResource CyanBrush}" />
+                <TextBlock Text=" -- "
+                           FontSize="{DynamicResource BodyFontSize}"
+                           Foreground="{DynamicResource MutedTextBrush}"
+                           VerticalAlignment="Center"
+                           Margin="6,0,6,0" />
+                <TextBlock x:Name="HeaderPublisher"
+                           FontSize="{DynamicResource BodyFontSize}"
+                           Foreground="{DynamicResource MutedTextBrush}"
+                           VerticalAlignment="Center" />
+            </StackPanel>
+        </StackPanel>
+
+        <!-- Description block -->
+        <Border Grid.Row="1"
+                Margin="0,16,0,0"
+                Padding="14,10"
+                Background="{DynamicResource RowBgBrush}"
+                CornerRadius="8">
+            <TextBlock x:Name="HeaderDescription"
+                       Foreground="{DynamicResource WhiteBrush}"
+                       Opacity="0.85"
+                       FontSize="{DynamicResource BodyFontSize}"
+                       TextWrapping="Wrap" />
+        </Border>
+
+        <!-- Capability heading -->
+        <TextBlock Grid.Row="2"
+                   Text="{loc:Loc ConsentSheet_ThisPluginAsksFor}"
+                   FontFamily="{DynamicResource MonoFontFamily}"
+                   FontSize="{DynamicResource MetaFontSize}"
+                   Foreground="{DynamicResource MutedTextBrush}"
+                   Margin="0,18,0,8" />
+
+        <!-- Capability list -->
+        <!-- MaxHeight lives HERE rather than on the row, because SizeToContent collapses a star row
+             to its minimum and would have hidden this list entirely. The Border grows with the
+             manifest up to this cap and the ScrollViewer takes it from there (F-115). -->
+        <Border Grid.Row="3"
+                x:Name="CapabilityFrame"
+                MaxHeight="280"
+                MinHeight="96"
+                VerticalAlignment="Top"
+                BorderBrush="{DynamicResource DividerBrush}"
+                BorderThickness="1"
+                CornerRadius="8">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <ItemsControl x:Name="CapabilityList" Margin="8">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{DynamicResource RowBgBrush}"
+                                    CornerRadius="6"
+                                    Padding="12,10"
+                                    Margin="0,0,0,6">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox Grid.Column="0"
+                                              IsChecked="{Binding IsGranted, Mode=TwoWay}" AutomationProperties.Name="{loc:Loc ConsentSheet_GrantThisCapability}"
+                                              VerticalAlignment="Top"
+                                              Margin="0,2,12,0" />
+                                    <StackPanel Grid.Column="1">
+                                        <!-- The capability id is tinted by which namespace it is in.
+                                             This was a NamespaceBrush property on the row model
+                                             resolving brushes through TryFindResource with literal
+                                             fallbacks (F-087). Two things were wrong with that: a
+                                             converter or property that resolves a brush at read
+                                             time hands back the instance it found, and
+                                             ThemeService.ApplySlot REPLACES instances rather than
+                                             mutating them, so the sheet kept whatever was current
+                                             when the row was built; and the literal fallback
+                                             silently painted brand hues onto a themed field when
+                                             the dictionary was not loaded. A DynamicResource that
+                                             fails to resolve is a bug to surface, not to paper
+                                             over.
+                                             The tint is a SECOND carrier, never the only one: under
+                                             magenta-heat Cyan and Magenta are the same value, so
+                                             the two namespaces render identically there. What
+                                             actually distinguishes them is NamespaceLabel below,
+                                             which says either "RoRoRo enforces this on every call."
+                                             or "Runs on your machine". Same ruling as the warning
+                                             banners this cycle — the words carry it. -->
+                                        <TextBlock Text="{Binding Id}"
+                                                   FontFamily="{DynamicResource MonoFontFamily}"
+                                                   FontSize="{DynamicResource MetaFontSize}"
+                                                   TextWrapping="Wrap">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <!-- system.*: runs on the user's machine. -->
+                                                    <Setter Property="Foreground" Value="{DynamicResource MagentaBrush}" />
+                                                    <Style.Triggers>
+                                                        <!-- host.*: RoRoRo enforces it at the interceptor. -->
+                                                        <DataTrigger Binding="{Binding IsHostEnforced}" Value="True">
+                                                            <Setter Property="Foreground" Value="{DynamicResource CyanBrush}" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding Display}"
+                                                   FontSize="{DynamicResource BodyFontSize}"
+                                                   Foreground="{DynamicResource WhiteBrush}"
+                                                   TextWrapping="Wrap"
+                                                   Margin="0,3,0,0" />
+                                        <TextBlock Text="{Binding NamespaceLabel}"
+                                                   FontSize="{DynamicResource MetaFontSize}"
+                                                   Foreground="{DynamicResource MutedTextBrush}"
+                                                   Margin="0,4,0,0" />
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </Border>
+
+        </Grid>
+    </DockPanel>
+</Window>

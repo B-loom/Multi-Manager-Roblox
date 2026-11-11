@@ -1,0 +1,348 @@
+using System.IO;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace ROROROblox.Core.Theming;
+
+/// <summary>
+/// Default <see cref="IThemeStore"/> backed by built-in records + a JSON folder. Sanduhr-shape:
+/// drop a file, theme appears at next list. Failures (missing fields, bad hex) are logged + the
+/// file is skipped — never thrown — so a malformed user theme never breaks the picker.
+/// </summary>
+public sealed class ThemeStore : IThemeStore
+{
+    // snake_case JSON → PascalCase record properties. Mirrors Sanduhr's convention so the
+    // AGENT_PROMPT examples are copy-paste compatible across both apps.
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
+
+    private readonly string _userThemesFolder;
+    private readonly IReadOnlyList<Theme> _builtIns;
+
+    public ThemeStore() : this(DefaultUserThemesFolder()) { }
+
+    public ThemeStore(string userThemesFolder)
+    {
+        _userThemesFolder = userThemesFolder ?? throw new ArgumentNullException(nameof(userThemesFolder));
+        _builtIns = BuildBuiltIns();
+    }
+
+    public string UserThemesFolder => _userThemesFolder;
+
+    public static string DefaultUserThemesFolder()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return Path.Combine(localAppData, "ROROROblox", "themes");
+    }
+
+    public async Task<IReadOnlyList<Theme>> ListAsync()
+    {
+        var combined = new List<Theme>(_builtIns);
+
+        try
+        {
+            Directory.CreateDirectory(_userThemesFolder);
+        }
+        catch
+        {
+            return combined;
+        }
+
+        IEnumerable<FileInfo> files;
+        try
+        {
+            files = new DirectoryInfo(_userThemesFolder)
+                .EnumerateFiles("*.json", SearchOption.TopDirectoryOnly)
+                .OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return combined;
+        }
+
+        foreach (var file in files)
+        {
+            var theme = await TryLoadFileAsync(file).ConfigureAwait(false);
+            if (theme is null) continue;
+            // Drop user themes that collide with a built-in id — the built-in wins. Filename-id
+            // is the stable handle, so the user can rename their file to reclaim the slot.
+            if (combined.Any(t => string.Equals(t.Id, theme.Id, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+            combined.Add(theme);
+        }
+
+        return combined;
+    }
+
+    public async Task<Theme?> GetByIdAsync(string id)
+    {
+        var list = await ListAsync().ConfigureAwait(false);
+        return list.FirstOrDefault(t => string.Equals(t.Id, id, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<Theme?> TryLoadFileAsync(FileInfo file)
+    {
+        try
+        {
+            await using var stream = File.OpenRead(file.FullName);
+            var raw = await JsonSerializer.DeserializeAsync<RawTheme>(stream, JsonOptions).ConfigureAwait(false);
+            if (raw is null)
+            {
+                return null;
+            }
+
+            // Filename minus .json -> theme id. Lowercase-kebab is the convention; we don't
+            // enforce it — just pass through.
+            var id = Path.GetFileNameWithoutExtension(file.Name);
+            return raw.ToTheme(id, isBuiltIn: false);
+        }
+        catch
+        {
+            // Malformed JSON, missing required field, bad hex — silently drop. UI shows what's
+            // valid; a user troubleshooting can check the log to see why a file didn't appear.
+            return null;
+        }
+    }
+
+    public async Task<Theme> SaveUserThemeAsync(string rawJson)
+    {
+        var (theme, canonical) = ParseUserTheme(rawJson);
+
+        Directory.CreateDirectory(_userThemesFolder);
+        var path = Path.Combine(_userThemesFolder, theme.Id + ".json");
+        var tempPath = path + ".tmp";
+        await File.WriteAllBytesAsync(tempPath, canonical).ConfigureAwait(false);
+        File.Move(tempPath, path, overwrite: true);
+
+        return theme;
+    }
+
+    /// <summary>
+    /// The one place a user theme's JSON is read and validated. <see cref="SaveUserThemeAsync"/>
+    /// calls it, and so does <see cref="ThemeShare"/>: an imported file passes the exact checks a
+    /// pasted one does. Returns the theme plus the canonical bytes the store would write for it.
+    /// Throws <see cref="InvalidThemeException"/> on any refusal.
+    /// </summary>
+    internal static (Theme Theme, byte[] CanonicalBytes) ParseUserTheme(string rawJson)
+    {
+        if (string.IsNullOrWhiteSpace(rawJson))
+        {
+            throw new InvalidThemeException(InvalidThemeKind.EmptyInput);
+        }
+
+        RawTheme? raw;
+        try
+        {
+            raw = JsonSerializer.Deserialize<RawTheme>(rawJson, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            // Detail is the parser's own reason — diagnostic data the App drops into the localized
+            // template's {0} slot, exactly as CoreMessageCatalog handles an exception's text elsewhere.
+            throw new InvalidThemeException(InvalidThemeKind.UnreadableJson, ex, ex.Message);
+        }
+
+        if (raw is null)
+        {
+            throw new InvalidThemeException(InvalidThemeKind.NullPayload);
+        }
+
+        if (string.IsNullOrWhiteSpace(raw.Name))
+        {
+            throw new InvalidThemeException(InvalidThemeKind.MissingName);
+        }
+
+        // Filename derivation. lowercase + only alphanumeric/dash; spaces and other punctuation
+        // collapse to single dashes. Two themes with similar names that normalize to the same
+        // id will overwrite each other; that's acceptable for "the user pastes again" UX.
+        var id = ToKebabId(raw.Name);
+        if (string.IsNullOrEmpty(id))
+        {
+            throw new InvalidThemeException(InvalidThemeKind.EmptyFilename);
+        }
+
+        // Validate by constructing the Theme — this throws on the first missing required field,
+        // naming it in the exception text. That name is the Detail (data) the App drops into the
+        // localized "missing a required field: {0}" template.
+        Theme theme;
+        try
+        {
+            theme = raw.ToTheme(id, isBuiltIn: false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidThemeException(InvalidThemeKind.MissingField, ex, ex.Message);
+        }
+
+        // Round-trip via the canonical RawTheme shape so we don't accidentally save extra fields
+        // a future Theme version might add (Id, IsBuiltIn) — those are inferred at load time.
+        var canonical = JsonSerializer.SerializeToUtf8Bytes(raw, JsonOptions);
+        return (theme, canonical);
+    }
+
+    /// <summary>The JSON <see cref="SaveUserThemeAsync"/> would write for this theme: same keys, same casing.</summary>
+    internal static byte[] ToCanonicalBytes(Theme theme)
+    {
+        var raw = new RawTheme(
+            theme.Name, theme.Bg, theme.Cyan, theme.Magenta, theme.White, theme.MutedText,
+            theme.Divider, theme.RowBg, theme.RowExpiredBg, theme.RowExpiredAccent, theme.Navy);
+        return JsonSerializer.SerializeToUtf8Bytes(raw, JsonOptions);
+    }
+
+    internal static bool IsBuiltInId(string id) =>
+        BuildBuiltIns().Any(t => string.Equals(t.Id, id, StringComparison.OrdinalIgnoreCase));
+
+    private static string ToKebabId(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length);
+        var lastWasDash = false;
+        foreach (var ch in name.ToLowerInvariant())
+        {
+            if (char.IsLetterOrDigit(ch))
+            {
+                sb.Append(ch);
+                lastWasDash = false;
+            }
+            else if (!lastWasDash && sb.Length > 0)
+            {
+                sb.Append('-');
+                lastWasDash = true;
+            }
+        }
+        // Trim trailing dash.
+        while (sb.Length > 0 && sb[^1] == '-')
+        {
+            sb.Length--;
+        }
+        return sb.ToString();
+    }
+
+    private static IReadOnlyList<Theme> BuildBuiltIns() => new List<Theme>
+    {
+        // Brand — the original 626 Labs cyan + magenta on navy. v1.1 default.
+        new Theme(
+            Id: "brand",
+            Name: "Galaxy",
+            Bg: "#0B0720",
+            Cyan: "#B69CFF",
+            Magenta: "#FF5FD2",
+            White: "#FFFFFF",
+            MutedText: "#A59CC8",
+            Divider: "#2A1F55",
+            RowBg: "#150E36",
+            RowExpiredBg: "#3A2D14",
+            RowExpiredAccent: "#F1B232",
+            Navy: "#0B0720",
+            IsBuiltIn: true),
+        // Midnight — colder + dimmer for late-night play sessions. Same brand hues, lower
+        // saturation, slightly darker base so the rows recede until you focus on them.
+        new Theme(
+            Id: "midnight",
+            Name: "Midnight",
+            Bg: "#0A1320",
+            Cyan: "#3FB8D9",
+            Magenta: "#C0407E",
+            White: "#E6EDF5",
+            // Was #6F7E92 until v1.21 item 6, which measured 4.19:1 against this theme's own RowBg
+            // — under AA, shipped, and unmeasured by anything: no element declares the prose token
+            // with a fill inline, so the contrast gate could not see the pair at all (F-086). It
+            // also sat at exactly 4.504 on Bg/Navy, the thinnest margin in the app.
+            // #768598 is a 6% blend toward this theme's own White, the smallest step that clears
+            // the floor with headroom: RowBg 4.19 -> 4.60, Bg/Navy 4.50 -> 4.95. Against White it
+            // drops 3.51 -> 3.19, which costs nothing — F-032 moved the quiet/loud distinction off
+            // colour and onto weight, and MutedTextFenceTests is what holds it there.
+            MutedText: "#768598",
+            Divider: "#162232",
+            RowBg: "#0F1B2B",
+            RowExpiredBg: "#241B0E",
+            RowExpiredAccent: "#C99A2D",
+            Navy: "#0A1320",
+            IsBuiltIn: true),
+        // Magenta Heat — magenta-forward; flips the brand emphasis. Cyan keeps subtle accent
+        // duty on selection dots + status. Designed to make Squad Launch / Stop CTAs lead.
+        new Theme(
+            Id: "magenta-heat",
+            Name: "Magenta Heat",
+            Bg: "#1A0F1F",
+            Cyan: "#F22F89",
+            Magenta: "#F22F89",
+            White: "#FFE9F4",
+            MutedText: "#B091A2",
+            Divider: "#2D1832",
+            RowBg: "#241432",
+            RowExpiredBg: "#3A2D14",
+            RowExpiredAccent: "#F1B232",
+            Navy: "#1A0F1F",
+            IsBuiltIn: true),
+        // Flatline — carries no meaning in colour. One page, one row surface, one text colour,
+        // one light accent and one dark accent. Achromatic throughout: nothing here encodes a
+        // hue, so nothing here is lost to colour vision deficiency, a bad panel, or direct sun.
+        new Theme(
+            Id: "flatline",
+            Name: "Flatline",
+            Bg: "#101010",
+            Cyan: "#D4D4D4",
+            Magenta: "#6E6E6E",
+            White: "#F5F5F5",
+            MutedText: "#989898",
+            Divider: "#333333",
+            RowBg: "#2A2A2A",
+            RowExpiredBg: "#3D3D3D",
+            RowExpiredAccent: "#D4D4D4",
+            Navy: "#101010",
+            IsBuiltIn: true),
+    };
+
+    /// <summary>On-disk shape — same field set as <see cref="Theme"/> minus the id (which comes
+    /// from the filename). <b>snake_case JSON ↔ PascalCase property</b> via
+    /// <see cref="JsonOptions"/>'s <c>SnakeCaseLower</c> policy — so the on-disk keys are
+    /// <c>muted_text</c>, <c>row_bg</c>, <c>row_expired_bg</c>, <c>row_expired_accent</c>.
+    /// <para>
+    /// This comment said "Camelcase" until 2026-08-10 and was wrong, which is worth a sentence
+    /// because of how it fails: a camelCase key deserializes to null, <see cref="ToTheme"/> throws,
+    /// and <c>TryLoadFileAsync</c> catches and drops the file — so a theme written to this comment's
+    /// instructions vanishes with no error, which is F-053's exact complaint. Caught when a hand-written
+    /// test theme was rejected during the v1.18 C2 walk. The user-facing docs
+    /// (<c>docs/themes/template.json</c>, <c>AGENT_PROMPT.md</c>, the shipped example) were all
+    /// correct throughout; only this one misled, and only a maintainer.
+    /// </para></summary>
+    private sealed record RawTheme(
+        string? Name,
+        string? Bg,
+        string? Cyan,
+        string? Magenta,
+        string? White,
+        string? MutedText,
+        string? Divider,
+        string? RowBg,
+        string? RowExpiredBg,
+        string? RowExpiredAccent,
+        string? Navy)
+    {
+        public Theme ToTheme(string id, bool isBuiltIn)
+        {
+            // Required fields throw via the Theme record — bg/cyan/magenta/etc. must be present.
+            // We let the throw propagate to TryLoadFileAsync's catch, which silently drops the file.
+            return new Theme(
+                Id: id,
+                Name: Name ?? id,
+                Bg: Bg ?? throw new InvalidOperationException("bg is required"),
+                Cyan: Cyan ?? throw new InvalidOperationException("cyan is required"),
+                Magenta: Magenta ?? throw new InvalidOperationException("magenta is required"),
+                White: White ?? throw new InvalidOperationException("white is required"),
+                MutedText: MutedText ?? throw new InvalidOperationException("mutedText is required"),
+                Divider: Divider ?? throw new InvalidOperationException("divider is required"),
+                RowBg: RowBg ?? throw new InvalidOperationException("rowBg is required"),
+                RowExpiredBg: RowExpiredBg ?? throw new InvalidOperationException("rowExpiredBg is required"),
+                RowExpiredAccent: RowExpiredAccent ?? throw new InvalidOperationException("rowExpiredAccent is required"),
+                Navy: Navy ?? throw new InvalidOperationException("navy is required"),
+                IsBuiltIn: isBuiltIn);
+        }
+    }
+}

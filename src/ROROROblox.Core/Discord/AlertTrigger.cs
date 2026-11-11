@@ -1,0 +1,163 @@
+using ROROROblox.Core.Metrics;
+
+namespace ROROROblox.Core.Discord;
+
+/// <summary>
+/// The things worth waking someone up for. NOT extensible without a design decision:
+/// session-expired and landed-elsewhere were considered and cut (spec §11), and
+/// <see cref="MetricBreach"/> was added only with a written design
+/// (specs/2026-09-09-external-metric-alerts-design.md).
+/// </summary>
+public enum AlertKind
+{
+    AccountDroppedOut,
+    MemoryWarning,
+
+    /// <summary>A recycle completed — row button, plugin, or any future auto path. The
+    /// away-from-PC completion notice (Este, 2026-09-05).</summary>
+    Recycled,
+
+    /// <summary>The periodic all-good mark while accounts are running (every 2 hours,
+    /// <c>UptimeMarkTracker</c>). Its ABSENCE is the only dead-PC signal a PC-fired alert
+    /// system can give. Carrier AccountId is Guid.Empty — a global mark must not be silenced
+    /// by any one account's mute.</summary>
+    UptimeMark,
+
+    /// <summary>A user-configured metric crossed its rule — a contribution rate fell below a
+    /// floor, a level crossed a threshold, a tracked value changed. The number arrives from
+    /// outside the app; the RULE is evaluated here so this kind inherits mute, cooldown and
+    /// coalescing like every other.</summary>
+    MetricBreach,
+
+    /// <summary>
+    /// A metric that had breached its rule is back on the right side of it. The companion to
+    /// <see cref="MetricBreach"/> and the reason it can be trusted: once a breach is announced
+    /// ONCE, on the crossing, silence afterwards means "still bad" and nothing distinguishes it
+    /// from "nothing is wrong". This is the buzz that lets you stop watching.
+    /// <para>
+    /// Opt-in per rule (<c>MetricRule.TellMeWhenItRecovers</c>), because it doubles how often a
+    /// rule can speak. It goes wherever its breach goes — <c>DiscordConfig.DestinationsFor</c>
+    /// maps it to the same destinations — since anyone who wanted the bad news here wants the
+    /// good news here too, and a second settings row for it would be a worse question to ask.
+    /// </para>
+    /// </summary>
+    MetricRecovered,
+
+    /// <summary>
+    /// Auto-rejoin gave up on an account — either the monitor's own Pause action (the 4th drop in
+    /// an hour) or a pending relaunch that failed <c>MainViewModel.PendingRelaunchMaxAttempts</c>
+    /// times in a row (task 10, 2026-09-29). Routed the same as <see cref="AccountDroppedOut"/> by
+    /// default (<c>DiscordConfig.AutoRejoinPausedDestinations</c>): it is the same kind of news —
+    /// something stopped watching an account and someone should know. <see
+    /// cref="AlertTrigger.PauseReason"/> carries which of the two reasons fired, since the two
+    /// read as different sentences even though both end the same way (paused until turned back on).
+    /// APPENDED LAST, so the existing numeric values (serialized nowhere today, but kept stable on
+    /// principle with every other kind here) never shift under an older build.
+    /// </summary>
+    AutoRejoinPaused,
+
+    /// <summary>
+    /// An account crossed the idle-warn threshold — nobody has given it input while its window was
+    /// in front for <c>settings:idleWarnThresholdMinutes</c> (15 by default). The coalesced,
+    /// edge-triggered crossing <c>ActivityMonitor</c> has raised since v1.8, which until v1.33
+    /// reached the screen through <c>IdleAlertPresenter</c>: its own path, honouring one mute flag,
+    /// no destinations, no cadence, no per-account mute. Promoting it to a kind deletes that third
+    /// path (spec §1) rather than teaching it the routing rules a second time.
+    /// <para>
+    /// The latch stays where it is. <c>ActivityMonitor</c>'s per-account <c>WarnLatched</c> answers
+    /// "has this account NEWLY gone idle", which is a different question from "may we speak about
+    /// it" — the first is the event, the second is <see cref="AlertRouter"/>'s to answer. Conflating
+    /// the two is how the memory cap and the alert cooldown got confused with each other.
+    /// </para>
+    /// <para>
+    /// APPENDED LAST, same as <see cref="AutoRejoinPaused"/> and for the same reason: these values
+    /// are the identity every destination list, cooldown key and per-kind cadence override is keyed
+    /// on, so a kind landing anywhere but the end renumbers the ones after it.
+    /// </para>
+    /// </summary>
+    AccountIdle,
+}
+
+/// <summary>
+/// Which of the two things that pause auto-rejoin actually happened, carried on an
+/// <see cref="AlertTrigger"/> of <see cref="AlertKind.AutoRejoinPaused"/> so <see
+/// cref="ROROROblox.Core.Discord.WebhookPayload"/> and the desktop toast can say the true
+/// sentence instead of a single copy that is right for one case and wrong for the other.
+/// </summary>
+public enum AutoRejoinPauseReason
+{
+    /// <summary>The monitor's own Pause action: the account dropped out and was rejoined 3 times
+    /// inside an hour, and a 4th drop pauses it rather than spending a 4th rejoin.</summary>
+    RepeatedDrops,
+
+    /// <summary>A relaunch stayed pending and failed <c>MainViewModel.PendingRelaunchMaxAttempts</c>
+    /// times in a row; auto-rejoin gives up on it rather than retrying forever.</summary>
+    RelaunchFailed,
+}
+
+/// <summary>
+/// One alert-worthy event, carrying BOTH names.
+/// <para>
+/// <paramref name="DisplayName"/> is already rendered through streamer mode by the caller — it is
+/// what every destination gets by default. <paramref name="RealName"/> is the actual account name,
+/// and exactly one destination is allowed to use it: the clan channel.
+/// </para>
+/// <para>
+/// Streamer mode exists to stop alt names reaching an audience the user did not choose — a stream,
+/// a screenshot, a friends list. A clan channel is the opposite: a room the user deliberately
+/// joined, full of people who already know which accounts are theirs. Masking there produces a
+/// board of invented names nobody can act on, which is worse than useless in the one place the
+/// information is meant to be shared.
+/// </para>
+/// <para>
+/// The residual risk, stated once so it is not rediscovered: a clan channel visible on a second
+/// monitor while streaming leaks real names anyway. That is a "don't show your clan channel on
+/// stream" problem, not something this type can solve — but it IS the reason no other destination
+/// gets <paramref name="RealName"/>.
+/// </para>
+/// <para>
+/// <paramref name="MetricValue"/> is the observed number behind a <see cref="AlertKind.MetricBreach"/>,
+/// and it is TRAILING and OPTIONAL on purpose: the four older kinds and every existing construction
+/// site compile untouched, so widening the record costs them nothing. It exists because
+/// <paramref name="PrivateBytes"/> is a <c>long?</c> — a byte count, honestly — and pouring a metric
+/// through it truncated every fraction, so a Level rule on a 0.0-1.0 ratio rendered "at 0" for 0.79
+/// and for nothing at all alike. That is the unknown-is-not-zero conflation the metric core defends
+/// against in three places; it must not come back at the display layer. Null for every other kind.
+/// </para>
+/// <para>
+/// <paramref name="Rule"/> is the <see cref="MetricRule"/> that breached, for a
+/// <see cref="AlertKind.MetricBreach"/> only — trailing and optional for the same reason as
+/// <paramref name="MetricValue"/>. It exists because the alert has to say WHAT fired (label, kind,
+/// threshold, window, direction), and through 1.28 nothing past the coordinator knew, so every post
+/// read "ps99.diamonds at 2974993" (live test, 2026-09-15). It is also the grouping key
+/// <c>MetricBreachBatcher</c> uses. <paramref name="GameName"/> keeps carrying the metric id.
+/// </para>
+/// <para>
+/// <paramref name="PauseReason"/> is which of the two things paused auto-rejoin, for a
+/// <see cref="AlertKind.AutoRejoinPaused"/> only — trailing and optional for the same "every older
+/// construction site compiles untouched" reason as <paramref name="MetricValue"/> and
+/// <paramref name="Rule"/> (task 10, 2026-09-29). Repeated drops and a failed relaunch are the same
+/// KIND of news (auto-rejoin stopped watching this account) but different SENTENCES, and without
+/// this field the two would have to share one copy that is wrong for whichever case it wasn't
+/// written for.
+/// </para>
+/// <para>
+/// <paramref name="NotRunningHere"/> marks a metric trigger whose account is saved but not running on
+/// this PC at observation time (2026-10-19 ruling). The trigger still exists, because the metric
+/// crossed its rule on the same numbers as before, but the alert text must not NAME it: an alt that
+/// is not running here sends the user to the wrong machine. Trailing and optional for the same
+/// "every older construction site compiles untouched" reason as the fields above.
+/// </para>
+/// </summary>
+public sealed record AlertTrigger(
+    AlertKind Kind,
+    Guid AccountId,
+    string DisplayName,
+    string RealName,
+    string? GameName,
+    long? PrivateBytes,
+    DateTimeOffset OccurredAtUtc,
+    double? MetricValue = null,
+    MetricRule? Rule = null,
+    AutoRejoinPauseReason? PauseReason = null,
+    bool NotRunningHere = false);

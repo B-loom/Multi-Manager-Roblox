@@ -1,0 +1,113 @@
+<Window x:Class="ROROROblox.App.CookieCapture.CookieCaptureWindow"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:loc="clr-namespace:ROROROblox.App.Localization"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="{loc:Loc CookieCaptureWindow_AddAccount}"
+        Height="700" Width="1024"
+        MinHeight="560" MinWidth="800" ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource BgBrush}"
+        Icon="/ROROROblox.App;component/Tray/Resources/tray-on.ico">
+    <!-- F-114. This window bound ZERO theme brushes and carried 14 hex literals — the one surface
+         every new user meets, rendering the brand palette on a field they may have themed to
+         something else, and the only window in the app that did not change under flatline. It was
+         counted in F-066's "out of scope modals" bucket and came into scope when wave 13 put its
+         copy on the table.
+
+         TWO CALLS WORTH STATING, because both had a nearest-match answer that would have been
+         wrong. #5CE6FF was a brighter cyan than any slot holds and is now CyanBrush: no eleventh
+         slot (invariant 6 — the contract does not grow), and "brighter than the theme's cyan" is
+         not a thing a user theme can promise. #FF5FD2 on the rejection hint is now
+         RowExpiredAccentBrush rather than MagentaBrush — that line is a FAILURE message, and the
+         expired accent is the app's failure colour. It happens to be byte-identical in brand, which
+         is exactly why binding it to the brand duo would have looked correct and meant nothing. -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="{DynamicResource NavyBrush}" Padding="16,12">
+            <StackPanel>
+                <TextBlock Text="{loc:Loc CookieCaptureWindow_AddARobloxAccount}"
+                           FontSize="{DynamicResource HeadingFontSize}" FontWeight="Bold"
+                           Foreground="{DynamicResource CyanBrush}" />
+                <TextBlock FontSize="{DynamicResource BodyFontSize}"
+                           Foreground="{DynamicResource WhiteBrush}"
+                           Opacity="0.9"
+                           Margin="0,4,0,0"
+                           TextWrapping="Wrap">
+                    <Run Text="{loc:Loc CookieCaptureWindow_YourPasswordGoesOnlyTo}" />
+                    <Run Text="roblox.com" FontWeight="Bold" />
+                    <Run Text="{loc:Loc CookieCaptureWindow_OverHttpsInsideThisEmbedded}" />
+                </TextBlock>
+                <TextBlock FontSize="{DynamicResource BodyFontSize}"
+                           Foreground="{DynamicResource WhiteBrush}"
+                           Opacity="0.7"
+                           Margin="0,2,0,0"
+                           TextWrapping="Wrap">
+                    <Run Text="{loc:Loc CookieCaptureWindow_WeCaptureOnlyTheSession}" />
+                </TextBlock>
+                <Border Margin="0,8,0,0" Padding="10,8"
+                        Background="{DynamicResource RowBgBrush}" CornerRadius="4">
+                    <StackPanel>
+                        <TextBlock FontSize="{DynamicResource BodyFontSize}" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource CyanBrush}">
+                            <Run Text="{loc:Loc CookieCaptureWindow_IfThePageIsBlank}" />
+                        </TextBlock>
+                        <TextBlock FontSize="{DynamicResource BodyFontSize}"
+                                   Foreground="{DynamicResource WhiteBrush}"
+                                   Opacity="0.85"
+                                   Margin="0,2,0,0"
+                                   TextWrapping="Wrap">
+                            <Run Text="{loc:Loc CookieCaptureWindow_TheEmbeddedBrowserSometimesLoads}" />
+                        </TextBlock>
+                        <!-- Shown from code-behind after Roblox rejects a captured session cookie
+                             (mid-2FA partial login, or a session Roblox won't honor). -->
+                        <TextBlock x:Name="RejectionHint"
+                                   FontSize="{DynamicResource BodyFontSize}" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource RowExpiredAccentBrush}"
+                                   Margin="0,6,0,0"
+                                   TextWrapping="Wrap"
+                                   Visibility="Collapsed">
+                            <Run Text="{loc:Loc CookieCaptureWindow_RobloxHasnTAcceptedThis}" />
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <wv:WebView2 x:Name="WebView" />
+
+            <!-- Loading overlay; shown until the first NavigationCompleted fires successfully.
+                 Covers the slow CoreWebView2Environment.CreateAsync + EnsureCoreWebView2Async
+                 + first Navigate pre-render window. Hidden in code-behind once roblox.com paints. -->
+            <Border x:Name="LoadingOverlay"
+                    Background="{DynamicResource BgBrush}">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="{loc:Loc CookieCaptureWindow_LoadingRobloxCom}"
+                               Foreground="{DynamicResource CyanBrush}"
+                               FontSize="{DynamicResource HeadingFontSize}" FontWeight="SemiBold"
+                               HorizontalAlignment="Center"
+                               Margin="0,0,0,12" />
+                    <ProgressBar IsIndeterminate="True"
+                                 Width="200" Height="4"
+                                 Foreground="{DynamicResource CyanBrush}"
+                                 Background="{DynamicResource RowBgBrush}"
+                                 BorderThickness="0" />
+                    <TextBlock Text="{loc:Loc CookieCaptureWindow_FirstOpenCanTakeA}"
+                               Foreground="{DynamicResource WhiteBrush}"
+                               Opacity="0.65"
+                               FontSize="{DynamicResource BodyFontSize}"
+                               Margin="0,12,0,0"
+                               HorizontalAlignment="Center"
+                               TextWrapping="Wrap"
+                               MaxWidth="300" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

@@ -1,0 +1,206 @@
+# RORORO -- tag-triggered release pipeline.
+#
+# Trigger: pushing a tag matching `v*.*.*` or `v*.*.*.*` (e.g. v1.1.2.0).
+# Output: a DRAFT GitHub Release with rororo-win-Setup.exe + delta nupkg + releases.win.json
+# attached. Maintainer reviews assets + notes, then clicks Publish.
+#
+# To auto-publish (skip the draft step), use Actions -> Release -> Run workflow with
+# publish=true. Tag-push always produces a draft so a botched build can't go live silently.
+#
+# Why Windows runner: WPF + System.Drawing PNG generation + Velopack Setup.exe builder
+# are all Windows-only.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 1.1.2.0)'
+        required: true
+        type: string
+      publish:
+        description: 'Auto-publish (vs draft)'
+        required: false
+        type: boolean
+        default: false
+      pre:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create + upload to Releases
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+
+jobs:
+  release:
+    name: build + pack + upload
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # vpk reads tag history when computing deltas
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk
+
+      - name: Resolve version + tag
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            $v = $tag -replace '^v', ''
+          } else {
+            $v = '${{ inputs.version }}'
+            $tag = "v$v"
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Invalid version: '$v'. Expected semver-ish (e.g. 1.1.2.0)."
+          }
+          "version=$v" | Out-File $env:GITHUB_OUTPUT -Append
+          "tag=$tag"   | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved: $tag (version $v)"
+
+      - name: Restore
+        run: dotnet restore ROROROblox.slnx
+
+      - name: Test
+        run: dotnet test ROROROblox.slnx --configuration Release --no-restore --logger "console;verbosity=minimal"
+
+      - name: Check plugin catalog drift
+        # Fails the tag when docs/store/plugins-catalog.json latestVersion disagrees with a
+        # plugin repo's latest release. Public repos; the default token is enough.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: pwsh -File scripts/check-plugin-catalog-drift.ps1
+
+      - name: Fetch prior release (for delta generation)
+        # First-ever release: no prior release exists -> non-zero exit -> tolerated.
+        # All subsequent releases: this populates dist/release/ with the previous
+        # *-full.nupkg so `vpk pack` can compute a delta against it.
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path 'dist/release' -Force | Out-Null
+          vpk download github `
+            --repoUrl "https://github.com/${{ github.repository }}" `
+            --token "$env:GITHUB_TOKEN" `
+            --outputDir 'dist/release'
+
+      - name: Build Velopack release
+        shell: pwsh
+        run: |
+          pwsh scripts/build-velopack-release.ps1 `
+            -Version '${{ steps.ver.outputs.version }}' `
+            -NoClean
+
+      - name: Upload artifacts (audit trail)
+        uses: actions/upload-artifact@v4
+        with:
+          name: velopack-${{ steps.ver.outputs.version }}
+          path: dist/release/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish to GitHub Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $args = @(
+            'upload', 'github'
+            '--repoUrl',     "https://github.com/${{ github.repository }}"
+            '--token',       "$env:GITHUB_TOKEN"
+            '--tag',         '${{ steps.ver.outputs.tag }}'
+            '--releaseName', 'RoRoRo ${{ steps.ver.outputs.tag }}'
+            '--outputDir',   'dist/release'
+            '--merge'
+          )
+          if ('${{ inputs.publish }}' -eq 'true') { $args += '--publish' }
+          if ('${{ inputs.pre }}'     -eq 'true') { $args += '--pre' }
+          Write-Host "vpk $($args -join ' ')"
+          vpk @args
+          if ($LASTEXITCODE -ne 0) { throw "vpk upload failed (exit $LASTEXITCODE)" }
+
+      - name: Sign compat config
+        env:
+          ROBLOXCOMPAT_SIGNING_KEY: ${{ secrets.ROBLOXCOMPAT_SIGNING_KEY }}
+        shell: pwsh
+        run: |
+          # Detached-signs roblox-compat.json (ECDSA P-256/SHA-256, ported from 626-mod-launcher's
+          # manifest-signing pattern) so RobloxCompatChecker.FetchConfigAsync can verify the raw
+          # bytes before deserializing. Fails the build hard on a missing/bad key rather than ever
+          # publishing an unsigned-but-expected roblox-compat.json.
+          $compatPath = (Resolve-Path 'roblox-compat.json').Path
+          dotnet run --project tools/CompatSigner --configuration Release -- $compatPath
+          if ($LASTEXITCODE -ne 0) { throw "CompatSigner failed (exit $LASTEXITCODE)" }
+          # known-issues.json is validated by the app's own parser, then signed with the same key, so
+          # KnownIssuesFeed can verify it exactly as RobloxCompatChecker verifies roblox-compat.json.
+          $issuesPath = (Resolve-Path 'known-issues.json').Path
+          dotnet run --project tools/CompatSigner --configuration Release -- --validate-known-issues $issuesPath
+          if ($LASTEXITCODE -ne 0) { throw "known-issues.json failed validation (exit $LASTEXITCODE)" }
+          dotnet run --project tools/CompatSigner --configuration Release -- $issuesPath
+          if ($LASTEXITCODE -ne 0) { throw "CompatSigner failed on known-issues.json (exit $LASTEXITCODE)" }
+
+      - name: Upload remote compat config
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          # roblox-compat.json (known-good Roblox version range + singleton mutex name) must ride on
+          # every release so releases/latest/download/roblox-compat.json resolves. The app fetches it
+          # at startup for the version-drift banner + the config-driven mutex name, and VERIFIES the
+          # fetched bytes against the pinned RobloxCompatSigningKey before trusting them — so
+          # roblox-compat.json.sig (produced by the "Sign compat config" step above) must ride
+          # alongside it on every release. A missing/invalid signature means the app treats it as no
+          # update available (fail-quiet to the existing safe defaults) — never a crash, never a
+          # fallback to unverified content.
+          gh release upload '${{ steps.ver.outputs.tag }}' roblox-compat.json roblox-compat.json.sig --clobber
+          # plugins-catalog.json rides the same way: the marketplace (unpackaged builds only) fetches
+          # releases/latest/download/plugins-catalog.json. Missing asset = 404 = empty Available
+          # section (fail-safe dark), but a release that BECOMES latest without it would un-light
+          # the marketplace for everyone — so every release carries the current catalog. Not signed
+          # yet — a natural follow-up, out of scope for this change.
+          gh release upload '${{ steps.ver.outputs.tag }}' docs/store/plugins-catalog.json --clobber
+          # known-issues.json rides every release for the same reason as the two above: the app reads
+          # releases/latest/download/known-issues.json (+ .sig), so a release that becomes latest
+          # without it would empty the Known Roblox issues page for everyone.
+          gh release upload '${{ steps.ver.outputs.tag }}' known-issues.json known-issues.json.sig --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload of known-issues.json failed (exit $LASTEXITCODE)" }
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $url = "https://github.com/${{ github.repository }}/releases/tag/$tag"
+          $isDraft = '${{ inputs.publish }}' -ne 'true'
+          $state = if ($isDraft) { 'DRAFT (review + publish manually)' } else { 'PUBLISHED' }
+          @"
+          ## RORORO $tag
+          - State: **$state**
+          - Release: $url
+          - Artifacts: rororo-win-Setup.exe + *-full.nupkg + *-delta.nupkg + releases.win.json
+
+          $(if ($isDraft) { 'Open the release URL, review the assets, add release notes, then click ' + '**Publish release**' + '.' } else { 'Live now. Auto-update will roll out to existing installs within 24h (debounced).' })
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append

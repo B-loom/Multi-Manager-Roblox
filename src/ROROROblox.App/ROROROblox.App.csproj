@@ -1,0 +1,146 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ROROROblox.Core\ROROROblox.Core.csproj" />
+    <ProjectReference Include="..\ROROROblox.PluginContract\ROROROblox.PluginContract.csproj" />
+  </ItemGroup>
+
+  <!-- Microsoft.AspNetCore.App shared framework provides Kestrel + named-pipe transport
+       + Grpc.AspNetCore.Server hosting. The standalone NuGet for the named-pipe transport
+       does not exist; the transport ships inside the shared framework starting .NET 8+. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DiscordRichPresence" Version="1.6.1.70" />
+    <PackageReference Include="Grpc.AspNetCore" Version="2.68.0" />
+    <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3912.50" />
+    <PackageReference Include="Microsoft.Windows.CsWin32" Version="0.3.275">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="QRCoder" Version="1.8.0" />
+    <PackageReference Include="Serilog" Version="4.2.0" />
+    <PackageReference Include="Serilog.Extensions.Logging" Version="9.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageReference Include="Velopack" Version="0.0.1298" />
+    <PackageReference Include="WPF-UI" Version="4.3.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- The 10.0.19041.0 platform version exposes the WinRT projections that
+         Windows.ApplicationModel.StartupTask needs (packaged run-on-login, spec
+         2026-08-30-packaged-activation-design.md). Projects referencing this one
+         (Tests, PluginTestHarness) must target the same or a higher windows version;
+         Core stays bare net10.0-windows and is referenced downlevel, which is fine. -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- Custom entry point so VelopackApp.Build().Run() executes before WPF starts.
+         Replaces the auto-generated Main from App.xaml. -->
+    <StartupObject>ROROROblox.App.Program</StartupObject>
+    <!-- Assembly version surfaces in the About box via Assembly.GetName().Version.
+         Keep in sync with <Identity Version> in Package.appxmanifest. The script
+         scripts/finalize-store-build.ps1 patches both atomically on every release. -->
+    <Version>1.0.0.0</Version>
+    <!-- Job-object setup passes a struct by pointer to SetInformationJobObject (F-101). Scoped
+         to this project and used in exactly one file, PluginJobObject.cs. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Embed the app icon in the exe so Explorer, taskbar, and Velopack-created
+         shortcuts show the RoRoRo mark instead of a generic icon. Committed here and
+         also regenerated identically by scripts/build-velopack-release.ps1 at pack
+         time (same PNG sources). Missing this was the "Install Partially Succeeded"
+         blank-shortcut-icon on direct-download installs. -->
+    <ApplicationIcon>Package\Logos\AppIcon.ico</ApplicationIcon>
+    <!-- The exe's version resource — the FRIENDLY name Windows and Discord read, as distinct
+         from the file name. Without these, all three fields default to the assembly name and the
+         product introduces itself as "ROROROblox.App" in Task Manager, in the UAC dialog, in
+         Explorer's details pane, and in Discord's manual "Add a game" list.
+         That last one matters beyond cosmetics: Discord's game detection matches a running
+         executable and takes its display name from these fields, so whatever they say is the name
+         RoRoRo would eventually be recognised under. Cheap to fix now, permanent later.
+         AssemblyName is deliberately NOT changed — renaming the output file would churn the MSIX
+         manifest, Velopack, the run-on-login entry, and the URI-scheme command for no additional
+         benefit, since none of those surfaces show the file name to a user. -->
+    <AssemblyTitle>Multi Manager Roblox</AssemblyTitle>
+    <Product>Multi Manager Roblox</Product>
+    <Company>626 Labs LLC</Company>
+    <Copyright>© 626 Labs LLC</Copyright>
+  </PropertyGroup>
+
+  <!-- Expose internals (PluginRow, PluginsViewModel) to the test project so VM-level
+       unit tests can drive them directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="ROROROblox.Tests" />
+  </ItemGroup>
+
+  <!-- Tray icons: Direction C iso voxel stack on a navy disk with state-coloured ring.
+       Generated by scripts/generate-tray-icons.ps1 (programmatic, no external image source).
+       The *-titlebar.png variants are 64x64 standalone PNGs the WPF window title bar uses
+       directly; ICOs cover the system tray (where multi-size ICO is required). Title bar
+       gets PNG to avoid the 16x16 ICO embed's flat-bottom rendering at 18px display. -->
+  <ItemGroup>
+    <Resource Include="Tray\Resources\tray-on.ico" />
+    <Resource Include="Tray\Resources\tray-off.ico" />
+    <Resource Include="Tray\Resources\tray-error.ico" />
+    <Resource Include="Tray\Resources\tray-on-titlebar.png" />
+    <Resource Include="Tray\Resources\logo.png" />
+    <Resource Include="Tray\Resources\tray-off-titlebar.png" />
+    <Resource Include="Tray\Resources\tray-error-titlebar.png" />
+    <Resource Include="Tray\Resources\tray-warn.ico" />
+    <Resource Include="Tray\Resources\tray-warn-titlebar.png" />
+  </ItemGroup>
+
+  <!-- Embed the source-of-truth agent prompt so the in-app theme builder reads the same
+       text users see in docs/. ../../docs reaches up to repo root. The LogicalName is what
+       Assembly.GetManifestResourceStream() looks up. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\docs\themes\AGENT_PROMPT.md" LogicalName="ROROROblox.App.Themes.AGENT_PROMPT.md" />
+    <!-- The 128x128 mark the Pushover setup hands out (Settings > Alerts > Save the RoRoRo
+         icon). Embedded from docs/store/graphics so the file members upload matches the one
+         Este's own application registration uses. -->
+    <EmbeddedResource Include="..\..\docs\store\graphics\pushover-icon-128.png" LogicalName="ROROROblox.App.Notify.pushover-icon-128.png" />
+    <!-- The alert chime (v1.33 item 5). Synthesised, not licensed: two soft tones, E5 then B5,
+         350 ms, peak -13 dBFS. scripts/generate-alert-chime.py is the recipe and writes this file;
+         edit the numbers there and re-run rather than editing a waveform.
+
+         EmbeddedResource rather than the <Resource> the tray ICOs beside it use, deliberately. A
+         WPF <Resource> is only reachable through Application.GetResourceStream, which needs a live
+         Application to have installed the pack:// scheme and set ResourceAssembly — so the real
+         loader would be the one thing a test could not call, on an item whose whole failure mode is
+         a missing asset. AlertSoundPlayerTests calls AlertSoundPlayer.OpenBundledChime() itself and
+         measures the bytes it gets back, which is only honest if that method is the production one.
+         Same reason the Pushover icon above is embedded. -->
+    <EmbeddedResource Include="Tray\Resources\alert-chime.wav" LogicalName="ROROROblox.App.Tray.alert-chime.wav" />
+  </ItemGroup>
+
+  <!-- Streamer-mode banked avatar tiles — FINAL brand art (2026-07-10 design pass through
+       the 626labs-design skill). Twelve flat-vector characters on the brand duo (cyan
+       #17d4fa + magenta #f22f89, navy field), drawn circle-crop-safe because every display
+       surface clips them to a circle. Vector sources live in StreamerMode\Avatars\sources\
+       (*.svg, rendered at 256px via headless Chromium); edit the SVG and re-render rather
+       than touching the PNGs. The glob only matches this folder's PNGs, so sources\ stays
+       out of the resource stream. -->
+  <ItemGroup>
+    <Resource Include="StreamerMode\Avatars\*.png" />
+  </ItemGroup>
+
+  <!-- Discord:ApplicationId lives here. The committed appsettings.json ships the real, public
+       application id (1501748116985221272) since commit 8c75544 (2026-08-03); an empty value
+       still means the feature is off with no crash. Must be present next to the exe at
+       runtime for config binding to find it. -->
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

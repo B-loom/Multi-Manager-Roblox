@@ -1,0 +1,881 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+
+    <!-- The app's component vocabulary (F-035). Before this file, App.xaml held ten brushes, nine
+         converters, and exactly ONE keyed control style — so every button in the app was a
+         hand-copied attribute set. 63 sites across 15 files repeat the same four themed attributes,
+         which is why they drifted and why every previous fix had to be applied 63 times.
+
+         WHAT THESE STYLES DO NOT REACH (review gate, 2026-08-05): two buttons are constructed in
+         C# rather than markup — CaptionColorPickerWindow's palette swatches and SquadLaunchWindow's
+         Remove — and they set their brushes via FindResource, not via a Style. They bind the same
+         derived edge and are guarded by their own test, but a change made here does NOT reach them.
+         Text inputs are a separate, deliberate gap: they keep the authored divider until stage 5.
+
+         These styles own the THEMED attributes only: background, foreground, border. Padding,
+         margin and font size stay at the call site, because those legitimately differ — a toolbar
+         button and a dialog footer button are not the same size, and pretending otherwise would
+         trade one bug for a layout sweep nobody asked for. -->
+
+    <!-- ============================ THE TEMPLATE (F-068, v1.20) ============================
+
+         Until now these styles set only resting colours and inherited their TEMPLATE from the OS.
+         That template's state triggers are hardcoded literals with no resource binding:
+
+             IsMouseOver == True   ->  Background #BEE6FD, BorderBrush #3C7FB1
+             IsPressed   == True   ->  Background #C4E5F6
+             IsEnabled   == False  ->  Background #F4F4F4, Foreground #838383
+
+         #BEE6FD is Windows Aero light blue. Every button in this app has flashed it on hover, in
+         every theme, for the app's whole life — confirmed by eye on a running v1.19 build. Under
+         flatline, a theme whose entire purpose is carrying no meaning in colour, the pointer paints
+         sky blue on it.
+
+         WHY A TEMPLATE AND NOT Style.Triggers. Layering triggers on top would be smaller and would
+         survive a WPF-UI package bump, and it cannot work: every one of those setters carries
+         TargetName="border", so it targets a named element INSIDE the inherited template. A Style
+         trigger on the Button's own Background sets a different object's property — not a
+         precedence contest, a different element. Exactly one of the seven (Foreground on disabled)
+         is reachable that way, and one of seven is not a fix.
+
+         THE COST, stated rather than discovered later: owning this template means a future WPF-UI
+         improvement to its Button template will not reach these buttons. There is no version of
+         this that fixes the defect and avoids that.
+
+         Hover and pressed reuse EXISTING palette slots. A twelfth slot would be a contract change
+         and every user theme already on disk would need updating to supply it (invariant 6 — the
+         contract does not grow). RowBg is one step up from Navy in every built-in; Divider is a
+         further step. Disabled is opacity plus a muted label rather than a colour, because flatline
+         has no hue to spend — the same reasoning F-032 settled for status colours. -->
+    <!-- THE RANKS BELOW DO NOT DERIVE FROM THE IMPLICIT BUTTON STYLE, and that is the second half
+         of owning the template. BasedOn="{StaticResource {x:Type Button}}" inherits the implicit
+         style's Style.Triggers as well as its setters, and an inherited TRIGGER outranks a plain
+         Setter in the derived style. So the implicit disabled trigger overwrote each rank's
+         Background the moment a button disabled, and the fill never reached the template at all:
+         a disabled Launch As rendered as muted text on bare row, with no cyan anywhere. Removing
+         opacity from our own disabled trigger did not fix it, because ours was never the trigger
+         doing it. Found at C1 by the builder reporting "only the text is what's staying".
+
+         Every rank sets its own Template, Background, Foreground and border, so there is nothing
+         left worth inheriting, only the triggers that were fighting us. -->
+    <!-- Galaxy CTA fill: violet to nebula pink. -->
+    <LinearGradientBrush x:Key="GalaxyCtaBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#B69CFF" Offset="0" />
+        <GradientStop Color="#FF8FE0" Offset="1" />
+    </LinearGradientBrush>
+    <ControlTemplate x:Key="AppButtonTemplate" TargetType="Button">
+        <Grid>
+            <Border x:Name="Chrome" CornerRadius="10"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    SnapsToDevicePixels="True" />
+
+            <!-- Hover and pressed are a translucent SHEEN over the fill, not a replacement for it.
+                 The first version set Chrome's Background to RowBgBrush on hover, which is a
+                 SURFACE colour: fine under a quiet navy button, catastrophic under a bright one.
+                 Hovering a cyan CTA turned it dark navy, and the builder's report at C1 was that
+                 the button dims to nearly nothing. It was not dimming; it was being replaced.
+
+                 A sheen is relative, so one rule works for every fill the app has or will have:
+                 cyan, amber, navy, magenta-edged, and transparent. It also survives a theme
+                 nobody has written yet, which a fixed hover slot cannot.
+
+                 Opacity is set STATICALLY on these two layers and the triggers toggle Visibility.
+                 That is deliberate: an opacity animated by a trigger is what erased the disabled
+                 fill earlier in this same cycle, and ButtonStateGateTests now forbids a trigger
+                 from setting Opacity at all. A fixed alpha on a dedicated layer is a different
+                 thing, and the layer is IsHitTestVisible=False so it never eats a click. -->
+            <!-- The hover layer carries an OUTLINE as well as a tint, and the outline is the part
+                 that actually reads. A white tint is weakest exactly where the fill is brightest:
+                 10% white over cyan is almost nothing, which is what the builder saw at C1 after
+                 the previous fix ("now it's not dimming at all"). Luminance-based feedback cannot
+                 work equally on a near-white fill and a near-black one.
+                 An outline appearing is structural. It reads the same on cyan, amber, navy and on
+                 a transparent ghost button, and it does not depend on the fill's brightness at
+                 all. The tint stays as a supporting cue and is stronger on press than on hover, so
+                 the two states remain distinguishable. -->
+            <Border x:Name="HoverSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.22"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <Border x:Name="PressSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.38"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+
+            <ContentPresenter x:Name="Content"
+                              Margin="{TemplateBinding Padding}"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              RecognizesAccessKey="True"
+                              SnapsToDevicePixels="True" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="HoverSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="PressSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <!-- Disabled mutes the label and KEEPS the fill. See the C1 note above: fading the
+                 fill on a dark row does not read as unavailable, it reads as gone. -->
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <!-- The same template for ranks whose fill is BRIGHT, differing in exactly one state.
+
+         Found by ButtonStateGateTests the first time it measured a state pair instead of asserting
+         a state pair was themed. AppButtonTemplate expresses disabled by swapping the label to
+         MutedTextBrush and keeping the fill. That is correct on a navy fill: muted on navy is
+         6.88 brand, 4.50 midnight, 6.55 magenta-heat, 6.60 flatline, and it was written when
+         every rank in the file had one. Items 3 and 4 added two ranks with bright fills and the
+         disabled trigger was never re-measured against them:
+
+             Cta      1.37 brand   1.79 midnight   1.34 magenta-heat   1.95 flatline
+             Warning  1.29 brand   1.60 midnight   1.50 magenta-heat   1.95 flatline
+
+         A mid grey on bright cyan is very close to invisible, and it was not theoretical: the Join
+         by link, Export accounts and Import accounts windows each OPEN with their primary CTA
+         disabled, so that label at 1.37:1 was the first thing a user saw in three separate windows.
+
+         WHY A WASH AND NOT A DIM. Fading a bright fill toward the background is the obvious move
+         and it fails by measurement. It squeezes the dark label from the other side, and there is
+         no opacity at which all eight rank/theme pairs clear AA (0.35 was the best and still failed
+         four). Washing toward WhiteBrush moves the fill away from the dark label instead of into
+         it, so legibility rises as the control becomes less available: 8.96 worst case across all
+         eight, against a 4.5 floor. It also keeps C1's lesson intact, since nothing here fades
+         toward the field the button sits on.
+
+         WHY A SECOND TEMPLATE. The difference is real and belongs to the fill, not to a flag. A
+         Style trigger cannot address a template element by name, so the alternative was a Tag
+         carrying a mode string that the template branched on, which hides the finding above
+         behind an indirection instead of naming it. The two templates differ in one trigger, and
+         ButtonStateGateTests measures both against the same floor. -->
+    <ControlTemplate x:Key="AppFilledButtonTemplate" TargetType="Button">
+        <Grid>
+            <Border x:Name="Chrome" CornerRadius="10"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    SnapsToDevicePixels="True" />
+            <Border x:Name="HoverSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.22"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <Border x:Name="PressSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.38"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <!-- Sits above the interaction sheens so a disabled control cannot show hover feedback
+                 layered over its own wash. It is never hit-testable, and a disabled control does
+                 not raise IsMouseOver anyway; the ordering is belt and braces for the case where a
+                 rank is disabled while the pointer is already over it. -->
+            <!-- 0.65, raised from 0.55 on the v1.20 walk (2026-08-11). At 0.55 the disabled state
+                 still read as available — Este's call on the Join-by-link Launch button, which is
+                 the one that opens already disabled and so gets judged on first paint.
+                 This is the axis no test can settle: the gate below proves the LABEL stays legible
+                 through the wash, but "does it look unavailable" is a human question, and 0.55
+                 answered it wrong. 0.45 and 0.65 were both measured as clear AA before the walk, so
+                 this direction was pre-cleared rather than guessed. -->
+            <Border x:Name="DisabledWash" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    Opacity="0.65"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <ContentPresenter x:Name="Content"
+                              Margin="{TemplateBinding Padding}"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              RecognizesAccessKey="True"
+                              SnapsToDevicePixels="True" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="HoverSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="PressSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <!-- No foreground swap. The rank's dark label is the thing keeping this legible, and
+                 the wash underneath it is what says unavailable. -->
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="DisabledWash" Property="Visibility" Value="Visible" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <!-- ToggleButton gets its own copy of the template, because a ControlTemplate's TargetType
+         must match the control and ToggleButton is not a Button. Nothing else about it differs.
+
+         This gap was found at C2, in the header: the default-game widget is a ToggleButton, so
+         none of the six Button ranks reached it and it kept the OS template's hardcoded hover.
+         Every other button in the app had stopped flashing #BEE6FD and that one still did, in the
+         middle of the toolbar. The scanner never saw it either, since it counts the Button tag, so
+         broken control sat outside the definition entirely while the count read "1 site left". -->
+    <ControlTemplate x:Key="AppToggleButtonTemplate" TargetType="ToggleButton">
+        <Grid>
+            <Border x:Name="Chrome" CornerRadius="10"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    SnapsToDevicePixels="True" />
+            <Border x:Name="HoverSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.22"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <Border x:Name="PressSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.38"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <ContentPresenter Margin="{TemplateBinding Padding}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              RecognizesAccessKey="True" SnapsToDevicePixels="True" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="HoverSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <!-- Checked reuses the press sheen: a toggle that is ON is a control being held down,
+                 and giving it a third layer would be a distinction without a difference. -->
+            <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="PressSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style x:Key="SecondaryToggleButtonStyle" TargetType="ToggleButton">
+        <Setter Property="Template" Value="{StaticResource AppToggleButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- v1.36 C2 (E1, Este's pick 2026-11-02): the account panel's expander, which moved from the actions column
+         into the name column. It is the same rank as SecondaryToggleButtonStyle at rest and under the pointer (Navy
+         fill, derived edge, white glyph, the house hover and press sheens), with ONE difference, and it is the
+         point: OPEN is a Cyan outline and a Cyan glyph, the mock's call, where the shared toggle template fills the
+         checked state with the grey press sheen. A checked expander therefore never paints a fill. The checked state
+         lives here, in the template's triggers, so the row's XAML carries no colour trigger (a button's per-instance
+         style carries Visibility/IsEnabled setters only). Its own template rather than a trigger on
+         SecondaryToggleButtonStyle's: that template is shared by the header's default-game widget and the Library
+         chips, whose checked state stays the press sheen. Measured by ButtonStateGateTests (rest, hover, pressed,
+         disabled; the checked pair, Cyan on Navy, has its own fact there) and RenderedStyleGateTests. -->
+    <ControlTemplate x:Key="PanelExpanderToggleTemplate" TargetType="ToggleButton">
+        <Grid>
+            <Border x:Name="Chrome" CornerRadius="10"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    SnapsToDevicePixels="True" />
+            <Border x:Name="HoverSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.22"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <Border x:Name="PressSheen" CornerRadius="10"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.38"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <ContentPresenter Margin="{TemplateBinding Padding}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              RecognizesAccessKey="True" SnapsToDevicePixels="True" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <!-- Open: outline and glyph, never a fill. Listed first so the pointer states below can still layer a
+                 sheen over an open expander. -->
+            <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource CyanBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource CyanBrush}" />
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="HoverSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="PressSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style x:Key="PanelExpanderToggleButtonStyle" TargetType="ToggleButton">
+        <Setter Property="Template" Value="{StaticResource PanelExpanderToggleTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- v1.36 C3 (Este's pick 2026-11-03): the Library chips are the mock's rounded pills. The expander's rank and
+         checked state exactly (Navy fill, derived edge, white label, house sheens; ON = Cyan outline and Cyan label, no
+         fill), with one difference: every border is rounded, the two sheens included, so a hover or press wash never
+         paints square corners outside the pill. A radius larger than half the height clamps to a full semicircle.
+         Measured by ButtonStateGateTests (the shared state pairs, APillChipsCheckedState against Bg, and the matching
+         radii) and RenderedStyleGateTests. -->
+    <ControlTemplate x:Key="PillToggleTemplate" TargetType="ToggleButton">
+        <Grid>
+            <Border x:Name="Chrome"
+                    CornerRadius="14"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    SnapsToDevicePixels="True" />
+            <Border x:Name="HoverSheen"
+                    CornerRadius="14"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.22"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <Border x:Name="PressSheen"
+                    CornerRadius="14"
+                    Background="{DynamicResource WhiteBrush}"
+                    BorderBrush="{DynamicResource WhiteBrush}"
+                    BorderThickness="1"
+                    Opacity="0.38"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False" />
+            <ContentPresenter Margin="{TemplateBinding Padding}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              RecognizesAccessKey="True" SnapsToDevicePixels="True" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource CyanBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource CyanBrush}" />
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="HoverSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="PressSheen" Property="Visibility" Value="Visible" />
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style x:Key="PillToggleButtonStyle" TargetType="ToggleButton">
+        <Setter Property="Template" Value="{StaticResource PillToggleTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- Primary. Navy field, white text, cyan edge. Measured 9.39:1 in brand, 8.05:1 in midnight,
+         4.90:1 in magenta-heat — this recipe was always fine. It is here so it stops being copied
+         by hand, not because it was broken. -->
+    <Style x:Key="PrimaryButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource CyanBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- Secondary — the recipe F-025, F-030 and F-031 are all about.
+
+         It differs from primary in exactly one attribute: the border. That single difference is the
+         entire defect. Secondary bound DividerBrush, and Navy == Bg in all three built-in themes,
+         so the fill contributed zero separation and the whole affordance rested on a border
+         measuring 1.26:1 (brand), 1.16:1 (midnight), 1.14:1 (magenta-heat) against WCAG 1.4.11's
+         3:1 floor. It shipped in the default theme at about a fifth of the required contrast.
+
+         InteractiveEdgeBrush is derived by ContrastGuard from whatever the active theme supplies,
+         so this clears 3:1 under any theme including ones users authored — without adding a slot
+         they would have to fill in, and without touching DividerBrush, which is still correct
+         everywhere it draws a separator rather than a control boundary.
+
+         SINCE F-090 the derivation clears 3:1 against every surface a control can sit on, not just
+         NavyBrush. It used to take Navy alone, and the same edge on a card measured 2.82:1 in three
+         built-ins and 2.28:1 in flatline — under the floor at eight of the fourteen call sites for
+         the input styles. RenderedStyleGateTests measures both surfaces now, in pixels.
+
+         F-032: the label was MutedTextBrush, the same token helper prose uses. Muted-vs-White is
+         2.42:1 in brand and 1.00:1 under flatline, so colour could not carry "quiet" under a theme
+         this app supports — a control label and the paragraph beside it became the same thing.
+         Weight carries it now, and the derived edge above already marks control-vs-prose. Note the
+         label was never illegible: Muted on Navy measures 6.88:1 and passes AA. The defect was
+         semantic, not contrast. -->
+    <Style x:Key="SecondaryButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="FontWeight" Value="Normal" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+
+    <!-- Secondary, strong label. The sweep that consolidated these found THREE recipes, not two.
+         Since F-032 all three share a white label and differ by edge and weight: quiet secondary
+         (derived edge, Normal), primary (cyan edge), and this one (derived edge, SemiBold).
+
+         It gets the same edge fix and keeps its white label. Folding it into the quiet secondary
+         would have fixed the contrast bug by demoting a dialog's main action to muted text, which
+         is a legibility trade nobody asked for. Three recipes existed; three styles name them. -->
+    <Style x:Key="SecondaryStrongButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!--
+        F-041. The dialog Close button, in one place.
+
+        Nine windows carry one, and wave 5 already settled its RANK — every one of them is
+        SecondaryStrongButtonStyle. What never got settled was the rest of it. Padding came in four
+        values (14,8 / 16,8 / 20,8 / 22,8), and IsDefault split four-to-four with nothing behind
+        the split: the four windows whose Close is NOT the default turned out to have no default
+        button at all, so Enter did nothing in Diagnostics, Friends, Games and Squad Launch.
+
+        Enter and Esc both dismiss, and that is safe everywhere precisely because dismissing a
+        dialog is the one action that never destroys anything. A window that wants Enter for a real
+        submission — Join by link, Rename — does not use this style and keeps its own default.
+    -->
+    <Style x:Key="DialogCloseButtonStyle" TargetType="Button" BasedOn="{StaticResource SecondaryStrongButtonStyle}">
+        <Setter Property="Padding" Value="22,8" />
+        <Setter Property="HorizontalAlignment" Value="Right" />
+        <Setter Property="IsDefault" Value="True" />
+        <Setter Property="IsCancel" Value="True" />
+    </Style>
+
+
+    <!-- Destructive — the third rank, added for the three sites v1.18 enumerates: Remove on the
+         account row, Clear history, and the Stop all confirm. Assigned BY NAME, never by sweep.
+         "Destructive by consequence" is unbounded on its face, and F-068's 61 un-migrated call
+         sites are a different cycle's; a fourth button needing a judgement call is the signal to
+         drop the work rather than widen it.
+
+         WHY IT IS NOT A COLOUR. MagentaBrush is the obvious answer and it fails by measurement in
+         two of the four shipped themes. Under magenta-heat the theme sets Magenta and Cyan to the
+         SAME value, so a magenta-edged destructive button and a cyan-edged PrimaryButtonStyle
+         render identically — the rank would not exist as a rank in a theme a user can pick today.
+         Under flatline Magenta is the dark achromatic accent: it measures 3.73:1 against Navy where
+         the derived edge already measures 3.03:1, a difference no reader can name, and a dim grey
+         outline reads as disabled rather than dangerous. RowExpiredAccentBrush — the warning token
+         v1.17 established across expired rows, idle chips and the compat banner — fails the mirror
+         image of the same test, because under flatline it is the same value as Cyan. And Magenta is
+         the CTA fill on 13 inline-styled surfaces, so it already means "primary action" in places;
+         borrowing it here would hand one token two meanings, which is the defect the secondary rank
+         above exists to describe.
+
+         SO THE RANK IS A RELATIONSHIP, not a hue. Two axes, both of which survive greyscale, colour
+         vision deficiency, and any JSON a user drops in the themes folder:
+
+           edge    InteractiveEdgeBrush at BorderThickness 2 — DOUBLE every other rank in this file,
+                   all of which set 1. The derived brush is also the only boundary token guaranteed
+                   to clear WCAG 1.4.11's 3:1 under a theme nobody has authored yet, so the loudest
+                   edge here is also the one a theme cannot quietly turn invisible.
+           weight  Bold — one step above SecondaryStrongButtonStyle's SemiBold, which is itself one
+                   step above the quiet secondary's Normal. Three ranks, three weights, in order.
+
+         Navy fill and a white label, same as the two ranks above, and deliberately so. A
+         destructive control has to be unmistakable, not inviting: an accent FILL would make Remove
+         the loudest thing on an account row, which is the same cycle's Close-button defect wearing
+         the opposite costume. -->
+    <Style x:Key="DestructiveButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="FontWeight" Value="Bold" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="2" />
+    </Style>
+
+    <!-- CTA — the cyan-filled call to action. 23 sites wanted this rank and none existed: 17 wrote
+         CyanBrush + NavyBrush inline and 6 more wrote the same thing as raw #B69CFF + #0B0720,
+         which are brand's hexes for exactly those two tokens. Those six were frozen to brand and
+         stayed cyan-on-navy under flatline; this rank un-freezes them.
+
+         DARK LABEL, NOT WHITE, and it is not a preference. White on CyanBrush measures 1.77:1 in
+         brand, 1.96:1 midnight, 3.29:1 magenta-heat, 1.36:1 flatline — under AA in every theme the
+         app ships. Navy on CyanBrush measures 9.39 / 8.05 / 4.90 / 12.84 and clears it in every
+         one. The 23 existing sites already use the dark label, so this rank changes nothing about
+         how they look; it only stops them being written by hand. -->
+    <Style x:Key="CtaButtonStyle" TargetType="Button">
+        <!-- Filled template: the disabled label stays navy and the fill washes pale. See that
+             template's note: muted-on-cyan measured 1.37:1 and three windows open with one. -->
+        <Setter Property="Template" Value="{StaticResource AppFilledButtonTemplate}" />
+        <Setter Property="Background" Value="{StaticResource GalaxyCtaBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <!-- BORDERLESS, and the fill is the boundary. Every one of the 23 sites this replaces sets
+             BorderThickness="0" — these are solid blocks, not outlined controls. An earlier draft
+             gave them a 1px edge to satisfy the rendered-edge gate and it was the wrong fix: WCAG
+             1.4.11 asks whether the control is distinguishable from what is adjacent to it, and
+             cyan on the page background measures 9.39 / 8.05 / 4.90 / 12.84. The fill answers the
+             rule; a border would only be decoration, and decoration that changes 23 buttons. -->
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+
+    <!-- Accent action — Stop, Squad Launch, and the six other sites that were solid magenta blocks.
+
+         THE MAGENTA MOVED FROM THE FILL TO THE EDGE, and the measurement forced it. A white label
+         on MagentaBrush is 3.79:1 in brand, 4.16:1 midnight, 3.29:1 magenta-heat — under the 4.5:1
+         floor this file holds everything else to. A dark label does not rescue it either: navy on
+         magenta is 4.40 / 3.79 / 4.90 / 3.73, under AA in three of four. There is no label colour
+         that makes a magenta FILL legible in the themes this app ships, which is why F-050 has an
+         exemption rather than a fix.
+
+         As an edge it passes cleanly. The label now sits on Navy at 16.66 / 15.79 / 16.09 / 17.45,
+         and the magenta border measures 4.40 / 3.79 / 4.90 / 3.73 against the fill behind it —
+         above WCAG 1.4.11's 3:1 in all four. Same brand signal, legible label, and it survives
+         greyscale because the edge is a boundary rather than a meaning.
+
+         SEMIBOLD IS LOAD-BEARING, not decoration. Under magenta-heat the theme sets Magenta and
+         Cyan to the SAME value, so this rank's edge and PrimaryButtonStyle's edge render
+         identically there. Weight is what keeps them apart, the same way it separates the two
+         secondary ranks above. Bold stays exclusive to Destructive so the file's three-ranks-
+         three-weights ordering still reads. -->
+    <Style x:Key="AccentActionButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="BorderBrush" Value="{DynamicResource MagentaBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- Warning — Recycle, Re-authenticate, and the memory-pressure recycle glyph. The warning
+         token v1.17 established across expired rows, idle chips and the compat banner, now
+         carrying the three buttons that ACT on those warnings.
+
+         Dark label, for the same reason CtaButtonStyle has one: navy on the accent measures
+         8.85 / 7.23 / 9.85 / 12.84 while white measures 1.88 / 2.19 / 1.63 / 1.36 — under AA in
+         every theme the app ships. All three existing sites already use the dark label, so this
+         changes nothing about how they look.
+
+         Borderless, and the fill is the boundary: the accent against the page measures
+         8.85 / 7.23 / 9.85 / 12.84, well past 1.4.11's 3:1. -->
+    <Style x:Key="WarningButtonStyle" TargetType="Button">
+        <!-- Filled template, same reason as CtaButtonStyle: muted-on-accent measured 1.29:1. -->
+        <Setter Property="Template" Value="{StaticResource AppFilledButtonTemplate}" />
+        <Setter Property="Background" Value="{DynamicResource RowExpiredAccentBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+
+    <!-- Ghost — the quiet affordances that sit ON something rather than next to it: the tag's
+         remove glyph, the compact/expand toggle, the set-main swatch, dismiss links. Transparent
+         fill, no border, no chrome at all; the label is the entire control.
+
+         WHY IT IS NOT MEASURED AS A BOUNDARY. There is no fill and no edge to measure, so
+         1.4.11's non-text rule has nothing to govern here — this is text on whatever surface hosts
+         it, and 1.4.3's text contrast is the rule that applies. The label binds WhiteBrush, which
+         is measured against every surface it can land on by the sibling text pairs. A ghost rank
+         that invented a fill to have something to measure would be adding chrome to satisfy a
+         gate, which is the opposite of the point.
+
+         Hover still reads: the shared template reveals a translucent white sheen with an outline on
+         IsMouseOver, so a transparent button gains a visible surface exactly when the pointer is
+         over it, and loses it again after. That is the affordance these sites previously had no way
+         to express, and the sheen is the version of it that works here. The first draft of that
+         hover tinted Chrome to RowBgBrush, which this note described until now; it was replaced
+         mid-cycle because repainting the fill erased bright ranks, and a ghost rank is the case
+         where the difference is starkest. A surface colour on a transparent button paints a fill
+         where there was none; a sheen over nothing is still a sheen. -->
+    <Style x:Key="GhostButtonStyle" TargetType="Button">
+        <Setter Property="Template" Value="{StaticResource AppButtonTemplate}" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+
+    <!-- v1.36 facts-line badge (A1): a thin outlined pill at meta size, one per fact on the account
+         row (Robux, membership, friends online, last played, the note's first line). The outline is
+         the divider brush (decoration, not a control edge); the text takes the ordinary themed text
+         brush and size through TextElement so the child TextBlock inherits them and the pill sets no
+         colour of its own. The note badge overrides Foreground to the muted brush at the call site.
+         Every element carrying this style names itself (FactBadgeNamingFenceTests). -->
+    <Style x:Key="FactBadgeStyle" TargetType="Border">
+        <Setter Property="BorderBrush" Value="{DynamicResource DividerBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="8" />
+        <Setter Property="Padding" Value="6,0" />
+        <Setter Property="Margin" Value="0,0,6,3" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="TextElement.FontSize" Value="{DynamicResource MetaFontSize}" />
+        <Setter Property="TextElement.Foreground" Value="{DynamicResource WhiteBrush}" />
+    </Style>
+
+    <!-- v1.36 C2 (F2, Este's pick 2026-11-02): colour on three of the five facts, as variants of the pill above
+         rather than literals at the call site. Theme slots only, so each follows all four themes.
+         FactBadgeAccentStyle: a Cyan outline, text left at the base white (friends online; the call site adds a
+         small Cyan dot). FactBadgeAccentTextStyle: the same outline with Cyan text (Robux).
+         FactBadgePlusStyle: a Magenta outline with HealthLimitedBrush text, bold. Raw MagentaBrush TEXT fails AA on
+         the row in three themes (the reason the Limited health badge reads HealthLimitedBrush, the lightened
+         magenta), so Magenta is only ever the outline here. Under magenta-heat Magenta and Cyan are one value and
+         under flatline both are achromatic: the badges still tell themselves apart by their words, which is why
+         colour is the third carrier and never the only one. They are decoration like the base pill (a hairline
+         role 1.4.11 does not govern), and every use still names itself (FactBadgeNamingFenceTests).
+
+         EXPIRED ROWS ARE THE ONE PLACE THE COLOURED TEXT STANDS DOWN. The text pairs are measured on RowBg (Cyan 8.64:1
+         in brand, HealthLimited 4.54:1) by ContrastPairGateTests.NamedPairs, and measuring them on RowExpiredBg, the
+         amber-tinted surface an expired row repaints to, FAILED AA: HealthLimited 3.97 brand, 4.41 midnight, 3.54
+         magenta-heat, 3.45 flatline, and Cyan 3.54 under magenta-heat (2026-11-02). So the two styles that colour TEXT
+         (Accent text, Plus) carry a DataTrigger on the row's SessionExpired that returns the text to WhiteBrush, the text
+         colour every other fact already has there; the outline colour and the bold stay. The trigger reads the row's
+         DataContext, which is why these two styles only make sense inside an account row. White on RowExpiredBg is
+         a named pair of its own. -->
+    <Style x:Key="FactBadgeAccentStyle" TargetType="Border" BasedOn="{StaticResource FactBadgeStyle}">
+        <Setter Property="BorderBrush" Value="{DynamicResource CyanBrush}" />
+    </Style>
+    <Style x:Key="FactBadgeAccentTextStyle" TargetType="Border" BasedOn="{StaticResource FactBadgeAccentStyle}">
+        <Setter Property="TextElement.Foreground" Value="{DynamicResource CyanBrush}" />
+        <Style.Triggers>
+            <DataTrigger Binding="{Binding SessionExpired}" Value="True">
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource WhiteBrush}" />
+            </DataTrigger>
+        </Style.Triggers>
+    </Style>
+    <Style x:Key="FactBadgePlusStyle" TargetType="Border" BasedOn="{StaticResource FactBadgeStyle}">
+        <Setter Property="BorderBrush" Value="{DynamicResource MagentaBrush}" />
+        <Setter Property="TextElement.Foreground" Value="{DynamicResource HealthLimitedBrush}" />
+        <Setter Property="TextElement.FontWeight" Value="Bold" />
+        <Style.Triggers>
+            <DataTrigger Binding="{Binding SessionExpired}" Value="True">
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource WhiteBrush}" />
+            </DataTrigger>
+        </Style.Triggers>
+    </Style>
+
+    <!-- ============================ INPUTS (F-029, F-049) ============================
+
+         A text box IS a UI component under WCAG 1.4.11, exactly as much as a button is. Wave 5
+         fixed buttons and left these on DividerBrush, which produced a visible inconsistency the
+         close-out captured: under the flatline theme the Alerts panel shows a "Show" button with a
+         clear outline sitting directly beside a webhook field with no boundary at all.
+
+         Same derived brush, same reasoning. This is not new policy — it is the policy wave 5 wrote,
+         applied to the controls it did not reach. What stays on DividerBrush is decoration: card
+         edges, row rules, the popup edge on a context menu. Those are separators, and 1.4.11 does
+         not govern separators. The fence test enforces that split by role. -->
+
+    <!-- NO Background setter, and that is deliberate. Two fills are in use and both are right:
+         RowBgBrush where the field sits on a card (Export, Import, Games) and NavyBrush where it
+         sits on window chrome (Preferences). A field takes its fill from the surface behind it, so
+         forcing one here would flatten a real distinction — the same reason the button styles leave
+         padding and font size at the call site. The border is what drifted; the border is what this
+         owns. -->
+    <Style x:Key="AppTextBoxStyle" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- A password field's boundary matters more than most, not less: there is no text to infer the
+         control's extent from, so the outline is the only thing saying where to type. -->
+    <Style x:Key="AppPasswordBoxStyle" TargetType="PasswordBox" BasedOn="{StaticResource {x:Type PasswordBox}}">
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- IMPLICIT, deliberately, and the only implicit style in this file (F-049). The alerts block
+         was added twenty lines below an identical ComboBox and picked up none of its theming,
+         because nothing made it inherit. Keying this would preserve exactly that failure mode: the
+         next ComboBox someone adds would again theme itself by hand or not at all. Buttons and text
+         boxes stay keyed — they have more than one legitimate recipe, so an implicit default there
+         would silently overrule deliberate choices. A ComboBox has one. -->
+    <Style TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
+        <Setter Property="Background" Value="{DynamicResource NavyBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource InteractiveEdgeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+
+    <!-- ======================= SURFACES + HEADINGS (F-047, F-064) =======================
+
+         WHAT THESE DO AND DO NOT FIX. They consolidate. Nine section cards in Preferences repeat
+         the same four attributes by hand; Diagnostics builds its section heading in C# with a third
+         spec no markup review would ever see. One style each, so the next change is one edit.
+
+         They do NOT fix C5. A card is a fill and a radius, and under a theme that sets RowBg == Bg
+         the grouping disappears entirely — no brush in this file can rescue that, because the
+         problem is that grouping is carried by colour alone. The real fix is structural: a heading
+         level above the card so the group reads from typography and rhythm rather than a fill. That
+         is F-026, tagged [new-mechanism] in the register, and it is deliberately not smuggled in
+         here. What this does is make F-026 a one-place edit instead of a nine-place one. -->
+
+    <Style x:Key="CardBorderStyle" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource RowBgBrush}" />
+        <Setter Property="CornerRadius" Value="14" />
+        <Setter Property="Padding" Value="14" />
+        <Setter Property="Margin" Value="0,0,0,10" />
+    </Style>
+
+    <!-- C8's stated convention, finally expressed once: 13px SemiBold on the primary text token.
+         Diagnostics had it at 12px on CyanBrush — accent colour doing structural work, which is the
+         same mistake as grouping-by-fill and fails for the same reader. The generous top margin is
+         the point: with the accent gone, separation between groups has to come from rhythm, not
+         hue. -->
+    <Style x:Key="SectionHeadingStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="Margin" Value="0,18,0,6" />
+    </Style>
+
+    <!-- WHY THIS LIVES HERE AND NOT IN App.xaml, which is where it was first written and where
+         CI caught it: App.xaml is the Application, not a mergeable dictionary, so nothing
+         outside the running app can reach what is declared inline in it. Every render gate
+         builds its scope from ThemesDictionary + ControlsDictionary + THIS FILE by pack URI
+         (ThemedRender.Resources), extracts a subtree of real markup and parses it against
+         that scope — so a {DynamicResource MetaFontSize} in MainWindow.xaml threw
+         "Cannot find resource named 'MetaFontSize'" the moment a gate sampled a site
+         carrying one. A shared token has to live somewhere shared consumers can merge.
+
+         Worth recording that x64 CI passed the same commit arm64 failed: whether the gate
+         happened to sample a site with the new key decided it, so the green was luck. -->
+    <!-- ================= THE TYPE LADDER (F-057, F-044) =================
+         Four steps, and before this there were ELEVEN sizes and no resource of any kind:
+         326 FontSize declarations, every one a raw number typed into markup. That is why
+         there were eleven — nothing existed to inherit from, so each new control picked a
+         number that looked right next to its neighbour.
+
+         The roles, which are what actually stop the twelfth size appearing:
+
+           Display  22  page identity and hero wordmarks. About, Welcome. Rare on purpose.
+           Heading  14  section headings inside a surface.
+           Body     12  prose. The floor: anything a person READS sits here or above.
+           Meta     11  short, uppercase, tracked labels only - the C8 convention. NOT a
+                smaller body size, and using it for a sentence is the defect F-044
+                names.
+
+         Meta is the floor for everything, and that is the F-044 fix: 38 declarations sat
+         at 8, 9 and 10px, including two 8px pills. The row said "six places."
+
+         STILL TO DO, recorded rather than implied: 163 declarations sit at 11px and most of
+         them are prose that belongs at Body, not Meta. Sorting those is per-site judgement
+         across 22 files and is its own row - see F-118. This defines the ladder and raises
+         the floor; it does not claim the app is on four sizes yet. -->
+    <!-- CONSUME THESE WITH {DynamicResource}, NOT {StaticResource}, and the reason is the same one
+         that makes every brush in this app dynamic. StaticResource resolves at PARSE time against
+         whatever scope the element is being parsed into. Several render gates sample a real subtree
+         out of a window and hand it to XamlReader.Parse as a standalone string - no parent, no
+         scope - then attach the theme dictionary to a host afterwards, which is already too late.
+         DynamicResource defers the lookup to render time and walks the tree it ends up in, by which
+         point the dictionary is there. Two CI runs were spent learning this: the first fix moved the
+         keys here from App.xaml, which was necessary and not sufficient. -->
+    <!-- ================= THE FAMILY ROLES (F-067) =================
+         Same argument as the size ladder above, one axis over. The mono role was declared TWO ways
+         — "JetBrains Mono, Cascadia Mono, Consolas" at 18 sites and a bare "Consolas" at 7 — so
+         seven meta labels skipped JetBrains Mono anywhere it was installed. It went unnoticed for an
+         ordinary reason: on a machine without JetBrains Mono both recipes fall through to Consolas
+         and look identical, so the defect is invisible exactly where it is being written.
+
+         The display role had NO expression anywhere in the app. Invariant 3 fixes the type roles —
+         Space Grotesk display, Inter body, JetBrains Mono for small meta labels — and F-067
+         explicitly refuses the "declare it intentionally system-font" branch, so the role gets a
+         name here rather than being quietly conceded.
+
+         BOTH ARE FALLBACK STACKS, not bundled fonts. Nothing here ships a font file: each names the
+         brand face first and degrades through faces Windows already has. That is what the mono
+         declaration has always done, and it keeps this a vocabulary change rather than a packaging
+         one. A machine with the brand fonts installed gets the brand; a machine without gets the
+         closest system equivalent instead of an arbitrary one. -->
+    <!-- CONSUMED WITH {DynamicResource}, for the reason recorded above the size ladder: several
+         render gates hand a real subtree to XamlReader.Parse as a standalone string and attach the
+         dictionary afterwards, which is too late for a parse-time StaticResource lookup. Two CI
+         runs were spent learning that with MetaFontSize; this one is written that way from the
+         start rather than being taught the same lesson twice. -->
+    <FontFamily x:Key="MonoFontFamily">JetBrains Mono, Cascadia Mono, Consolas</FontFamily>
+    <FontFamily x:Key="DisplayFontFamily">Space Grotesk, Segoe UI Variable Display, Segoe UI</FontFamily>
+
+    <sys:Double x:Key="DisplayFontSize">22</sys:Double>
+    <sys:Double x:Key="HeadingFontSize">14</sys:Double>
+    <sys:Double x:Key="BodyFontSize">12</sys:Double>
+    <sys:Double x:Key="MetaFontSize">11</sys:Double>
+
+    <!-- Nav rail item, shared by the shell (F-013) and Settings' inner rail. SELECTION IS A
+         SHAPE, NOT A FILL — deliberately, and it is the whole reason a rail replaces a scroll of
+         cards. The audit's flatline theme collapses RowBgBrush into BgBrush, which erased the old
+         section cards entirely (finding F-002); a rail whose selected state were a highlight fill
+         would rebuild that same failure in a new shape. So selection is carried by an accent BAR
+         plus a weight change, two cues that both survive a theme with one background colour. Do
+         not add a Background setter to the selected trigger. -->
+    <Style x:Key="NavItemStyle" TargetType="ListBoxItem">
+        <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Grid Background="Transparent">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="3" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Rectangle x:Name="Marker" Grid.Column="0"
+                                   Fill="{DynamicResource CyanBrush}"
+                                   RadiusX="1.5" RadiusY="1.5"
+                                   Visibility="Hidden" />
+                        <!-- Wraps (2026-11-03): long translated labels were cut at the rail's edge, "Bekannte
+                             Roblox-Proble" and "Problemas conhecidos d", in every Store screenshot of the shell. The
+                             implicit TextBlock style reaches the TextBlock WPF generates for string content; the
+                             rails disable horizontal scrolling so items are measured at the rail's width. -->
+                        <ContentPresenter Grid.Column="1" Margin="12,9"
+                                          VerticalAlignment="Center">
+                            <ContentPresenter.Resources>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="TextWrapping" Value="Wrap" />
+                                </Style>
+                            </ContentPresenter.Resources>
+                        </ContentPresenter>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Marker" Property="Visibility" Value="Visible" />
+                            <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+                            <Setter Property="FontWeight" Value="SemiBold" />
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource WhiteBrush}" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+</ResourceDictionary>

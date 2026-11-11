@@ -1,0 +1,248 @@
+using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
+using ROROROblox.Core;
+using ROROROblox.Core.Discord;
+
+namespace ROROROblox.App.Discord;
+
+/// <summary>
+/// Turns triggers into delivered alerts: route (mute, coalesce, cooldown), then send.
+/// <para>
+/// Holds the per-account last-sent map that <see cref="AlertRouter"/> reads, so the router itself
+/// stays pure. A destination whose webhook 404s is marked rejected and surfaced in Settings rather
+/// than retried — a deleted webhook does not come back.
+/// </para>
+/// <para>
+/// Degrade-safe like every other Discord surface: an alert is a passenger. Nothing here may throw
+/// into a caller, because the callers are the memory watchdog, the presence path and — since
+/// metric alerts, 2026-09-11 — a thread-pool timer thread flushing a plugin's grouped reports (a
+/// gRPC handler thread until 2026-09-15), and none of those may be taken down by Discord being
+/// unreachable.
+/// </para>
+/// </summary>
+public sealed class AlertDispatcher(
+    DiscordWebhookSender sender,
+    ITrayService tray,
+    Func<DiscordConfig> config,
+    TimeProvider time,
+    ILogger<AlertDispatcher> log,
+    ROROROblox.App.Notify.PhoneAlertSender? phoneSender = null,
+    Func<ROROROblox.Core.Notify.PhoneNotifyConfig>? phoneConfig = null,
+    Func<AlertCadence>? cadence = null)
+{
+    /// <summary>
+    /// Keyed by <see cref="AlertCooldownKey"/> — (account, KIND), plus the metric id for a metric
+    /// breach (corrected 2026-09-15) — see <see cref="AlertRouter.Route"/> for why each belongs in
+    /// the key. The stamp below and the router's check both build the key with
+    /// <see cref="AlertCooldownKey.For"/>, so they cannot disagree about which slot an alert used.
+    /// Concurrent because this dispatcher has TWO fire-and-forget producers: the view model,
+    /// raising on the UI thread, and the metric sink, raising on a thread-pool timer thread when a
+    /// grouping window closes (a gRPC handler thread until 2026-09-15; both wired in
+    /// <c>App.xaml.cs</c>). A plain Dictionary was
+    /// safe only while the view model was the sole producer, and stopped being safe the moment
+    /// <see cref="AlertKind.MetricBreach"/> got a destination — before that the metric path routed
+    /// nowhere and never reached the write below.
+    /// <para>
+    /// What the race actually did, measured 2026-09-11 against the plain Dictionary: 3 063 of
+    /// 3 200 concurrent dispatches threw, almost all of them
+    /// "Operations that change non-concurrent collections must have exclusive access", and the
+    /// catch in <see cref="DispatchAsync"/> swallowed every one. So the production symptom was
+    /// alerts silently vanishing rather than a crash — and, in the worst case a corrupted bucket
+    /// chain allows, a read that never returns.
+    /// </para>
+    /// <para>
+    /// Known and deliberately NOT fixed here: the cooldown stamp lands AFTER the sends complete,
+    /// so two dispatches racing can both pass the cooldown check and both send. That is narrower
+    /// than the corruption this type prevents, and moving the stamp would change delivery
+    /// behaviour for four already-shipped alert kinds inside a change whose job is a data race.
+    /// </para>
+    /// <para>
+    /// The map is not this type's only shared state, and this paragraph exists because the first
+    /// version of the comment above pretended it was. The three rejection flags —
+    /// <see cref="MineWebhookRejected"/>, <see cref="ClanWebhookRejected"/> and
+    /// <see cref="PhoneRejected"/> — are plain bools written from the same two producer threads.
+    /// They are safe because of HOW they are written, not because of their type: every write is an
+    /// unconditional <c>= true</c> guarded by the send's own verdict, so two racing dispatches can
+    /// only ever agree. <c>flag |= await Send(...)</c> would NOT be safe — the compiler reads the
+    /// property before the await, so a dispatch that reads false and then succeeds would overwrite
+    /// a concurrent dispatch's 404 verdict, leaving a dead webhook offered and Settings reporting
+    /// it healthy (fixed 2026-09-11; <c>DispatchAsync_TwoRacingDispatches_KeepTheRejection</c>
+    /// holds the line). The resets are UI-thread-only and terminal-in-one-direction besides, so a
+    /// torn read is not reachable: a bool write is atomic, and the worst a stale read costs is one
+    /// POST to a URL already known dead.
+    /// </para>
+    /// </summary>
+    private readonly ConcurrentDictionary<AlertCooldownKey, DateTimeOffset> _lastSent = new();
+
+    /// <summary>True once that webhook has returned 404. Surfaced in Settings; also stops the
+    /// dispatcher offering the destination at all — see <see cref="EffectiveConfig"/>.</summary>
+    public bool MineWebhookRejected { get; private set; }
+
+    public bool ClanWebhookRejected { get; private set; }
+
+    /// <summary>True once the push provider has rejected the saved credentials (a Pushover 4xx
+    /// naming the key, an ntfy 403). Same terminal-for-the-session contract as a webhook 404.</summary>
+    public bool PhoneRejected { get; private set; }
+
+    /// <summary>
+    /// Clear the rejection so a newly pasted webhook gets a real chance. Without this, a user who
+    /// deletes a webhook, sees the warning, makes a new one, and pastes it would still be routed
+    /// to desktop-only for the rest of the session — punished for fixing the problem.
+    /// </summary>
+    public void ResetMineRejection() => MineWebhookRejected = false;
+
+    public void ResetClanRejection() => ClanWebhookRejected = false;
+
+    /// <summary>Clear the phone rejection so newly saved credentials get a real chance — the
+    /// same fixing-it-must-work rule the webhook resets exist for.</summary>
+    public void ResetPhoneRejection() => PhoneRejected = false;
+
+    public async Task DispatchAsync(IReadOnlyList<AlertTrigger> triggers)
+    {
+        ArgumentNullException.ThrowIfNull(triggers);
+        if (triggers.Count == 0) return;
+
+        try
+        {
+            var current = EffectiveConfig(config());
+            var now = time.GetUtcNow();
+            var phone = phoneConfig?.Invoke() ?? new ROROROblox.Core.Notify.PhoneNotifyConfig();
+            var phoneReady = phoneSender is not null && !PhoneRejected && phone.IsConfigured;
+            // Read per dispatch, like the Discord config beside it, so a cadence change takes
+            // effect on the next alert rather than on the next launch. A null provider means the
+            // shipped five minutes (AlertCadence.Default) — every test construction site.
+            var pace = cadence?.Invoke() ?? AlertCadence.Default;
+            var routed = AlertRouter.Route(triggers, current, _lastSent, now, phoneReady, pace);
+
+            // Same diagnostic gap that cost three sessions on the presence side: without this, a
+            // delivered alert and a swallowed one look identical in the log (both silent). The
+            // swallowed cases are the ones worth naming — routed nowhere (the shipped default),
+            // muted, or inside the cooldown all look like "the feature is broken" from outside.
+            if (routed.Count == 0)
+            {
+                log.LogInformation(
+                    "Alert raised for {Count} account(s) but routed nowhere — check the destination, the per-account mute, and the {Cooldown}-minute cooldown.",
+                    triggers.Count, pace.Global.TotalMinutes);
+                return;
+            }
+
+            foreach (var alert in routed)
+            {
+                // The clan channel is the one destination exempt from streamer mode — a room the
+                // user deliberately joined, full of people who already know which accounts are
+                // theirs. See AlertTrigger for the full reasoning. Every other destination
+                // (desktop toast, personal channel) keeps the masked name. Built per destination
+                // for its length envelope too: the desktop toast holds 63/255 characters where a
+                // webhook holds 250/992, so each names as many accounts as IT fits and says how
+                // many more (2026-09-15; see PayloadLimits.Toast).
+                var payload = WebhookPayload.ForAlert(
+                    alert.Kind, alert.Triggers, useRealNames: alert.Destination == AlertDestination.Clan,
+                    limits: PayloadLimits.For(alert.Destination));
+
+                log.LogInformation("Alert → {Destination}: {Title} ({Count} account(s)).",
+                    alert.Destination, payload.Title, alert.Triggers.Count);
+
+                switch (alert.Destination)
+                {
+                    case AlertDestination.Local:
+                        // The trailing id is what makes the drawn balloon clickable (v1.33 item 4).
+                        // Supplied here and nowhere else: this is the only place that knows which
+                        // accounts a coalesced group covered by the time it becomes one balloon.
+                        tray.ShowToast(payload.Title, payload.Body, SingleAccount(alert.Triggers));
+                        break;
+                    // `if (send) flag = true`, never `flag |= await send`: the compiler reads the
+                    // property BEFORE the await, so `|=` opens a read-to-write window spanning a
+                    // whole HTTP round trip and a concurrent dispatch's 404 verdict can be
+                    // overwritten by this one's success. Writing only true has no such window.
+                    case AlertDestination.Mine when current.MineWebhookUrl is { } mine:
+                        if (await SendAsync(mine, payload).ConfigureAwait(false)) MineWebhookRejected = true;
+                        break;
+                    case AlertDestination.Clan when current.ClanWebhookUrl is { } clan:
+                        if (await SendAsync(clan, payload).ConfigureAwait(false)) ClanWebhookRejected = true;
+                        break;
+                    case AlertDestination.Phone when phoneSender is not null:
+                        var phoneResult = await phoneSender.SendAsync(phone, alert.Kind, payload).ConfigureAwait(false);
+                        if (phoneResult == Notify.PhoneSendResult.EndpointRejected)
+                        {
+                            log.LogInformation("The push provider rejected the saved credentials; disabling the phone destination.");
+                            PhoneRejected = true;
+                        }
+                        break;
+                }
+
+                // The indexer setter is the concurrent idiom for an unconditional overwrite —
+                // atomic per key, last writer wins, which is exactly the semantics this had
+                // single-threaded. AddOrUpdate would say the same thing in more words.
+                foreach (var t in alert.Triggers) { _lastSent[AlertCooldownKey.For(t)] = now; }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "Alert dispatch failed; the alert was dropped.");
+        }
+    }
+
+    /// <summary>
+    /// The one account a routed group is about, or <c>null</c> when it is about more than one — or
+    /// about none. It is what <c>ITrayService.ShowToast</c> hands the drawn balloon so a click can
+    /// focus that row (v1.33 item 4).
+    /// <para>
+    /// DISTINCT ACCOUNTS, not trigger count. One flapping client can raise the same kind twice
+    /// inside a coalescing window and that balloon is still about one row;
+    /// <c>DispatchAsync_TwoTriggersForOneAccount_StillHandsThatAccount</c> is the case that fails
+    /// the easier rule.
+    /// </para>
+    /// <para>
+    /// <see cref="Guid.Empty"/> IS EXCLUDED, and it is not a defensive flourish:
+    /// <see cref="AlertKind.UptimeMark"/> carries Empty as its account id by design, because a
+    /// global mark must not be silenced by any one account's mute. Empty counts as one distinct id,
+    /// so a plain distinct-count rule would call the uptime mark single-account and hand a click an
+    /// account that does not exist — the window would surface and then fail to find a row.
+    /// </para>
+    /// <para>
+    /// A group of three carries nothing and its balloon is honestly unclickable. Picking the first
+    /// of three would be a coin flip dressed as a feature, and it is the special case this cycle
+    /// exists to delete rather than re-create.
+    /// </para>
+    /// </summary>
+    private static Guid? SingleAccount(IReadOnlyList<AlertTrigger> triggers)
+    {
+        Guid? only = null;
+        foreach (var t in triggers)
+        {
+            if (t.AccountId == Guid.Empty) return null;
+            if (only is null) { only = t.AccountId; continue; }
+            if (only != t.AccountId) return null;
+        }
+        return only;
+    }
+
+    /// <summary>
+    /// Blanks out any webhook already known to be dead, which does two things at once: the dead URL
+    /// is never POSTed again, and <see cref="AlertRouter"/>'s existing "destination configured but
+    /// no webhook → fall back to the desktop notification" rule takes over automatically, so the
+    /// user still finds out.
+    /// <para>
+    /// Marking a flag is not the same as acting on it. Without this, a 404'd webhook is re-POSTed
+    /// on every alert forever AND every one of those alerts vanishes — the worst of both, and the
+    /// exact opposite of what "a 404 is terminal" is supposed to buy.
+    /// </para>
+    /// </summary>
+    private DiscordConfig EffectiveConfig(DiscordConfig current) => current with
+    {
+        MineWebhookUrl = MineWebhookRejected ? null : current.MineWebhookUrl,
+        ClanWebhookUrl = ClanWebhookRejected ? null : current.ClanWebhookUrl,
+    };
+
+    /// <summary>Returns true when the destination should be treated as dead.</summary>
+    private async Task<bool> SendAsync(string url, WebhookPayload payload)
+    {
+        var result = await sender.SendAsync(url, payload).ConfigureAwait(false);
+        if (result == WebhookSendResult.WebhookGone)
+        {
+            log.LogInformation("A Discord webhook returned 404; disabling that destination.");
+            return true;
+        }
+        return false;
+    }
+}

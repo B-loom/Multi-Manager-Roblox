@@ -1,0 +1,426 @@
+syntax = "proto3";
+
+option csharp_namespace = "ROROROblox.PluginContract";
+
+package rororo.plugin.v1;
+
+// =====================================================================
+// Services
+// =====================================================================
+
+// RoRoRoHost — implemented by RoRoRo, called by the plugin.
+service RoRoRoHost {
+  // Handshake — first call after the named-pipe connection is established.
+  // Plugin sends manifest hash + contract version; RoRoRo responds with host info
+  // or rejects the connection.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Read surface
+  rpc GetHostInfo(Empty) returns (HostInfo);
+  rpc GetRunningAccounts(Empty) returns (RunningAccountsList);
+
+  // Server-streaming events
+  rpc SubscribeAccountLaunched(SubscriptionRequest) returns (stream AccountLaunchedEvent);
+  rpc SubscribeAccountExited(SubscriptionRequest) returns (stream AccountExitedEvent);
+  rpc SubscribeMutexStateChanged(SubscriptionRequest) returns (stream MutexStateEvent);
+
+  // Server-streaming events (additive, NuGet 0.7.0): memory-pressure crossings from the
+  // host's memory watchdog. One stream item per tracked account whenever the watchdog
+  // latches a new crossing (a cap breach or a projection-to-ceiling warning) -- not a
+  // continuous telemetry feed. Pairs naturally with StopAccounts + RequestLaunch/
+  // RequestLaunchTarget: a plugin can recycle the fattest client and relaunch it back
+  // into the same server. See AUTHOR_GUIDE.md's "React to memory pressure" recipe.
+  rpc SubscribeMemoryPressure(SubscriptionRequest) returns (stream AccountMemorySnapshot);
+
+  // Theming (additive, NuGet 0.8.0). The wire contract_version stays "1.0" -- these are
+  // new methods on the host's own service, so a plugin that never calls them is entirely
+  // unaffected and still handshakes.
+  //
+  // Two RPCs rather than one because a theme is STATE, not an occurrence. GetTheme answers
+  // "what colour are you right now" for a plugin connecting mid-session; the stream answers
+  // "tell me when that changes". Same split the contract already makes elsewhere:
+  // GetRunningAccounts pairs with the launch/exit streams, while SubscribeMemoryPressure has
+  // no paired read because a pressure crossing is an event, not a state you can ask about.
+  //
+  // Before this existed, a plugin wanting to match the host had to read RoRoRo's settings.json
+  // and themes folder directly -- which worked for user themes (they are files) and could never
+  // work for built-ins (they are records in host code). See F-091.
+  rpc GetTheme(Empty) returns (ThemePalette);
+  rpc SubscribeThemeChanged(SubscriptionRequest) returns (stream ThemePalette);
+
+  // Command surface
+  rpc RequestLaunch(LaunchRequest) returns (LaunchResult);
+
+  // Command surface (contract 1.0, additive in NuGet 0.2.0)
+  rpc RequestLaunchTarget(LaunchTargetRequest) returns (LaunchResult);
+  // Query surface (additive)
+  rpc GetCurrentServer(Empty) returns (CurrentServer);
+  // Query surface (additive, NuGet 0.3.0): per-account idle awareness.
+  rpc GetAccountActivity(Empty) returns (AccountActivityList);
+  // Query surface (additive, NuGet 0.9.0): ALL saved accounts + is_main, so a connector can
+  // resolve human names and "the main" before launching. GetRunningAccounts lists running only.
+  rpc GetAccounts(Empty) returns (SavedAccountsList);
+
+  // Command surface (additive, NuGet 0.5.0): a keep-alive plugin credits an account as
+  // active after it acts on that account's window (idle heuristic can't see plugin input).
+  rpc MarkAccountActive(MarkAccountActiveRequest) returns (Empty);
+
+  // Command surface (additive, NuGet 0.6.0): stop Roblox clients RoRoRo tracks, per account.
+  // Graceful close (CloseMainWindow) first, hard kill only as fallback — the same sequence the
+  // main window's per-account close button uses. Never touches an untracked process: clients
+  // RoRoRo did not launch (or could not re-attach to) are the startup leftover gate's problem,
+  // not this rpc's.
+  //
+  // stopped_count means the stop was ISSUED, not that the client is gone — process exit is
+  // asynchronous. A caller relaunching an account must poll GetRunningAccounts until the
+  // account disappears, or it will race the dying client.
+  rpc StopAccounts(StopAccountsRequest) returns (StopAccountsResult);
+
+  // Metric reporting (additive, NuGet 0.10.0). A consented plugin reports ONE number it
+  // gathered itself; the host keeps the history, applies the rules, and decides whether that
+  // is worth an alert.
+  //
+  // The split is deliberate and is the whole design. Thresholding stays in the host so a
+  // metric alert inherits per-account mute and coalescing from the same router every other
+  // alert kind rides. (Corrected 2026-09-15: a metric breach's cooldown is keyed by account
+  // and metric id, not account and kind — every other alert kind keeps the per-(account,
+  // kind) cooldown this comment used to claim for all of them.) A plugin that decided for
+  // itself when to page would bypass all of that, and "a bad night becomes forty
+  // notifications" is the one outcome this feature must not produce.
+  //
+  // Fire-and-forget: the host returns Empty whether or not the report produced an alert.
+  // A plugin cannot learn whether it made the user's phone buzz, and does not need to.
+  rpc ReportMetric(MetricReport) returns (Empty);
+
+  // UI surface (v1: tray menu, row badge, status panel)
+  rpc AddTrayMenuItem(MenuItemSpec) returns (UIHandle);
+  rpc AddRowBadge(RowBadgeSpec) returns (UIHandle);
+  rpc AddStatusPanel(StatusPanelSpec) returns (UIHandle);
+  rpc UpdateUI(UIUpdate) returns (Empty);
+  rpc RemoveUI(UIHandle) returns (Empty);
+}
+
+// Plugin — implemented by the plugin, called by RoRoRo.
+service Plugin {
+  rpc OnUIInteraction(UIInteractionEvent) returns (Empty);
+  rpc OnConsentChanged(ConsentChangeEvent) returns (Empty);
+  rpc OnShutdown(Empty) returns (Empty);
+}
+
+// =====================================================================
+// Messages
+// =====================================================================
+
+message Empty {}
+
+message HandshakeRequest {
+  string plugin_id = 1;
+  string manifest_sha256 = 2;
+  string contract_version = 3;  // semver, e.g. "1.0"
+  repeated string declared_capabilities = 4;
+}
+
+message HandshakeResponse {
+  bool accepted = 1;
+  string reject_reason = 2;
+  string host_version = 3;
+  string contract_version = 4;
+}
+
+message HostInfo {
+  string version = 1;
+  bool multi_instance_enabled = 2;
+  string multi_instance_state = 3;  // "On" / "Off" / "Error"
+  // 0.12.0: build identity, so a caller can tell which binary it is driving.
+  string install_flavour = 4;       // "store" / "sideload" / "dev"
+  string process_path = 5;          // Environment.ProcessPath of the host
+  string informational_version = 6; // AssemblyInformationalVersion, e.g. "1.33.0+<commit>"
+  // 0.13.0: false while RoRoRo is still loading saved accounts at startup. Until it is true,
+  // GetAccounts and the launch calls wait briefly and then refuse with "accounts-loading" rather
+  // than answer with an empty roster. Older hosts leave it false; treat a host whose version
+  // predates 1.35 as loaded.
+  bool accounts_loaded = 7;
+  // 0.14.0: how the PREVIOUS RoRoRo session ended, so a caller that just found the host freshly
+  // started can say why. last_exit_reason is one of "none" (first run, no record), "clean",
+  // "session-ending" (Windows logoff or shutdown; detail names which), "crash" (detail is the
+  // exception type, HResult and message, nothing more) or "unknown" (the record still said
+  // running: killed, power loss, or servicing that gave no notice). last_exit_at_unix_ms is when
+  // that record was written, 0 for "none": the exit time, except for "unknown", where nothing
+  // recorded the end and it is the time that session started. Older hosts leave all three empty.
+  string last_exit_reason = 8;
+  string last_exit_detail = 9;
+  int64 last_exit_at_unix_ms = 10;
+}
+
+message RunningAccountsList {
+  repeated RunningAccount accounts = 1;
+}
+
+message RunningAccount {
+  string account_id = 1;       // RoRoRo internal Guid as string
+  int64 roblox_user_id = 2;    // UID-aware: which Roblox user this account is
+  string display_name = 3;
+  int32 process_id = 4;
+  // Game identity from the host's presence tracking (0.4.0). 0 / empty when
+  // unknown — presence can lag a fresh launch; plugins must treat that as
+  // "no game info", never as a game named "".
+  int64 place_id = 5;
+  string place_name = 6;
+}
+
+message SubscriptionRequest {
+  // No filters in v1 — plugin subscribes to all events.
+}
+
+// The host's ACTIVE palette, as applied (0.8.0). Resolved #RRGGBB values only.
+//
+// There is deliberately NO id and NO name field, and that absence is the feature. A plugin
+// that receives a theme id needs somewhere to look it up, and "somewhere" was RoRoRo's own
+// settings.json plus its themes folder plus its file-naming policy -- five internal storage
+// details a plugin had no business knowing, any of which could change in a host release
+// without the plugin noticing. That was F-091. Sending colours instead of a name removes the
+// lookup entirely.
+//
+// These are the values ThemeService.ApplyTo actually wrote, read back out of the resource
+// dictionary rather than copied from the host's Theme record. The two can differ: a hex that
+// will not parse leaves the previous brush in place, so the record says one thing while the
+// screen shows another. The screen wins here, which is the same rule the host's own contrast
+// gate follows.
+message ThemePalette {
+  string bg = 1;
+  string cyan = 2;
+  string magenta = 3;
+  string white = 4;
+  string muted_text = 5;
+  string divider = 6;
+  string row_bg = 7;
+  string row_expired_bg = 8;
+  string row_expired_accent = 9;
+  string navy = 10;
+  // Derived by the host, not authored by the theme: an interactive control's edge has to
+  // clear WCAG 1.4.11's 3:1 against the surface behind it, and the host substitutes when an
+  // authored divider does not. Absent from the host's Theme record by design, so a plugin
+  // cannot compute this without a second copy of that logic -- which is why it ships here.
+  string interactive_edge = 11;
+}
+
+message AccountLaunchedEvent {
+  string account_id = 1;
+  int64 roblox_user_id = 2;
+  string display_name = 3;
+  int32 process_id = 4;
+  int64 launched_at_unix_ms = 5;
+  // Game identity from the host's presence tracking (0.4.0). Often still
+  // 0 / empty at launch time (presence lags the process attach) — plugins
+  // wanting fresh identity should re-query GetRunningAccounts.
+  int64 place_id = 6;
+  string place_name = 7;
+}
+
+message AccountExitedEvent {
+  string account_id = 1;
+  int64 roblox_user_id = 2;
+  int32 process_id = 3;
+  int64 exited_at_unix_ms = 4;
+}
+
+message MutexStateEvent {
+  string state = 1;  // "On" / "Off" / "Error"
+}
+
+// One tracked account's memory reading at the moment the host's watchdog latched a
+// pressure crossing (NuGet 0.7.0). Every account the watchdog is tracking is included
+// on each crossing, not just the one that tripped the latch -- read is_target / over_cap
+// per-item to see which account(s) are actually the problem.
+message AccountMemorySnapshot {
+  string account_id       = 1;
+  uint64 private_bytes    = 2;
+  double growth_mb_per_hr = 3;
+
+  // Minutes until the machine is projected to hit its RAM ceiling at current growth.
+  // 0 means "no valid projection" (not enough observation time yet, growth is flat, or
+  // the system-memory read failed this tick) -- NEVER read 0 as "zero minutes left, act
+  // now". If your plugin needs to distinguish "no projection" from "imminent", treat any
+  // is_target/over_cap signal as the actionable trigger and use this field only when it
+  // is non-zero.
+  uint32 mins_to_ceiling  = 4;
+  bool   over_cap         = 5;
+  bool   is_target        = 6;   // fattest client with a valid reading, at fire time
+
+  // False when the host could not read this account's process memory THIS tick (the
+  // process may have exited, be elevated, or the read may have simply failed). When
+  // false, private_bytes is a last-known-good figure carried forward from an earlier
+  // successful read, NOT a fresh sample -- do not act on it as current. over_cap and
+  // is_target are always false when read_ok is false: the host itself doesn't trust an
+  // unreadable account enough to flag it as over-cap or select it as the recycle target,
+  // and a plugin shouldn't either.
+  bool   read_ok          = 7;
+}
+
+message LaunchRequest {
+  string account_id = 1;
+  // future: place_id, fps_cap (not v1)
+}
+
+message LaunchResult {
+  bool ok = 1;
+  string failure_reason = 2;
+  int32 process_id = 3;
+  // Machine-readable refusal code (e.g. "follow-target-not-joinable"). Empty when ok is true or
+  // the failure has no stable code yet. Additive field — contract stays "1.0".
+  string reason_code = 4;
+}
+
+message LaunchTargetRequest {
+  string account_id = 1;
+  oneof target {
+    // A Roblox server link in ANY form the host understands (private-server share
+    // URL, PlaceLauncher accessCode URL, roblox.com/share token, public game URL,
+    // or a bare place id). The host resolves it via its existing share-URL resolver.
+    string share_url = 2;
+    // Follow a friend into whatever server they're in (Roblox permission-checks).
+    int64 follow_user_id = 3;
+    // 0.14.0: launch into ONE named public server. Both halves must come from the same entry of
+    // Roblox's public games.roblox.com/v1/games/{placeId}/servers/Public list for that place id:
+    // place_id is the {placeId} you queried, game_instance_id is that entry's `id`. They only mean
+    // anything together (the host's ServerInstance). A full server queues and the host never falls
+    // back to matchmaking. A half pair or a malformed id is refused with reason_code
+    // "invalid-target". A host older than 0.14.0 refuses it as having no target.
+    GameInstance game_instance = 4;
+  }
+}
+
+message GameInstance {
+  int64  place_id          = 1;
+  string game_instance_id = 2;
+}
+
+message CurrentServer {
+  bool present = 1;                    // false when no private server has been launched
+  string share_url = 2;               // ready-to-post shareable link
+  string place_name = 3;
+  int64  place_id = 4;
+  int64  last_launched_at_unix_ms = 5;
+}
+
+message AccountActivity {
+  string account_id = 1;
+  int64  last_activity_unix_ms = 2;
+  int64  seconds_since_activity = 3;
+}
+
+message AccountActivityList {
+  repeated AccountActivity items = 1;
+}
+
+message MarkAccountActiveRequest {
+  string account_id = 1;
+}
+
+// One number, for one subject, at one instant.
+message MetricReport {
+  // A RoRoRo account id (the stringified Guid from GetAccounts), or empty for a metric that
+  // is not about any one account. Mapping an EXTERNAL identity -- a game's user id, a clan
+  // member -- onto a RoRoRo account is the plugin's job, because the plugin is the only side
+  // that knows the external system. GetAccounts carries roblox_user_id for exactly this.
+  //
+  // An id the host does not recognise is treated as the empty case rather than rejected: the
+  // alert still reaches the user, keyed globally, instead of vanishing because a plugin
+  // guessed an id wrong.
+  string subject_id = 1;
+
+  // Opaque to the host. The host stores history per (subject, metric_id) and matches rules by
+  // exact ordinal comparison. It carries no meaning here -- naming it "battle.points" or
+  // "widgets" is entirely the plugin's and the user's business, and the host ships no list of
+  // known ids because shipping one would name a game.
+  string metric_id = 2;
+
+  // Whatever the source reported, raw, and frequently CUMULATIVE (points so far) rather than
+  // a rate. Deriving a rate from two of these is the host's job, not the plugin's.
+  double value = 3;
+
+  // When the plugin observed it, UTC, unix milliseconds. NOT when it sent it.
+  //
+  // The host compares this against its own clock and drops a report stamped in the future,
+  // with a log line. That asymmetry is worth knowing: a rate is computed over a time window
+  // and so a skewed clock silently disables Rate rules ONLY, while Level and Event rules
+  // keep working -- the feature half-works and nobody can tell. Send real UTC.
+  int64 observed_at_unix_ms = 4;
+}
+
+message StopAccountsRequest {
+  // Empty = every account RoRoRo is currently tracking a client for.
+  // Otherwise, only these accounts. Ids RoRoRo isn't tracking come back in
+  // failed_account_ids rather than failing the whole call.
+  repeated string account_ids = 1;
+  // 0.13.0: return only once each stopped account's client has exited (or timeout_ms passes),
+  // instead of as soon as the stop is issued. A relaunch straight after a waited stop no longer
+  // meets "Account is already running".
+  bool wait_for_exit = 2;
+  // With wait_for_exit: how long to wait. 0 or less means 30000; capped at 120000. The stop
+  // itself asks the client to close, then forces it after a 10 s grace, so 30 s covers it.
+  int32 timeout_ms = 3;
+}
+
+message StopAccountsResult {
+  int32 stopped_count = 1;
+  // Unknown id, no tracked client, or the close+kill sequence failed.
+  repeated string failed_account_ids = 2;
+  // 0.13.0, filled only with wait_for_exit. Every stopped account lands in exactly one of these.
+  repeated string exited_account_ids = 3;        // confirmed gone: safe to relaunch
+  repeated string still_running_account_ids = 4; // the wait ran out first
+}
+
+message SavedAccountsList {
+  repeated SavedAccount accounts = 1;
+}
+
+// Place-free on purpose: a saved-but-not-running account is not in a game. Live game
+// identity comes from the enriched GetRunningAccounts (0.4.0).
+message SavedAccount {
+  string account_id = 1;       // RoRoRo internal Guid as string
+  int64  roblox_user_id = 2;   // 0 when not yet resolved
+  string display_name = 3;     // what the app shows; streamer mode masks here too
+  bool   is_main = 4;
+}
+
+message UIHandle {
+  string id = 1;  // RoRoRo-issued, opaque to plugin
+}
+
+message MenuItemSpec {
+  string label = 1;
+  string tooltip = 2;
+  bool enabled = 3;
+}
+
+message RowBadgeSpec {
+  string text = 1;
+  string color_hex = 2;  // optional override; default to brand cyan
+  string tooltip = 3;
+}
+
+message StatusPanelSpec {
+  string title = 1;
+  string body_markdown = 2;  // basic markdown subset (bold, italic, lists)
+}
+
+message UIUpdate {
+  UIHandle handle = 1;
+  oneof kind {
+    MenuItemSpec menu_item = 2;
+    RowBadgeSpec row_badge = 3;
+    StatusPanelSpec status_panel = 4;
+  }
+}
+
+message UIInteractionEvent {
+  UIHandle handle = 1;
+  string interaction_kind = 2;  // "click", "hover-enter", "hover-leave"
+  int64 timestamp_unix_ms = 3;
+}
+
+message ConsentChangeEvent {
+  repeated string newly_granted_capabilities = 1;
+  repeated string newly_revoked_capabilities = 2;
+}

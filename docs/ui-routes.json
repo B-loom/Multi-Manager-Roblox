@@ -1,0 +1,437 @@
+{
+  "app": "RoRoRo",
+  "processName": "ROROROblox.App",
+  "_note": "Every step names a control TYPE as well as a name or AutomationId, and the resolver additionally requires the UIA pattern the verb needs. This is not decoration: five elements in this app are named 'Settings' (a Window, a TitleBar, two Texts and the Button), and a name-only FindFirst returns the Window, which carries no InvokePattern. Steps that resolve to zero or to more than one element are errors, never a silent first-match.",
+  "_note_f013": "Since the F-013 shell fold (2026-08-21), Games/Settings/History/Diagnostics/Plugins/About are PAGES of one non-modal ShellWindow whose title tracks the active page. The routes below survive because the shell answers to the same Window names the six windows carried (the title IS the destination noun), and Settings' inner rail keeps its SettingsNav name. (2026-08-30, F-098 walk: the names half of this note held, but the SCOPING half did not — the shell is an unowned top-level window, so nothing in it was reachable from a main-window-rooted search and every cross-window flow had been failing since the fold; capture-ui.ps1's Search-AppScopes now widens resolution across the app's windows.) Only About's captured name changed: the About WINDOW was allowed the product name, the shell page is titled plain 'About'. close-window on a destination name now closes the whole shell, which is what resets state between routes.",
+  "deny": [
+    "Stop all Roblox instances",
+    "Remove",
+    "Launch As",
+    "Launch multiple",
+    "Squad Launch",
+    "Stop",
+    "Recycle",
+    "Stop all",
+    "Open Roblox home",
+    "Play",
+    "Play as"
+  ],
+  "_note_denyAids": "The deny list above is ENGLISH DISPLAY TEXT and stops working the moment the app runs in another language -- a Polish 'Zatrzymaj' is not in it. These AutomationIds are the language-independent form of the same guard, and are what the resolver actually enforces on localized runs. Added 2026-09-09 with the language parameter; the name list is kept because it still catches an English-run route that names a destructive control directly. DangerPanelLaunch is shared by every account-panel entry, which are named by game and so have no fixed name for the list above to catch: the id is their real guard (a route naming it also matches many elements, which the resolver treats as an error). DangerPlay and DangerPlayAs (v1.36 item 9) are the Library's per-entry launch buttons, each named by its game (\"Play Pet Simulator 99\"), so the id is the guard that holds in every language; the English list above carries the bare words Play and Play as.",
+  "denyAids": [
+    "DangerStop",
+    "DangerRemove",
+    "DangerLaunchAs",
+    "DangerRecycle",
+    "DangerSquadLaunch",
+    "DangerLaunchMultiple",
+    "DangerStopAll",
+    "DangerPanelLaunch",
+    "DangerOpenRobloxHome",
+    "DangerPlay",
+    "DangerPlayAs"
+  ],
+  "surfaces": [
+    {
+      "id": "01",
+      "name": "main-window",
+      "capture": {
+        "type": "Window",
+        "aid": "MainWindow"
+      }
+    },
+    {
+      "id": "02",
+      "name": "main-window-empty",
+      "skip": "Requires zero saved accounts; the live profile has eight. Documented gap, see the design spec section 11."
+    },
+    {
+      "id": "03",
+      "name": "preferences",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavStartup"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "03a",
+      "name": "preferences-accounts",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavAccounts"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "03b",
+      "name": "preferences-alerts",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavAlerts"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "03c",
+      "name": "preferences-discord",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavDiscord"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "03d",
+      "name": "preferences-appearance",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavAppearance"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "05",
+      "name": "about",
+      "open": [
+        {
+          "do": "expand",
+          "type": "Button",
+          "aid": "ToolbarTools"
+        },
+        {
+          "do": "invoke",
+          "type": "MenuItem",
+          "aid": "ToolsAbout"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "06",
+      "name": "history",
+      "open": [
+        {
+          "do": "expand",
+          "type": "Button",
+          "aid": "ToolbarTools"
+        },
+        {
+          "do": "invoke",
+          "type": "MenuItem",
+          "aid": "ToolsHistory"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "07",
+      "name": "diagnostics",
+      "open": [
+        {
+          "do": "expand",
+          "type": "Button",
+          "aid": "ToolbarTools"
+        },
+        {
+          "do": "invoke",
+          "type": "MenuItem",
+          "aid": "ToolsDiagnostics"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "08",
+      "name": "games",
+      "_note": "Route-driven again as of v1.20: Games left the Tools popup and is a main-window Button, so it resolves from the window root without an expand step. 'Games' also names the captured Window and the default-game ToggleButton is a UIA Button, but neither can win this step -- the Window carries no InvokePattern and a ToggleButton exposes Toggle, not Invoke, so the Type+Verb pair the resolver requires leaves exactly one match.",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarGames"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "09",
+      "name": "plugins",
+      "open": [
+        {
+          "do": "expand",
+          "type": "Button",
+          "aid": "ToolbarTools"
+        },
+        {
+          "do": "invoke",
+          "type": "MenuItem",
+          "aid": "ToolsPlugins"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ShellWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "10",
+      "name": "theme-builder",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavAppearance"
+        },
+        {
+          "do": "invoke",
+          "aid": "BuildThemeButton",
+          "type": "Button"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ThemeBuilderWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ThemeBuilderWindow"
+        },
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    },
+    {
+      "id": "11",
+      "name": "tray-menu",
+      "skip": "Confirmed reachable, not routable. Right-clicking the tray icon (default-hidden behind Explorer's 'Show Hidden Icons' overflow) opens a real WPF ContextMenu as its own top-level Popup HWND owned by this process -- proven live via UI Automation (Popup element, pid matched ROROROblox.App) containing 8 MenuItems (Multi-Instance toggle, Streamer mode, Stop all Roblox instances, Open ROROROblox, Settings..., History..., Diagnostics..., Plugins..., Open log folder, Quit). Not converted: reaching it needs a right-click on an element inside Explorer's Shell_TrayWnd/overflow-flyout tree (a different process, and only reachable after invoking 'Show Hidden Icons'), which needs raw mouse-coordinate simulation. That is outside the route schema's verb vocabulary (invoke/select/expand/close-window) and Resolve-UiaElement's single-scope ($appRoot) resolution model. Converting this is a resolver-contract change, not a route addition."
+    },
+    {
+      "id": "20",
+      "name": "welcome",
+      "open": [
+        {
+          "do": "expand",
+          "type": "Button",
+          "aid": "ToolbarTools"
+        },
+        {
+          "do": "invoke",
+          "type": "MenuItem",
+          "aid": "ToolsWelcomeTour"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "WelcomeWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "WelcomeWindow"
+        }
+      ]
+    },
+    {
+      "id": "21",
+      "name": "squad-launch",
+      "skip": "Confirmed via source, not converted. MainViewModel.OpenSquadLaunchAsync (MainViewModel.cs:2077-2097) shows the button opens SquadLaunchWindow.ShowDialog() -- a target-picker dialog -- and only calls SquadLaunchAsync (which launches Roblox clients) if the dialog returns true with a selected target. So the click itself is a dialog open, not a direct launch. Despite that, it stays on the deny list and skipped: deny-list membership is a compiled contract asserted by UiRoutesSchemaTests.NoRouteTargetsADeniedName, which pins both an Assert.Contains per entry and a hardcoded Assert.Equal on the list's total count. Removing 'Squad Launch' from deny therefore means deliberately editing that test, not just this route file -- outside this task's scope to do unilaterally."
+    },
+    {
+      "id": "22",
+      "name": "join-by-link",
+      "skip": "Confirmed reachable, not routable. MainWindow.xaml.cs:165 (OnGameComboBoxSelectionChanged) shows the trigger is selecting the '(Paste a link...)' sentinel entry in a per-account Game ComboBox (MainWindow.xaml:758-763) -- not a button. That ComboBox carries no x:Name or AutomationId and is instantiated once per saved account row, so every row's ComboBox is structurally identical and unaddressable by the route schema's Type+Name/Aid contract without an ancestor anchor, and there is no such anchor either (rows carry no distinguishing AutomationId). The only selector left would be a specific account's display name, which is live per-profile data (the route file is shared/committed) and would break on any profile with a different account list or zero accounts (the same class of gap already documented for surface 02)."
+    },
+    {
+      "id": "23",
+      "name": "export-accounts",
+      "open": [
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ToolbarSettings"
+        },
+        {
+          "do": "select",
+          "type": "ListItem",
+          "within": "SettingsNav",
+          "aid": "NavAccounts"
+        },
+        {
+          "do": "invoke",
+          "type": "Button",
+          "aid": "ExportAccountsButton"
+        }
+      ],
+      "capture": {
+        "type": "Window",
+        "aid": "ExportAccountsWindow"
+      },
+      "close": [
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ExportAccountsWindow"
+        },
+        {
+          "do": "close-window",
+          "type": "Window",
+          "aid": "ShellWindow"
+        }
+      ]
+    }
+  ]
+}

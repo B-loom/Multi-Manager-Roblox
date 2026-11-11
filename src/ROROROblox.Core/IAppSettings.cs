@@ -1,0 +1,294 @@
+namespace ROROROblox.Core;
+
+/// <summary>
+/// Per-user app preferences — theme, startup toggles, dismissed warnings and the rest.
+/// <para>
+/// This summary claimed "First-launch UX prompts to seed; the Preferences dialog allows editing"
+/// until v1.21 item 9. Neither had been true for over a cycle: no window read <c>DefaultPlaceUrl</c>
+/// and none ever wrote it, and per-account favourites (<c>IFavoriteGameStore</c>) replaced the
+/// single-URL model entirely. An interface comment describing a dialog that does not exist is worse
+/// than no comment, because it is the first thing a reader trusts. F-093 deleted the field rather
+/// than correcting the sentence a second time.
+/// </para>
+/// </summary>
+public interface IAppSettings
+{
+    // DefaultPlaceUrl was DELETED by F-093, along with the legacy LaunchAsync overload that was
+    // its only reader. It had been documented as editable in the Preferences dialog for more than a
+    // cycle while the App referenced it zero times. System.Text.Json ignores unknown keys, so an old
+    // settings.json still loads clean; the dead value is dropped on the next write, which is correct
+    // because nothing could read it back and no UI could set it again.
+
+    /// <summary>
+    /// True when ROROROblox should launch the user's main account into its current per-row
+    /// game pick a moment after the app finishes starting. Defaults to false; the user opts in
+    /// via the Preferences dialog. Pairs with run-on-login for hands-free login → playing flow.
+    /// </summary>
+    Task<bool> GetLaunchMainOnStartupAsync();
+    Task SetLaunchMainOnStartupAsync(bool enabled);
+
+    /// <summary>"Keep Roblox windowed": before each launch, a saved Fullscreen preference is
+    /// turned off in Roblox's own settings file. Defaults ON — for multi-instance, a client
+    /// swallowing the whole screen is almost never what the user meant (Este, 2026-09-05).</summary>
+    Task<bool> GetLaunchWindowedAsync();
+    Task SetLaunchWindowedAsync(bool enabled);
+
+    /// <summary>
+    /// Active theme id from <c>%LOCALAPPDATA%\ROROROblox\themes\</c> (or a built-in id like
+    /// "brand"). Empty / unknown id falls back to the "brand" built-in at startup.
+    /// </summary>
+    Task<string?> GetActiveThemeIdAsync();
+    Task SetActiveThemeIdAsync(string themeId);
+
+    /// <summary>
+    /// A theme author's answer to "may we raise this theme's interactive-control edge so it meets
+    /// the 3:1 contrast floor?", keyed by theme id. <c>null</c> means never asked — the question is
+    /// put once per theme and never again. <c>true</c> accepted; <c>false</c> declined, and the
+    /// theme then renders exactly as authored.
+    /// <para>
+    /// Keyed per theme rather than per app because the answer is about somebody's specific work.
+    /// Switching to a different custom theme is a different question. Built-in themes are never
+    /// asked about (the shortfall is ours to fix), so they never appear here.
+    /// </para>
+    /// </summary>
+    Task<bool?> GetEdgeRemediationAnswerAsync(string themeId);
+    Task SetEdgeRemediationAnswerAsync(string themeId, bool accepted);
+
+    /// <summary>
+    /// True after the user has dismissed the "Bloxstrap will override per-account FPS"
+    /// banner. Persisted so the banner does not re-render on every launch.
+    /// </summary>
+    Task<bool> GetBloxstrapWarningDismissedAsync();
+    Task SetBloxstrapWarningDismissedAsync(bool value);
+
+    /// <summary>
+    /// The canonical signature (see <c>MainViewModel.ComputeFpsCapSignature</c>) of the distinct
+    /// FPS-cap set that was in effect the last time the user dismissed the FPS-cap mismatch
+    /// banner. <c>null</c> means nothing has ever been dismissed. Persisted so the banner does
+    /// not re-render on every launch for a mismatch the user already acknowledged, but DOES
+    /// re-render if the set of distinct caps later changes to something not covered by this
+    /// signature — dismissal is scoped to the configuration, not "forever."
+    /// </summary>
+    Task<string?> GetDismissedFpsCapWarningSignatureAsync();
+    Task SetDismissedFpsCapWarningSignatureAsync(string? signature);
+
+    /// <summary>
+    /// True when the idle-alert toast should stay silent. Defaults to false (alerts on).
+    /// The user opts out via the Preferences dialog.
+    /// </summary>
+    Task<bool> GetMuteIdleAlertsAsync();
+    Task SetMuteIdleAlertsAsync(bool muted);
+
+    /// <summary>
+    /// Minutes of inactivity before the idle-warn line fires. Defaults to 15. A non-positive
+    /// stored or requested value is guarded back to 15 rather than treated as "disabled."
+    /// </summary>
+    Task<int> GetIdleWarnThresholdMinutesAsync();
+    Task SetIdleWarnThresholdMinutesAsync(int minutes);
+
+    /// <summary>
+    /// True when Squad Launch should wait for each account to fully land in the game before
+    /// dispatching the next. Defaults to false (fire all at once). The user opts in via the
+    /// Squad Launch checkbox.
+    /// </summary>
+    Task<bool> GetCarefulSquadLaunchAsync();
+    Task SetCarefulSquadLaunchAsync(bool careful);
+
+    /// <summary>
+    /// True when the per-row Recycle button should show on every running row instead of only while
+    /// the memory warning is latched. Defaults to false (the v1.12 silhouette).
+    /// <para>
+    /// Recycle was built as the remedy for Roblox's memory leak, and its visibility still says so.
+    /// Since v1.14 it also puts an account back in the exact server it was in — a reason to press
+    /// it that has nothing to do with RAM. This opt-in makes it reachable then, without changing
+    /// what an untouched install looks like.
+    /// </para>
+    /// </summary>
+    Task<bool> GetAlwaysShowRecycleAsync();
+    Task SetAlwaysShowRecycleAsync(bool always);
+
+    /// <summary>
+    /// True when streamer mode is on — the account manager shows fake identities instead of real
+    /// names/avatars. Sticky across launches (a streamer wants it reliably on). Defaults to false.
+    /// </summary>
+    Task<bool> GetStreamerModeAsync();
+    Task SetStreamerModeAsync(bool enabled);
+
+    /// <summary>
+    /// True when the memory watchdog should sample and react to system/process memory pressure.
+    /// Defaults to true. Editable on the Settings page ("Alerts and memory" section) together with
+    /// the three memory settings below it, since commit 067fcfa (2026-08-10, register row F-023).
+    /// From 2026-08-01 to then this comment correctly said "file-only"; it was not updated when the
+    /// UI shipped and stayed wrong until 2026-08-30.
+    /// </summary>
+    Task<bool> GetMemoryWatchdogEnabledAsync();
+    Task SetMemoryWatchdogEnabledAsync(bool enabled);
+
+    /// <summary>
+    /// MB of physical memory the watchdog reserves for the system before triggering. <c>null</c>
+    /// means the user has never set this — the composition root derives it from installed RAM via
+    /// <see cref="Diagnostics.MemoryDefaults.ReserveMb"/>. A non-null value is a deliberate user
+    /// override and must never be silently re-derived over. Editable on the Settings page (see
+    /// <see cref="GetMemoryWatchdogEnabledAsync"/>); a blank box there means "derive".
+    /// </summary>
+    Task<int?> GetMemoryReserveMbAsync();
+    Task SetMemoryReserveMbAsync(int? reserveMb);
+
+    /// <summary>
+    /// Per-client MB cap the watchdog enforces. <c>null</c> means the user has never set this —
+    /// derived from installed RAM via <see cref="Diagnostics.MemoryDefaults.CapMb"/>. <c>0</c> is a
+    /// distinct, meaningful user choice: it disables the cap trigger entirely, which is why this is
+    /// nullable rather than sentinel-zero — zero and unset must stay distinguishable. Editable on
+    /// the Settings page (see <see cref="GetMemoryWatchdogEnabledAsync"/>).
+    /// </summary>
+    Task<int?> GetMemoryCapMbAsync();
+    Task SetMemoryCapMbAsync(int? capMb);
+
+    /// <summary>
+    /// Minutes of projected time-to-cap below which the watchdog surfaces a warning. Defaults to
+    /// 120. Not hardware-derived — this is a UX pacing knob, not a hardware constraint. Editable on
+    /// the Settings page (see <see cref="GetMemoryWatchdogEnabledAsync"/>).
+    /// </summary>
+    Task<int> GetProjectionWarnMinutesAsync();
+    Task SetProjectionWarnMinutesAsync(int minutes);
+
+    /// <summary>
+    /// True when Stop should force-close a client immediately instead of giving Roblox its ten
+    /// seconds to close itself (F-111).
+    /// <para>
+    /// Defaults to false, which is the safer default rather than the tidier one. Pressing Stop
+    /// sends the client the same close its X sends; an in-game client answers by raising Roblox's
+    /// OWN confirm dialog, drawn inside the game surface where RoRoRo cannot see or click it. The
+    /// ten seconds are for a person to answer that. Only a clean exit persists Roblox's settings —
+    /// window size, fullscreen, graphics quality — so waiting is what keeps them.
+    /// </para>
+    /// <para>
+    /// Turning this on trades those settings for immediacy, which is a reasonable trade for someone
+    /// who stops clients constantly and never touches Roblox's own options. RoRoRo still asks
+    /// first: if Roblox takes the close immediately (no session, or the confirm suppressed via its
+    /// "Don't Show Again"), the clean exit is free and nothing is lost.
+    /// </para>
+    /// </summary>
+    Task<bool> GetAutoForceStopAsync();
+    Task SetAutoForceStopAsync(bool auto);
+
+    /// <summary>
+    /// The main window's last position and size, or null when nothing has been saved yet (F-060).
+    /// <para>
+    /// Restored only when <see cref="WindowPlacement.IsRestorableOnto"/> still says it lands on a
+    /// screen — a window saved on a monitor that has since been unplugged would otherwise come back
+    /// somewhere nobody can reach, which is worse than the forgetting this replaces.
+    /// </para>
+    /// </summary>
+    Task<WindowPlacement?> GetMainWindowPlacementAsync();
+    Task SetMainWindowPlacementAsync(WindowPlacement? placement);
+
+    /// <summary>
+    /// True when the main window opens in compact mode — the fixed-width, live-rows-only strip the
+    /// status bar's Compact button toggles. Defaults to false (expanded).
+    /// <para>
+    /// Sticky because the Welcome tour pitches compact as a second-monitor workflow, and a
+    /// second-monitor layout that resets on every launch is not a workflow. The toggle is on the
+    /// main window, not in Preferences: this is a per-session view state the user flips constantly,
+    /// and its home is where it is used.
+    /// </para>
+    /// </summary>
+    Task<bool> GetCompactModeAsync();
+    Task SetCompactModeAsync(bool compact);
+
+    /// <summary>
+    /// The user's chosen UI language as a culture name ("fr", "pt-BR", …), or <c>null</c> to
+    /// follow the operating system (localization, 2026-09-07). Applied to the UI thread's
+    /// <c>CurrentUICulture</c> at startup, before any window loads. A value naming a culture
+    /// whose catalog is not shipped resolves to English through the resource fallback, so a
+    /// stale value never breaks the UI — but the picker only offers languages that actually
+    /// ship, so a stored value is normally a real one. <b>Corrected 2026-10-06:</b> this used to
+    /// say a change waited for the next launch, which stopped being true when the XAML moved off
+    /// <c>x:Static</c> onto <c>{loc:Loc}</c>. <c>OnUiLanguageChanged</c> persists the value and
+    /// pushes <c>TranslationSource.Instance.CurrentCulture</c>, so the UI re-renders live and the
+    /// picker copy ("a change takes effect right away") is the accurate half of the pair.
+    /// </summary>
+    Task<string?> GetUiLanguageAsync();
+    Task SetUiLanguageAsync(string? cultureName);
+
+    /// <summary>
+    /// True when external metric alerts (<see cref="ROROROblox.Core.Discord.AlertKind.MetricBreach"/>)
+    /// are allowed to reach the alert router. Defaults to false — a feature that starts alerting
+    /// on upgrade is a bug, so this is opt-in like every other alert kind.
+    /// </summary>
+    Task<bool> GetMetricAlertsEnabledAsync();
+    Task SetMetricAlertsEnabledAsync(bool enabled);
+
+    /// <summary>
+    /// How many minutes one alert slot — (account, kind), plus the metric id for a metric breach —
+    /// stays quiet after it speaks. Defaults to 5, which is what
+    /// <c>AlertRouter.Cooldown</c> held as a <c>static readonly</c> from v1.0 to v1.32, so an
+    /// upgrade changes nobody's pace (v1.33).
+    /// <para>
+    /// <c>0</c> means every time, with no throttle at all. A real choice rather than a sentinel —
+    /// the same idiom <see cref="GetMemoryCapMbAsync"/> uses for a deliberate off, which is why
+    /// this is a plain <c>int</c> and not nullable. A negative value is a corrupt file rather than
+    /// a choice and <see cref="ROROROblox.Core.Discord.AlertCadence.FromSettings"/> reads it as the
+    /// shipped 5: the fallback has to be quieter than the corruption, not louder.
+    /// </para>
+    /// </summary>
+    Task<int> GetAlertCadenceMinutesAsync();
+    Task SetAlertCadenceMinutesAsync(int minutes);
+
+    /// <summary>
+    /// Per-kind cadence overrides as a small JSON map of <see cref="ROROROblox.Core.Discord.AlertKind"/>
+    /// NAME to minutes — <c>{"MemoryWarning":30}</c>. An absent or unusable entry means that kind
+    /// follows <see cref="GetAlertCadenceMinutesAsync"/>. Empty by default, so an untouched install
+    /// has one pace for everything.
+    /// <para>
+    /// One JSON key rather than one setting per kind: seven kinds would be seven members here,
+    /// seven fakes across four test files and seven reachability entries, for a feature whose UI is
+    /// one generated table (spec §2).
+    /// </para>
+    /// <para>
+    /// Keyed by NAME, which is the first thing in the app to persist an <c>AlertKind</c> at all —
+    /// so member names become load-bearing where their numeric order is not. Parsing is defensive
+    /// and per entry (see <see cref="ROROROblox.Core.Discord.AlertCadence.FromSettings"/>): a blob
+    /// that is not JSON, or one bad row beside a good one, degrades to the global and never throws.
+    /// A settings file nobody can parse must not be able to stop alerting.
+    /// </para>
+    /// </summary>
+    Task<string> GetAlertCadenceOverridesJsonAsync();
+    Task SetAlertCadenceOverridesJsonAsync(string? overridesJson);
+
+    /// <summary>
+    /// What a desktop alert sounds like, as an <see cref="ROROROblox.Core.Discord.AlertSound"/>
+    /// member NAME — <c>Chime</c>, <c>Silent</c> or <c>WindowsDefault</c> (v1.33 item 5). Defaults
+    /// to <c>Chime</c>.
+    /// <para>
+    /// <b>Raw here, resolved in one place.</b> This hands back whatever is in the file, exactly as
+    /// <see cref="GetAlertCadenceOverridesJsonAsync"/> does, and
+    /// <see cref="ROROROblox.Core.Discord.AlertSoundSetting.FromSetting"/> is the only thing that
+    /// turns it into a mode. Two guards for one rule is how they drift.
+    /// </para>
+    /// <para>
+    /// <b>A name rather than a number, and an unreadable value degrades to <c>Chime</c> rather than
+    /// to silence.</b> Item 4 took the shell balloon away, and with it the OS notification sound,
+    /// so silence is now a thing this app can produce by accident — and an alert that makes no
+    /// sound is a log entry. The quieter fallback was right for the cadence (a negative count reads
+    /// as the shipped five minutes) because there the loud direction was the harm; here the harm is
+    /// inverted, so the fallback is too.
+    /// </para>
+    /// </summary>
+    Task<string> GetAlertSoundAsync();
+    Task SetAlertSoundAsync(string? sound);
+
+    /// <summary>
+    /// The Library's layout, <c>"grid"</c> or <c>"list"</c> (v1.36). Stored as a name, never an
+    /// ordinal; the reader treats anything unrecognised as grid. Blank normalises to <c>"grid"</c>.
+    /// </summary>
+    Task<string> GetLibraryViewAsync();
+    Task SetLibraryViewAsync(string? view);
+
+    /// <summary>
+    /// The Library's kind chips as comma-separated names (<c>Recent,Favourites,PrivateServers</c>),
+    /// v1.36. Empty means none selected, which shows everything.
+    /// </summary>
+    Task<string> GetLibraryFiltersAsync();
+    Task SetLibraryFiltersAsync(string? filters);
+}

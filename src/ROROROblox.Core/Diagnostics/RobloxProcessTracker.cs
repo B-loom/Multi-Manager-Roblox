@@ -1,0 +1,528 @@
+using Windows.Win32;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace ROROROblox.Core.Diagnostics;
+
+/// <summary>
+/// Polls <see cref="Process.GetProcessesByName"/> for new <c>RobloxPlayerBeta.exe</c> processes
+/// after a launch and assigns the first unclaimed one (with a <c>StartTime</c> at-or-after
+/// <c>launchedAtUtc</c>) to the requesting account. FIFO across concurrent launches via a
+/// per-pid claim dictionary.
+/// </summary>
+public sealed class RobloxProcessTracker : IRobloxProcessTracker, IForegroundAccountResolver, IDisposable
+{
+    private const string PlayerProcessName = "RobloxPlayerBeta";
+    private const string InstallerProcessName = "RobloxPlayerInstaller";
+    private static readonly TimeSpan DefaultAttachTimeout = TimeSpan.FromSeconds(30);
+    // Install-aware extended deadline (v1.7.0 install-deferral rider 6). When RobloxPlayerInstaller.exe
+    // is running during the attach wait, an update can delay the real RobloxPlayerBeta well past the
+    // 30s base deadline. This cap is held in lockstep with the v1.6.0 AppStorageDefender's ~120s
+    // identity hold (AppStorageDefender max-cap) so the two stop disagreeing — the tracker keeps
+    // waiting for as long as the defender keeps defending the launching account's identity.
+    private static readonly TimeSpan DefaultInstallerExtendedTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(750);
+    // Process.StartTime can read a hair earlier than the wall clock we captured pre-Process.Start,
+    // so allow a small grace window when comparing against launchedAtUtc.
+    private static readonly TimeSpan StartTimeGrace = TimeSpan.FromSeconds(3);
+
+    private readonly ILogger<RobloxProcessTracker> _log;
+    private readonly TimeSpan _attachTimeout;
+    private readonly TimeSpan _installerExtendedTimeout;
+    private readonly TimeSpan _pollInterval;
+    private readonly Func<bool> _isInstallerRunning;
+    private readonly Func<IReadOnlyList<Process>> _candidateProcesses;
+    private readonly ConcurrentDictionary<Guid, AttachedSlot> _attachedByAccount = new();
+    private readonly ConcurrentDictionary<int, Guid> _claimedPidToAccount = new();
+    private bool _disposed;
+
+    public RobloxProcessTracker() : this(NullLogger<RobloxProcessTracker>.Instance) { }
+
+    public RobloxProcessTracker(ILogger<RobloxProcessTracker> log)
+        : this(
+            log,
+            DefaultAttachTimeout,
+            DefaultInstallerExtendedTimeout,
+            DefaultPollInterval,
+            DefaultInstallerScan,
+            DefaultPlayerScan)
+    { }
+
+    /// <summary>
+    /// Seam ctor — inject the timeouts/poll plus the two install-deferral seams:
+    /// <paramref name="isInstallerRunning"/> (the <c>RobloxPlayerInstaller.exe</c> signal, same shape
+    /// as <c>RobloxUpdateProbe.IsInstallerRunning</c>) and <paramref name="candidateProcesses"/> (the
+    /// raw <c>RobloxPlayerBeta</c> candidate source). The tracker still applies its own claim / FIFO /
+    /// start-time filtering on top of the candidates, so that logic stays under test. Used by tests
+    /// and any DI override; the public ctors wire the real live scans.
+    /// </summary>
+    internal RobloxProcessTracker(
+        ILogger<RobloxProcessTracker> log,
+        TimeSpan attachTimeout,
+        TimeSpan installerExtendedTimeout,
+        TimeSpan pollInterval,
+        Func<bool> isInstallerRunning,
+        Func<IReadOnlyList<Process>> candidateProcesses,
+        IClock? clock = null,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+    {
+        _log = log ?? throw new ArgumentNullException(nameof(log));
+        _attachTimeout = attachTimeout;
+        _installerExtendedTimeout = installerExtendedTimeout;
+        _pollInterval = pollInterval;
+        _isInstallerRunning = isInstallerRunning ?? throw new ArgumentNullException(nameof(isInstallerRunning));
+        _candidateProcesses = candidateProcesses ?? throw new ArgumentNullException(nameof(candidateProcesses));
+        _clock = clock ?? new SystemClock();
+        _delay = delay ?? Task.Delay;
+    }
+
+    /// <summary>
+    /// Where "now" comes from, and how waiting happens (F-116).
+    /// <para>
+    /// This class decides whether to give up by comparing wall-clock readings to a deadline, and it
+    /// waits with <see cref="Task.Delay(TimeSpan, CancellationToken)"/>. On a developer machine both
+    /// are invisible; on a loaded CI runner they are the test. Two of this file's tests blocked
+    /// merges on 2026-08-21 — one asserting the extension stays inside a 600ms cap, one asserting a
+    /// process revealed at 400ms still gets attached — and both passed on re-run, which is the
+    /// signature that trains people to press the button instead of reading the failure.
+    /// </para>
+    /// <para>
+    /// The fix is NOT a longer timeout. A longer timeout hides load sensitivity, which is the
+    /// opposite of what a deadline test is for. Injecting the clock and the wait lets a test advance
+    /// time by hand and assert the DECISION — "it kept polling because the installer was running" —
+    /// which is true on any machine at any load. Production passes neither argument and behaves
+    /// exactly as before.
+    /// </para>
+    /// </summary>
+    private readonly IClock _clock;
+    private readonly Func<TimeSpan, CancellationToken, Task> _delay;
+
+    public IReadOnlyDictionary<Guid, TrackedProcess> Attached =>
+        _attachedByAccount.ToDictionary(
+            kvp => kvp.Key,
+            kvp => new TrackedProcess(kvp.Value.Process.Id, kvp.Value.AttachedAtUtc));
+
+    public bool IsTracking(Guid accountId) => _attachedByAccount.ContainsKey(accountId);
+
+    /// <inheritdoc cref="IForegroundAccountResolver.TryResolveAccountByPid"/>
+    public bool TryResolveAccountByPid(int pid, out Guid accountId)
+        => _claimedPidToAccount.TryGetValue(pid, out accountId);
+
+    public event EventHandler<RobloxProcessEventArgs>? ProcessAttached;
+    public event EventHandler<RobloxProcessEventArgs>? ProcessAttachFailed;
+    public event EventHandler<RobloxProcessEventArgs>? ProcessExited;
+
+    public bool AttachExisting(Guid accountId, int pid)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (pid <= 0) return false;
+
+        Process? process = null;
+        try
+        {
+            process = Process.GetProcessById(pid);
+            if (process.HasExited) return false;
+            // Defensive: double-check we're actually attaching to a player process. If we're
+            // wrong here we'd end up tagging an unrelated process as a Roblox client.
+            if (!string.Equals(process.ProcessName, PlayerProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                process.Dispose();
+                return false;
+            }
+            if (!_claimedPidToAccount.TryAdd(pid, accountId))
+            {
+                // Already claimed (rare — same scanner re-runs). Bail without disturbing.
+                process.Dispose();
+                return false;
+            }
+            // Reuse the same attach path as the polled-launch flow so all consumers (UI badge,
+            // session history, window decorator) get the same ProcessAttached event shape.
+            AttachToProcess(accountId, process);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            // pid no longer exists.
+            process?.Dispose();
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "AttachExisting failed for pid {Pid} on account {AccountId}", pid, accountId);
+            process?.Dispose();
+            return false;
+        }
+    }
+
+    public async Task TrackLaunchAsync(Guid accountId, DateTimeOffset launchedAtUtc, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var startUtc = _clock.UtcNow;
+        // Base deadline = today's 30s behavior. The extended ceiling is only ever USED when the
+        // Roblox installer is found running as the base deadline elapses — an install can delay the
+        // real RobloxPlayerBeta past 30s, and the v1.6.0 defender holds identity to ~120s, so the
+        // tracker matches that hold instead of firing a false attach-failure mid-update. With no
+        // installer running, the loop never extends and behavior is unchanged.
+        var baseDeadline = startUtc + _attachTimeout;
+        // The extended cap can't be shorter than the base deadline (guards a misconfigured ctor).
+        var extendedDeadline = startUtc + (_installerExtendedTimeout > _attachTimeout
+            ? _installerExtendedTimeout
+            : _attachTimeout);
+        var extended = false;
+        _log.LogDebug("Tracking launch for account {AccountId}, base deadline {Deadline:O}", accountId, baseDeadline);
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var now = _clock.UtcNow;
+            // Past the base deadline: extend ONLY while the installer is running, and only up to the
+            // bounded extended cap. Re-check the installer signal each pass so a finished install
+            // doesn't keep us waiting needlessly past the base window.
+            if (now >= baseDeadline)
+            {
+                if (now >= extendedDeadline || !InstallerRunningSafe())
+                {
+                    break;
+                }
+                if (!extended)
+                {
+                    extended = true;
+                    _log.LogInformation(
+                        "RobloxPlayerInstaller.exe is running at the {Base}s mark for account {AccountId}; " +
+                        "extending attach wait up to {Cap}s (lockstep with the appStorage defender's hold).",
+                        _attachTimeout.TotalSeconds, accountId, _installerExtendedTimeout.TotalSeconds);
+                }
+            }
+
+            var match = TryFindUnclaimedPlayerProcess(launchedAtUtc);
+            if (match is not null)
+            {
+                if (_claimedPidToAccount.TryAdd(match.Id, accountId))
+                {
+                    AttachToProcess(accountId, match);
+                    return;
+                }
+                // Lost the claim race — release the handle and keep polling.
+                match.Dispose();
+            }
+
+            try
+            {
+                await _delay(_pollInterval, ct).ConfigureAwait(false);
+            }
+            catch (TaskCanceledException)
+            {
+                throw;
+            }
+        }
+
+        var waited = extended ? _installerExtendedTimeout : _attachTimeout;
+        _log.LogWarning(
+            "No RobloxPlayerBeta.exe spawned within {Timeout}s for account {AccountId}{Extended}. " +
+            "Likely silent launch failure (Roblox version drift, place removed, AV interference).",
+            waited.TotalSeconds, accountId, extended ? " (installer-extended)" : string.Empty);
+        ProcessAttachFailed?.Invoke(this, new RobloxProcessEventArgs(accountId, 0));
+    }
+
+    /// <summary>
+    /// Asks the client to close, the way clicking its X asks (F-111).
+    /// </summary>
+    /// <returns>
+    /// Whether we had a window to ask. <b>Never</b> whether it closed — that question has exactly
+    /// one honest answer, <c>HasExited</c>, and callers must ask it themselves.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// This used to be <c>Process.CloseMainWindow()</c>, which posts <c>WM_CLOSE</c>. Roblox ignores
+    /// <c>WM_CLOSE</c>. Measured 2026-08-20 against a live in-game client: the message posts,
+    /// <c>CloseMainWindow</c> returns <c>true</c>, and the client is still running, still titled,
+    /// thirty seconds later. Because the caller's guard was <c>if (!RequestClose(…)) Kill(…)</c>,
+    /// that <c>true</c> meant Stop escalated to nothing and did nothing — the first press of the
+    /// button was inert for as long as the button has existed.
+    /// </para>
+    /// <para>
+    /// <c>WM_SYSCOMMAND</c>/<c>SC_CLOSE</c> is what clicking the X actually sends, and Roblox does
+    /// act on it: a client with no session exits; an in-game client raises Roblox's own confirm
+    /// ("Close Roblox" / "Back to Home") and waits for a person. That dialog is drawn by the Roblox
+    /// engine inside the game surface, so it is not an OS window — UI Automation cannot see it and
+    /// nothing here can detect it, which is why the caller waits on a human-sized budget rather
+    /// than a teardown-sized one.
+    /// </para>
+    /// </remarks>
+    public bool RequestClose(Guid accountId)
+    {
+        if (!_attachedByAccount.TryGetValue(accountId, out var slot))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (slot.Process.HasExited)
+            {
+                return false;
+            }
+
+            slot.Process.Refresh();
+            var hwnd = slot.Process.MainWindowHandle;
+            if (hwnd == IntPtr.Zero)
+            {
+                // Windowless client — nothing to ask. The caller's escalation is the only route.
+                return false;
+            }
+
+            return PInvoke.PostMessage(
+                new Windows.Win32.Foundation.HWND(hwnd),
+                PInvoke.WM_SYSCOMMAND,
+                new Windows.Win32.Foundation.WPARAM(PInvoke.SC_CLOSE),
+                default);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "RequestClose failed for account {AccountId} pid {Pid}", accountId, slot.Process.Id);
+            return false;
+        }
+    }
+
+    public bool Kill(Guid accountId)
+    {
+        if (!_attachedByAccount.TryGetValue(accountId, out var slot))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (slot.Process.HasExited)
+            {
+                return false;
+            }
+            slot.Process.Kill(entireProcessTree: false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Kill failed for account {AccountId} pid {Pid}", accountId, slot.Process.Id);
+            return false;
+        }
+    }
+
+    // Degrade-safe wrapper for the installer signal: an injected scan that throws must never extend
+    // the wait forever — treat a failed read as "not installing" (same bias as RobloxUpdateProbe).
+    private bool InstallerRunningSafe()
+    {
+        try
+        {
+            return _isInstallerRunning();
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Installer-running signal threw; treating as not installing.");
+            return false;
+        }
+    }
+
+    private Process? TryFindUnclaimedPlayerProcess(DateTimeOffset earliestStartUtc)
+    {
+        IReadOnlyList<Process> candidates;
+        try
+        {
+            candidates = _candidateProcesses();
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Candidate-process scan failed; will retry next poll.");
+            return null;
+        }
+
+        Process? winner = null;
+        DateTime winnerStart = DateTime.MaxValue;
+
+        foreach (var p in candidates)
+        {
+            try
+            {
+                if (_claimedPidToAccount.ContainsKey(p.Id))
+                {
+                    p.Dispose();
+                    continue;
+                }
+                if (p.HasExited)
+                {
+                    p.Dispose();
+                    continue;
+                }
+                // Process.StartTime is local; compare in UTC with grace.
+                var startUtc = p.StartTime.ToUniversalTime();
+                if (startUtc + StartTimeGrace < earliestStartUtc.UtcDateTime)
+                {
+                    p.Dispose();
+                    continue;
+                }
+                // Pick the EARLIEST eligible — when two launches race, we attach to the older one
+                // first (FIFO), so the next iteration's caller gets the next one.
+                if (p.StartTime < winnerStart)
+                {
+                    winner?.Dispose();
+                    winner = p;
+                    winnerStart = p.StartTime;
+                }
+                else
+                {
+                    p.Dispose();
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Process exited between the snapshot and the inspection.
+                p.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Skipping process {Pid} during scan", p.Id);
+                p.Dispose();
+            }
+        }
+
+        return winner;
+    }
+
+    // Internal for tests: both public entry points pre-filter on HasExited, so the
+    // exited-during-attach window can only be staged deterministically by calling this directly.
+    internal void AttachToProcess(Guid accountId, Process process)
+    {
+        // Exit delivery must be once-only: it can arrive via the genuine Exited callback
+        // AND the post-attach HasExited double-check below; a double fire would double-stamp
+        // session-history end times downstream.
+        var exitHandled = 0;
+        void OnExitedOnce()
+        {
+            if (Interlocked.Exchange(ref exitHandled, 1) == 0)
+            {
+                HandleExited(accountId, process);
+            }
+        }
+
+        try
+        {
+            // Order is load-bearing:
+            //  1. slot first, so HandleExited always finds the entry to remove;
+            //  2. Exited subscribed BEFORE EnableRaisingEvents — setting it on an
+            //     already-exited process raises immediately, and a raise with zero
+            //     subscribers is simply lost (the ghost-"running"-row bug);
+            //  3. ProcessAttached announced before delivery can begin, so consumers
+            //     never see Exited ahead of Attached for the same attach;
+            //  4. EnableRaisingEvents arms delivery;
+            //  5. HasExited double-check synthesizes the exit if it happened before 4
+            //     took effect — the once-guard makes the two paths converge.
+            var slot = new AttachedSlot(process, _clock.UtcNow);
+            _attachedByAccount[accountId] = slot;
+            process.Exited += (_, _) => OnExitedOnce();
+            _log.LogInformation("Attached to RobloxPlayerBeta pid {Pid} for account {AccountId}", process.Id, accountId);
+            ProcessAttached?.Invoke(this, new RobloxProcessEventArgs(accountId, process.Id));
+            process.EnableRaisingEvents = true;
+            if (process.HasExited)
+            {
+                OnExitedOnce();
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to enable raising events on pid {Pid} for account {AccountId}", process.Id, accountId);
+            // ProcessAttached may already have been announced — synthesize the exit so
+            // consumers converge on "not running" instead of ghosting, and so the slot,
+            // pid claim, and handle are all released through the one cleanup path.
+            OnExitedOnce();
+        }
+    }
+
+    private void HandleExited(Guid accountId, Process process)
+    {
+        try
+        {
+            _attachedByAccount.TryRemove(accountId, out _);
+            _claimedPidToAccount.TryRemove(process.Id, out _);
+
+            // F-081 — say WHY, not just that it happened.
+            //
+            // This line used to carry pid + account and nothing else, and on 2026-08-07 that gap
+            // produced a WRONG conclusion rather than merely a slow one: three exits were read as
+            // Roblox's updater terminating clients when the user had closed them himself, and
+            // nothing in the log could tell the two apart. Reconstructing the truth took a live
+            // 45-minute test, Windows event logs, and Roblox's own client logs.
+            //
+            // Exit code distinguishes the common cases: 0 is an orderly shutdown (the user closed
+            // the window, or Roblox exited cleanly); anything else is the client dying. Uptime
+            // separates "died on launch" from "ran for hours". Both are read defensively — a
+            // process that has already been reaped throws rather than answering, and an unreadable
+            // value must log as unknown, never as a confident zero.
+            int? exitCode = null;
+            TimeSpan? uptime = null;
+            try { exitCode = process.ExitCode; } catch { }
+            try { uptime = DateTime.Now - process.StartTime; } catch { }
+
+            _log.LogInformation(
+                "RobloxPlayerBeta pid {Pid} exited for account {AccountId} (exit code {ExitCode}, up {Uptime})",
+                process.Id,
+                accountId,
+                exitCode is { } code ? code.ToString() : "unknown",
+                uptime is { } up ? $"{(int)up.TotalMinutes}m{up.Seconds:D2}s" : "unknown");
+
+            ProcessExited?.Invoke(this, new RobloxProcessEventArgs(accountId, process.Id));
+        }
+        finally
+        {
+            try { process.Dispose(); } catch { }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        foreach (var slot in _attachedByAccount.Values)
+        {
+            try { slot.Process.Dispose(); } catch { }
+        }
+        _attachedByAccount.Clear();
+        _claimedPidToAccount.Clear();
+    }
+
+    // Default live scans wired by the public ctors. The candidate scan hands the FULL set of
+    // RobloxPlayerBeta processes to TryFindUnclaimedPlayerProcess, which owns the claim / FIFO /
+    // start-time filtering. The installer scan mirrors RobloxUpdateProbe.IsInstallerRunning's
+    // process-name family (kept local so the tracker doesn't take a hard dependency on the probe).
+    private static IReadOnlyList<Process> DefaultPlayerScan() =>
+        Process.GetProcessesByName(PlayerProcessName);
+
+    private static bool DefaultInstallerScan()
+    {
+        var processes = Process.GetProcessesByName(InstallerProcessName);
+        try
+        {
+            return processes.Length > 0;
+        }
+        catch
+        {
+            // Degrade-safe: a scan failure must never extend the wait forever. Treat as "not installing".
+            return false;
+        }
+        finally
+        {
+            // Dispose every handle — same anti-leak discipline as the probe / running scanner.
+            foreach (var p in processes)
+            {
+                p.Dispose();
+            }
+        }
+    }
+
+    private sealed record AttachedSlot(Process Process, DateTimeOffset AttachedAtUtc);
+}

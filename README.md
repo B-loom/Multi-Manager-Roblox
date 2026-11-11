@@ -1,0 +1,102 @@
+<p align="center"><img src="src/ROROROblox.App/Tray/Resources/logo.png" width="140" alt="Multi Manager Roblox logo"></p>
+
+<h1 align="center">Multi Manager Roblox</h1>
+
+<p align="center">Run several Roblox clients side by side, each signed in as a different account.<br>
+<b>v1.0.0</b> · Windows 10 / 11 · <a href="https://b-loom.github.io/Multi-Manager-Roblox/">Website</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="LICENSE">MIT license</a></p>
+
+<p align="center"><a href="#français">🇫🇷 Version française plus bas</a></p>
+
+---
+
+## English
+
+### What it does
+
+- **Multi-instance**: open as many Roblox clients as you want at the same time.
+- **Accounts**: save several Roblox accounts, give them names, launch each one in its own client.
+- **Library**: save games and private servers, launch an account straight into them.
+- **Squad Launch**: launch several accounts one after another.
+- **History, Diagnostics, Plugins**: all inside the main window, from the sidebar.
+- **Two languages**: English or French, chosen at first launch (changeable in Settings).
+- **Galaxy theme**: violet palette, nebula glows and a starfield.
+
+### Install
+
+No installer is published yet. To build it yourself:
+
+1. Install the [.NET 10 SDK](https://dotnet.microsoft.com/download).
+2. Run:
+   ```powershell
+   dotnet build ROROROblox.slnx -c Release
+   ```
+3. Start `src\ROROROblox.App\bin\Release\net10.0-windows10.0.19041.0\ROROROblox.App.exe`.
+
+### Use
+
+1. On first launch, pick **English** or **Français**.
+2. **+ Add account**: sign in on the official Roblox login page. Your password is never stored by the app.
+3. Click **Launch** on an account. Repeat with other accounts: every client stays open.
+4. Use the sidebar to reach the Library, Settings, History and the other pages.
+
+### Security
+
+- Sign-in happens on Roblox's own page. Session cookies are encrypted with Windows DPAPI and stay on your PC.
+- Nothing is sent to a third-party server.
+- Multi-instance works by holding Roblox's single-instance lock. Roblox does not officially support this, and an update of the Roblox client can break it.
+
+### Disclaimer
+
+- **Use at your own risk.** The author of this repository is not responsible for anything that happens from using this software: account bans or restrictions, data loss, crashes or any other damage. The software is provided "as is", without warranty of any kind (see the [MIT license](LICENSE)).
+- **Made with AI.** All the changes in Multi Manager Roblox (galaxy theme, sidebar, embedded pages, language picker, logo integration, docs and website) were created by Claude, Anthropic's AI assistant.
+
+### Credits
+
+The original project is **RoRoRo** by 626 Labs: https://github.com/estevanhernandez-stack-ed/ROROROblox (MIT license). Multi Manager Roblox is a modified version of it. Not affiliated with Roblox Corporation. Roblox is a trademark of Roblox Corporation.
+
+---
+
+## Français
+
+### Ce que fait l'application
+
+- **Multi-instance** : ouvrez autant de clients Roblox que vous voulez en même temps.
+- **Comptes** : enregistrez plusieurs comptes Roblox, nommez-les, lancez chacun dans son propre client.
+- **Bibliothèque** : enregistrez des jeux et des serveurs privés, lancez un compte directement dedans.
+- **Lancement en équipe** : lancez plusieurs comptes l'un après l'autre.
+- **Historique, Diagnostics, Plugins** : tout s'ouvre dans la fenêtre principale, depuis la barre latérale.
+- **Deux langues** : anglais ou français, choisi au premier lancement (modifiable dans Paramètres).
+- **Thème Galaxy** : palette violette, nébuleuses et fond étoilé.
+
+### Installation
+
+Aucun installateur n'est encore publié. Pour compiler vous-même :
+
+1. Installez le [SDK .NET 10](https://dotnet.microsoft.com/download).
+2. Lancez :
+   ```powershell
+   dotnet build ROROROblox.slnx -c Release
+   ```
+3. Démarrez `src\ROROROblox.App\bin\Release\net10.0-windows10.0.19041.0\ROROROblox.App.exe`.
+
+### Utilisation
+
+1. Au premier lancement, choisissez **English** ou **Français**.
+2. **+ Ajouter un compte** : connectez-vous sur la page officielle de Roblox. L'application ne stocke jamais votre mot de passe.
+3. Cliquez sur **Lancer** sur un compte. Recommencez avec d'autres comptes : chaque client reste ouvert.
+4. Utilisez la barre latérale pour accéder à la Bibliothèque, aux Paramètres, à l'Historique et aux autres pages.
+
+### Sécurité
+
+- La connexion se fait sur la page de Roblox. Les cookies de session sont chiffrés avec Windows DPAPI et restent sur votre PC.
+- Rien n'est envoyé à un serveur tiers.
+- Le multi-instance fonctionne en réservant le verrou d'instance unique de Roblox. Roblox ne le prend pas officiellement en charge, et une mise à jour du client peut le casser.
+
+### Avertissement
+
+- **Utilisation à vos risques.** L'auteur de ce dépôt n'est responsable de rien de ce qui peut arriver en utilisant ce logiciel : bannissement ou restriction de compte, perte de données, plantage ou tout autre dommage. Le logiciel est fourni « tel quel », sans aucune garantie (voir la [licence MIT](LICENSE)).
+- **Créé avec une IA.** Toutes les modifications de Multi Manager Roblox (thème galaxy, barre latérale, pages intégrées, choix de la langue, intégration du logo, documentation et site) ont été créées par Claude, l'assistant IA d'Anthropic.
+
+### Crédits
+
+Le projet original est **RoRoRo** de 626 Labs : https://github.com/estevanhernandez-stack-ed/ROROROblox (licence MIT). Multi Manager Roblox en est une version modifiée. Non affilié à Roblox Corporation. Roblox est une marque de Roblox Corporation.

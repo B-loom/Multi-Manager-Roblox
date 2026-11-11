@@ -1,0 +1,3020 @@
+﻿using System.Diagnostics;
+using System.Globalization;
+using System.Windows;
+using System.Windows.Controls;
+using ROROROblox.App.Discord;
+using ROROROblox.App.Localization;
+using ROROROblox.App.Modals;
+using ROROROblox.App.Startup;
+using ROROROblox.App.Theming;
+using ROROROblox.App.Transport;
+using ROROROblox.App.ViewModels;
+using ROROROblox.Core;
+using ROROROblox.Core.Diagnostics;
+using ROROROblox.Core.Discord;
+using ROROROblox.Core.Theming;
+using ROROROblox.Core.Transport;
+
+using ROROROblox.App.Notify;
+using ROROROblox.Core.Notify;
+
+namespace ROROROblox.App.Preferences;
+
+/// <summary>
+/// The Settings destination, hosted by the shell (F-013 — formerly <c>PreferencesWindow</c>, a
+/// modal dialog). Toggles read at load and persist immediately on click, like Windows Settings —
+/// no Apply button. Going modeless is safe because every shared record this page edits now has a
+/// single owner (<see cref="DiscordConfigService"/> for Discord; <see cref="IAppSettings"/>'
+/// internal gate for the rest). Implements <see cref="IDisposable"/> for the subscriptions the
+/// window used to release on <c>Closed</c>; the shell disposes pages when it closes.
+/// </summary>
+internal partial class SettingsPage : UserControl, IDisposable
+{
+    private readonly IAppSettings _settings;
+
+    // Nudged the moment the memory toggle saves, so "off" stops the sampling in this session rather
+    // than at next launch. See MemoryWatchdogGate for the race this instance arbitrates.
+    private readonly MemoryWatchdogGate _memoryWatchdogGate;
+    private readonly IStartupRegistration _startupRegistration;
+    private readonly IThemeStore _themeStore;
+    private readonly ThemeService _themeService;
+    private readonly IAccountStore _accountStore;
+    private readonly IAccountTransport _transport;
+    private readonly MainViewModel _mainViewModel;
+    private readonly DiscordConfigService _discordConfigService;
+    private readonly AlertDispatcher _alertDispatcher;
+    private readonly DiscordWebhookSender _webhookSender;
+    private readonly WebhookProbe _webhookProbe;
+    private readonly ROROROblox.Core.Notify.PhoneNotifyConfigService _phoneNotifyService;
+    private readonly ROROROblox.App.Notify.PhoneAlertSender _phoneAlertSender;
+
+    /// <summary>
+    /// What the memory section's blank boxes resolve to on this machine (item 4a). Holds the
+    /// injected <see cref="ISystemMemoryProbe"/> rather than reaching for one, so a test can hand
+    /// it a known RAM figure — or a failing read — and assert what the section says.
+    /// </summary>
+    private readonly AutomaticMemorySummary _automaticMemory;
+
+    /// <summary>
+    /// What the themes folder had to say when this window opened, and what
+    /// <see cref="ThemeStatusLine"/> falls back to.
+    /// <para>
+    /// ONE LINE, TWO REPORTERS, so one of them has to be the resting state. A successful theme
+    /// change is silent (<c>spec.md &gt; §5</c>) — but silent means "says nothing about the save",
+    /// not "blanks the line", and blanking it would wipe a bad-file report the user has not fixed
+    /// yet. A bad file is still a bad file after a theme change that worked.
+    /// </para>
+    /// </summary>
+    private ThemeStatusSummary.Line _themeFolderStatus = ThemeStatusSummary.Silent;
+
+    /// <summary>
+    /// The same player the alert path uses, so the preview is the sound an alert actually makes
+    /// rather than a second implementation that can drift from it.
+    /// <para>
+    /// Added 2026-10-07 after the v1.33 live smoke found there was no way to hear a sound before
+    /// choosing one: the picker only saved, and "What a desktop alert sounds like" is its
+    /// accessible name rather than a button. A user picked between three sounds blind, and run 4
+    /// of the smoke could not be performed from this page at all — an alert had to fire.
+    /// </para>
+    /// </summary>
+    private readonly ROROROblox.App.Tray.IAlertSoundPlayer _alertSoundPlayer;
+
+    private bool _suppressClickHandlers; // true while we set the initial check states.
+    private bool _loaded;                 // true once OnLoaded has populated; gates the culture-change re-render.
+
+    /// <summary>
+    /// Depth of a programmatic write to a toggle's <c>IsChecked</c>. Raised only by
+    /// <see cref="SetToggle"/>, and only across the synchronous assignment itself.
+    /// <para>
+    /// v1.33 item 7 moved every toggle on this page from <c>Click</c> to
+    /// <c>Checked</c>/<c>Unchecked</c>, because <c>TogglePattern.Toggle()</c> raises the latter and
+    /// never the former (F-102), so a <c>Click</c>-wired box flipped by automation or a screen
+    /// reader saved nothing. That conversion changes what a programmatic write costs: an
+    /// <c>IsChecked</c> assignment used to raise no handler at all, and now raises one. Two kinds of
+    /// site therefore need guarding — the initial paint, and the ROLLBACK each handler performs
+    /// from the file when its own save throws, which without a guard re-enters the very handler
+    /// that is handling the failure.
+    /// </para>
+    /// <para>
+    /// A counter rather than a bool so nesting is safe, and a flag of its own rather than reusing
+    /// <see cref="_suppressClickHandlers"/> for the reason <c>_paintingMetricAlertsToggle</c>
+    /// already records: that flag is raised and cleared by other concerns, including a dispatcher
+    /// callback this page does not schedule, so a toggle's correctness must not depend on it.
+    /// </para>
+    /// </summary>
+    private int _programmaticToggleWrites;
+
+    /// <summary>True while <see cref="SetToggle"/> is assigning; every converted handler returns early on it.</summary>
+    private bool PaintingToggles => _programmaticToggleWrites > 0;
+
+    /// <summary>
+    /// Sets a toggle's state without its handler treating it as a user action.
+    /// <para>
+    /// Callers evaluate any <c>await</c> in the ARGUMENT, so the counter is only raised across the
+    /// synchronous assignment. That is deliberate and it fixes a latent bug in the code this
+    /// replaced: the old rollbacks set <c>_suppressClickHandlers = true</c>, then awaited the stored
+    /// value, then assigned — holding a page-wide suppression flag across an await, during which any
+    /// other control's handler would have been silently swallowed.
+    /// </para>
+    /// </summary>
+    private void SetToggle(System.Windows.Controls.Primitives.ToggleButton toggle, bool value)
+    {
+        _programmaticToggleWrites++;
+        try
+        {
+            toggle.IsChecked = value;
+        }
+        finally
+        {
+            _programmaticToggleWrites--;
+        }
+    }
+
+    // Keeps the alerts status line's "auto-rejoin in use" answer live while the page is shown
+    // (Settings is a non-modal shell page, F-013). Created in OnLoaded, disposed on Unloaded and in
+    // Dispose, so a page swapped out by the shell holds no subscription on the view model's rows.
+    private AutoRejoinUsageWatcher? _autoRejoinWatcher;
+
+    // Known Roblox issues' "Open memory settings" (spec §4). OnLoaded resets the rail to its first
+    // section every time the page is shown — the shell swaps pages in and out — so a reveal asked for
+    // before Loaded is queued here and applied straight after that reset.
+    private bool _revealMemoryOnLoad;
+
+    /// <summary>Channel names reported by the probe for each webhook, if it answered.</summary>
+    private string? _mineChannelName;
+
+    private string? _clanChannelName;
+
+    // The single owner replaced the snapshot that used to live here (F-013 prerequisite,
+    // 2026-08-21). The old design kept an in-memory copy, mutated it on every click, and saved it
+    // whole — safe only because this dialog was modal and the one other writer (the row context
+    // menu's mute) could not run underneath it. Its own comment said so: "it is the modality, not
+    // the code, that makes this safe today." DiscordConfigService serializes every writer's
+    // read-modify-write inside one gate, so the interleave that comment feared — two checkbox
+    // clicks in quick succession, or a row mute landing mid-save — composes instead of racing.
+    // This window reads Current per use and repaints on Changed: a view, not a snapshot.
+    private DiscordConfig CurrentDiscordConfig => _discordConfigService.Current;
+
+    // Set in OnLoaded when DiscordPresence is available, so OnDiscordStatusChanged and OnClosed
+    // (subscribe/unsubscribe) both have a reference without re-touching MainViewModel each time.
+    private DiscordPresenceService? _discordPresence;
+
+    public SettingsPage(
+        IAppSettings settings,
+        IStartupRegistration startupRegistration,
+        IThemeStore themeStore,
+        ThemeService themeService,
+        IAccountStore accountStore,
+        IAccountTransport transport,
+        MainViewModel mainViewModel,
+        DiscordConfigService discordConfigService,
+        AlertDispatcher alertDispatcher,
+        DiscordWebhookSender webhookSender,
+        WebhookProbe webhookProbe,
+        ROROROblox.Core.Notify.PhoneNotifyConfigService phoneNotifyService,
+        ROROROblox.App.Notify.PhoneAlertSender phoneAlertSender,
+        ISystemMemoryProbe systemMemoryProbe,
+        MemoryWatchdogGate memoryWatchdogGate,
+        ROROROblox.App.Tray.IAlertSoundPlayer alertSoundPlayer)
+    {
+        _alertSoundPlayer = alertSoundPlayer;
+        _memoryWatchdogGate = memoryWatchdogGate;
+        _automaticMemory = new AutomaticMemorySummary(systemMemoryProbe);
+        _alertDispatcher = alertDispatcher;
+        _webhookSender = webhookSender;
+        _webhookProbe = webhookProbe;
+        _phoneNotifyService = phoneNotifyService;
+        _phoneAlertSender = phoneAlertSender;
+        _settings = settings;
+        _startupRegistration = startupRegistration;
+        _themeStore = themeStore;
+        _themeService = themeService;
+        _accountStore = accountStore;
+        _transport = transport;
+        _mainViewModel = mainViewModel;
+        _discordConfigService = discordConfigService;
+        InitializeComponent();
+
+        // F-102. Two-way binding, NOT a Click handler. TogglePattern.Toggle() — the only pattern a
+        // CheckBox exposes, and the one every assistive technology and automation path uses — goes
+        // through WPF's ToggleButtonAutomationPeer, which raises Checked/Unchecked and never Click.
+        // So the old handler never ran for those callers: IsChecked flipped, UIA reported On, and
+        // streamer mode stayed OFF. A privacy control reporting engaged while disengaged, observed
+        // end to end in the Store capture run — toggled via UIA, read back On, and the captured PNG
+        // showed real account names.
+        //
+        // Binding is immune to the whole Click-versus-programmatic split, including automation
+        // paths nobody has thought of yet, which is why it beats moving the handler to
+        // Checked/Unchecked.
+        StreamerModeToggle.SetBinding(
+            System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty,
+            new System.Windows.Data.Binding(nameof(MainViewModel.StreamerModeOn))
+            {
+                Source = _mainViewModel,
+                Mode = System.Windows.Data.BindingMode.TwoWay,
+            });
+
+        Loaded += OnLoaded;
+        Unloaded += OnUnloaded;
+
+        // Live-refresh the code-composed summaries on a language toggle (the deferred half of the
+        // Phase D live-toggle). The language picker below sets TranslationSource.CurrentCulture, which
+        // raises CultureChanged synchronously; {loc:Loc} XAML re-renders itself, but the summaries
+        // this page assembles in code (alerts status, muted accounts, theme description + folder
+        // status) are set imperatively and would otherwise stay in the old language until the next
+        // open. Subscribed here (once per instance) rather than in OnLoaded, which re-fires on
+        // re-navigation and would double-subscribe; unsubscribed in Dispose.
+        TranslationSource.Instance.CultureChanged += OnUiCultureChanged;
+    }
+
+    /// <summary>
+    /// Unsubscribes <see cref="OnDiscordStatusChanged"/> from the presence service. Without this,
+    /// every Preferences open/close leaks one subscriber onto <see cref="DiscordPresenceService"/>
+    /// — a singleton that outlives this (transient, per-open) window — and each leaked subscriber
+    /// keeps firing (and marshalling through this closed window's <see cref="Window.Dispatcher"/>)
+    /// for the rest of the process.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_discordPresence is { } presence)
+        {
+            presence.StatusChanged -= OnDiscordStatusChanged;
+        }
+
+        // Same leak shape as the presence subscription above: this window is transient per-open,
+        // MainViewModel is a singleton, so an unsubscribed handler would fire through a closed
+        // window's Dispatcher for the rest of the process.
+        _mainViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+
+        // And the config owner outlives this window the same way.
+        _discordConfigService.Changed -= OnDiscordConfigChanged;
+
+        // The culture source is an app-lifetime singleton too — leave a subscription on it and this
+        // disposed page's re-render fires for the rest of the process.
+        TranslationSource.Instance.CultureChanged -= OnUiCultureChanged;
+
+        // And the account rows, which belong to the singleton view model.
+        _autoRejoinWatcher?.Dispose();
+        _autoRejoinWatcher = null;
+    }
+
+    /// <summary>The shell swapped this page out: stop listening to the account rows until it is shown again.</summary>
+    private void OnUnloaded(object sender, RoutedEventArgs e)
+    {
+        _autoRejoinWatcher?.Dispose();
+        _autoRejoinWatcher = null;
+    }
+
+    /// <summary>
+    /// Some account's auto-rejoin changed (the row menu, or a pause turned it off) or an account
+    /// came or went while this page is shown. The status line counts auto-rejoin-paused alerts
+    /// only while an account has it on, so recompute it.
+    /// </summary>
+    private void OnAutoRejoinUsageChanged()
+    {
+        if (!_loaded) return; // OnLoaded paints the line itself once population is done
+        if (Dispatcher.CheckAccess())
+        {
+            RefreshAlertsStatus();
+        }
+        else
+        {
+            Dispatcher.BeginInvoke(new Action(RefreshAlertsStatus));
+        }
+    }
+
+    /// <summary>
+    /// Repaint the Discord controls from a published change, whoever wrote it — this window's own
+    /// saves included, and the row context menu's mute, which can now land while this window is
+    /// open. Queued rather than inlined: the owner raises inside its write gate, possibly off the
+    /// UI thread, and a change raised by this window's own save must not re-enter the handler that
+    /// saved it.
+    /// <para>
+    /// Deliberately does NOT repaint the webhook fields: a repaint mid-edit would stomp a URL being
+    /// typed, and the only out-of-window writer today touches <c>MutedAccountIds</c>. If a second
+    /// out-of-window writer ever edits webhooks, this is the line to revisit.
+    /// </para>
+    /// </summary>
+    private void OnDiscordConfigChanged(object? sender, DiscordConfig config)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            _suppressClickHandlers = true;
+            try
+            {
+                SetToggle(DiscordPresenceToggle, config.PresenceEnabled);
+                SetToggle(DiscordJoinToggle, config.JoinEnabled);
+                DiscordJoinToggle.IsEnabled = config.PresenceEnabled;
+                SetRoutingChecks(config);
+                RefreshAlertsStatus();
+                RefreshMutedAccounts();
+            }
+            finally
+            {
+                _suppressClickHandlers = false;
+            }
+        });
+    }
+
+    /// <summary>
+    /// Keeps the streamer-mode checkbox a VIEW of the provider rather than a snapshot of it.
+    /// <para>
+    /// Streamer mode is flippable from three places — this checkbox, the tray menu, and a plugin —
+    /// and the tray menu is reachable while this window is open, because a modal
+    /// <c>ShowDialog</c> disables only the top-level windows that existed when it opened, and the
+    /// tray's <c>ContextMenu</c> popup is created after that. Without this subscription, flipping
+    /// the mask from the tray leaves this checkbox reporting the opposite of the truth on the one
+    /// control that tells a streamer whether their names are hidden.
+    /// </para>
+    /// <para>
+    /// Wave 1 shipped exactly that bug for one review round: the original control was a two-way
+    /// binding, and moving it here turned it into a single read in <c>OnLoaded</c>.
+    /// </para>
+    /// </summary>
+    private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(MainViewModel.StreamerModeOn)) return;
+
+        // MARSHAL FIRST. This notification arrives on a THREADPOOL thread:
+        // StreamerIdentityProvider.SetActiveAsync awaits the settings write with
+        // ConfigureAwait(false) and raises Changed on that continuation
+        // (StreamerIdentityProvider.cs:107-108). Writing IsChecked from there throws cross-thread
+        // instantly — and MainViewModel.StreamerModeOn discards the task it started, so the throw
+        // is swallowed with no log line AND it aborts the rest of the Changed multicast, starving
+        // every subscriber behind this one. That is the same hazard MainViewModel:261 documents
+        // for PressureCrossed, and the rule at MainViewModel:288: the binding engine auto-
+        // dispatches, a direct control write does not. The two-way binding this control replaced
+        // was marshalling for free; hand-rolling it dropped that.
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(new Action(() => OnViewModelPropertyChanged(sender, e)));
+            return;
+        }
+
+        try
+        {
+            _suppressClickHandlers = true;
+            // Streamer mode just changed. If it went ON while anything was revealed — the ntfy
+            // code, the topic itself, a webhook URL, a Pushover key — that credential is now
+            // sitting on a stream. Drop all of it in the same gesture that masks the names.
+            // Re-masking first matters: it unchecks the reveal toggles, which is what the QR
+            // refresh below then reads to decide the code is hidden too.
+            if (StreamerModeToggle.IsChecked == true) ReMaskRevealedSecrets();
+            RefreshNtfyQr();
+        }
+        catch (Exception)
+        {
+            // Never let a UI refresh abort the notification chain — see above. Worst case this
+            // checkbox is stale until reopened, which is strictly better than silently breaking
+            // every other subscriber's update.
+        }
+        finally
+        {
+            _suppressClickHandlers = false;
+        }
+    }
+
+    private async void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        _suppressClickHandlers = true;
+        try
+        {
+            SettingsNav.SelectedIndex = 0;
+            if (_revealMemoryOnLoad)
+            {
+                _revealMemoryOnLoad = false;
+                ShowMemorySwitch();
+            }
+
+            SetToggle(RunOnLoginToggle, SafeIsStartupEnabled());
+            SetToggle(LaunchMainToggle, await _settings.GetLaunchMainOnStartupAsync());
+            SetToggle(LaunchWindowedToggle, await _settings.GetLaunchWindowedAsync());
+            // v1.18 — the mirror of the Squad Launch modal's careful-mode toggle (F-020). Read on
+            // every open, exactly as SquadLaunchWindow.OnLoaded reads it, so the two surfaces agree
+            // without either one holding a copy of the value.
+            SetToggle(CarefulSquadLaunchToggle, await _settings.GetCarefulSquadLaunchAsync());
+
+            SetToggle(AlwaysShowRecycleToggle, await _settings.GetAlwaysShowRecycleAsync());
+            SetToggle(AutoForceStopToggle, await _settings.GetAutoForceStopAsync());
+
+            // The metric-alert opt-in, painted HERE with the other settings.json-backed toggles
+            // rather than in PopulateAlertControls, because that method paints from the Discord
+            // config and this value does not live there (see the XAML row's two-stores note).
+            // Order matters, mildly: this runs before PopulateAlertControls, whose
+            // RefreshAlertsStatus reads this checkbox for the status line.
+            //
+            // ITS OWN GUARD, NOT _suppressClickHandlers, and that is not belt-and-braces (review
+            // fix 2, 2026-09-11; this reason was corrected by the final whole-branch review the same
+            // day — the first version blamed OnDiscordConfigChanged, which is not subscribed until
+            // further down this method, AFTER the paint it claimed to be protecting).
+            //
+            // The real reason is what this paint is: the only one on the page whose handler a
+            // programmatic write actually raises. Every toggle above it is wired Click, which an
+            // IsChecked assignment never fires, so _suppressClickHandlers is belt for them and
+            // nothing more; this one is Checked/Unchecked and WOULD fire, turning a populate into a
+            // save and a gate nudge. A guard is therefore mandatory here, and it is a flag of its
+            // own so the toggle's safety does not depend on a flag another concern raises and
+            // clears — which OnDiscordConfigChanged becomes the moment it is subscribed below, on a
+            // dispatcher callback this page does not schedule. _paintingMetricAlertsToggle is set
+            // and cleared around this one assignment and nothing else can touch it. Today the value
+            // an unguarded write would save matches the file, so nothing breaks — which is exactly
+            // how this kind of path stays hidden until it does.
+            var metricAlertsEnabled = await _settings.GetMetricAlertsEnabledAsync();
+            PaintMetricAlertsToggle(metricAlertsEnabled);
+
+            // Streamer mode reads through to IStreamerIdentityProvider via the view model — there is
+            // no separate persisted flag here, which is why this reads the VM rather than _settings.
+            // The SUBSCRIPTION is the load-bearing half: see OnViewModelPropertyChanged.
+            _mainViewModel.PropertyChanged += OnViewModelPropertyChanged;
+
+            // Discord presence + Join (v1.14+ plan). DiscordPresence is only non-null when
+            // App.OnStartup found a non-empty Discord:ApplicationId in appsettings.json — see
+            // App.WireDiscordPresenceAsync. Null means the feature can never work in this build,
+            // so the toggles are disabled rather than left checkable-but-inert.
+            //
+            // Fix round 1, Finding 3: this block has its own try/catch, separate from the outer
+            // one (which has none — an async void Loaded handler with no catch takes the whole
+            // app down). The store underneath InitializeAsync only maps CryptographicException/
+            // JsonException to defaults; a locked or ACL-blocked discord.dat throws IOException/
+            // UnauthorizedAccessException straight through, and this block runs BEFORE idle +
+            // theme population below — an unguarded throw here would blank the rest of the dialog,
+            // not just the Discord section.
+            try
+            {
+                await _discordConfigService.InitializeAsync();
+                // The phone owner gets the same self-heal: WireAlertsAsync's shared try/catch can
+                // skip the phone load when the Discord init throws first, and nothing else ever
+                // re-initializes it — without this, the phone section would paint defaults over a
+                // populated notify.dat for the rest of the session (review 2026-09-04).
+                await _phoneNotifyService.InitializeAsync();
+                var discordConfig = CurrentDiscordConfig;
+                SetToggle(DiscordPresenceToggle, discordConfig.PresenceEnabled);
+                SetToggle(DiscordJoinToggle, discordConfig.JoinEnabled);
+                // FIX 7 (final whole-branch review, 2026-08-03): Join has no effect while presence
+                // is off (DiscordPresenceService.JoinEnabled is now PresenceEnabled && JoinEnabled)
+                // — disabling the checkbox here says so instead of leaving it checkable-but-inert.
+                DiscordJoinToggle.IsEnabled = discordConfig.PresenceEnabled;
+                // Alerts read the same owner — and, unlike presence, work with no Discord
+                // application id, so they are populated outside the DiscordPresence null-check below.
+                PopulateAlertControls();
+                // A view, not a snapshot: the row context menu can now mute an account while this
+                // window is open (it goes through the same owner), and this window has to show it.
+                // Unsubscribed in OnClosed, same leak discipline as the presence subscription.
+                _discordConfigService.Changed += OnDiscordConfigChanged;
+                if (_mainViewModel.DiscordPresence is { } presence)
+                {
+                    // Fix round 1, Finding 2: subscribe so the status line stays honest for the
+                    // rest of this window's lifetime, not just at this instant — see
+                    // OnDiscordStatusChanged's remarks for why a one-time read here isn't enough.
+                    _discordPresence = presence;
+                    presence.StatusChanged += OnDiscordStatusChanged;
+                    DiscordStatusLine.Text = presence.StatusLine;
+                }
+                else
+                {
+                    DiscordPresenceToggle.IsEnabled = false;
+                    DiscordJoinToggle.IsEnabled = false;
+                    DiscordStatusLine.Text = Loc.Get("Shell_Pref_DiscordNotSetUp");
+                }
+            }
+            catch (Exception)
+            {
+                // Same disabled-toggles-with-explanation shape as the "DiscordPresence is null"
+                // branch above — a store read failure and "the feature isn't available" look
+                // identical to the user, and both are non-fatal to the rest of this dialog.
+                SetToggle(DiscordPresenceToggle, false);
+                DiscordPresenceToggle.IsEnabled = false;
+                SetToggle(DiscordJoinToggle, false);
+                DiscordJoinToggle.IsEnabled = false;
+                DiscordStatusLine.Text = Loc.Get("Shell_Pref_DiscordNotSetUp");
+            }
+
+            // v1.33 item 6 — the pace and the sound. Before the idle threshold below rather than
+            // after it only because the pace is the thing the rows above it are read against.
+            //
+            // Its own try/catch for the reason the memory block below has one: this handler is
+            // async void with no outer catch, and AppSettings.LoadAsync maps only IOException and
+            // JsonException to defaults — an ACL-blocked settings.json throws
+            // UnauthorizedAccessException straight through and would blank everything after it.
+            try
+            {
+                await PopulateCadenceAndSoundAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(Window.GetWindow(this),
+                    Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                    Loc.Get("Shell_Pref_Title"),
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+
+            // v1.8 idle awareness — the warn-threshold preset (10/12/15/18 minutes). The mute
+            // toggle that used to be painted here went with v1.33 item 6: MuteIdleAlerts migrated
+            // once to DiscordConfig.IdleDestinations = [] in item 3 and is read by nothing now, so
+            // idle's "where does it go" is four checkboxes in the grid like every other kind's.
+            var thresholdMinutes = await _settings.GetIdleWarnThresholdMinutesAsync();
+            IdleWarnThresholdPicker.SelectedItem = IdleWarnThresholdPicker.Items
+                .OfType<System.Windows.Controls.ComboBoxItem>()
+                .FirstOrDefault(item => string.Equals((string)item.Tag, thresholdMinutes.ToString(), StringComparison.Ordinal))
+                ?? IdleWarnThresholdPicker.Items
+                .OfType<System.Windows.Controls.ComboBoxItem>()
+                .FirstOrDefault(item => string.Equals((string)item.Tag, "15", StringComparison.Ordinal));
+
+            // v1.18 — the four memory watchdog settings (F-023). Its own try/catch for the same
+            // reason the Discord block above has one: this handler is async void with no outer
+            // catch, and AppSettings.LoadAsync only maps IOException and JsonException to defaults
+            // — an ACL-blocked settings.json throws UnauthorizedAccessException straight through.
+            // Unguarded that would blank the theme picker below, not just this section.
+            try
+            {
+                await PopulateMemoryControlsAsync();
+            }
+            catch (Exception ex)
+            {
+                ShowMemoryWarning(Loc.Format("Shell_Pref_CouldntReadMemory", ex.Message));
+            }
+
+            // Populate the theme picker. Built-ins first, then user-supplied JSON files.
+            var themes = await _themeStore.ListAsync();
+            ThemePicker.ItemsSource = themes;
+            var activeId = await _settings.GetActiveThemeIdAsync() ?? "brand";
+            var initialTheme = themes.FirstOrDefault(t =>
+                string.Equals(t.Id, activeId, StringComparison.OrdinalIgnoreCase))
+                ?? themes.FirstOrDefault();
+            ThemePicker.SelectedItem = initialTheme;
+            // _suppressClickHandlers is still true here, so OnThemeChanged's SelectionChanged
+            // fire above is a no-op — set the description explicitly or a user who never touches
+            // the picker never sees it for the theme that is already active.
+            UpdateThemeDescription(initialTheme);
+            // v1.18 item 7 (F-026). A theme file the store could not read used to just not appear.
+            // Reported here rather than at startup because this is the page that owns the picker
+            // the file was supposed to show up in, and because a report nobody is looking at is
+            // the same silence in a different place.
+            ReportThemeFolder(themes);
+
+            // Language picker (localization, 2026-09-07). Only languages whose catalog ships
+            // (UiCulture.Available) — with no translated catalogs yet, English alone. Honest by
+            // construction: a language appears here exactly when its Strings.<culture>.resx does.
+            var languages = UiCulture.Available();
+            LanguagePicker.ItemsSource = languages;
+            var savedLang = await _settings.GetUiLanguageAsync() ?? "";
+            LanguagePicker.SelectedItem =
+                languages.FirstOrDefault(c => string.Equals(c.CultureName, savedLang, StringComparison.OrdinalIgnoreCase))
+                ?? languages[0]; // English — always present
+
+            // Population done — the culture-change re-render may now run against real state.
+            _loaded = true;
+
+            // Page activation: repaint the status line against the accounts as they are now (an
+            // account's auto-rejoin may have changed while the page was swapped out), then keep it
+            // live while the page is shown.
+            RefreshAlertsStatus();
+            _autoRejoinWatcher ??= new AutoRejoinUsageWatcher(_mainViewModel.Accounts, OnAutoRejoinUsageChanged);
+        }
+        finally
+        {
+            _suppressClickHandlers = false;
+        }
+    }
+
+    /// <summary>
+    /// Re-render the summaries this page composes in code when the UI language changes, so they flip
+    /// with the toggle instead of waiting for the next open. Every call here is a pure read of
+    /// already-loaded state — no settings re-read, no toggle reset, no editable field touched — so it
+    /// is safe to run on any culture change. The memory section and the Discord status line are
+    /// deliberately not here: the former re-reads settings (heavier, and a mid-edit stomp risk) and
+    /// the latter is event-driven (it re-narrates on the next presence event), both acceptable as
+    /// next-open refreshes.
+    /// </summary>
+    private void OnUiCultureChanged(object? sender, EventArgs e)
+    {
+        if (!_loaded) return;
+        RefreshAlertsStatus();
+        RefreshMutedAccounts();
+        UpdateThemeDescription(ThemePicker.SelectedItem as Theme);
+        if (ThemePicker.ItemsSource is IReadOnlyList<Theme> themes)
+        {
+            ReportThemeFolder(themes);
+        }
+    }
+
+    private async void OnUiLanguageChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+        if (LanguagePicker.SelectedItem is not CultureOption picked) return;
+        try
+        {
+            // Empty culture name = English (the neutral catalog) = "follow the OS" (null) next launch.
+            // Persist it, AND apply it LIVE — {loc:Loc} bindings re-render on the toggle now (Phase D),
+            // no restart. Composed ViewModel strings not yet migrated stay until their extraction.
+            await _settings.SetUiLanguageAsync(picked.CultureName.Length == 0 ? null : picked.CultureName);
+            TranslationSource.Instance.CurrentCulture = picked.CultureName.Length == 0
+                ? CultureInfo.InvariantCulture
+                : System.Globalization.CultureInfo.GetCultureInfo(picked.CultureName);
+        }
+        catch (System.Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveLanguage", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void OnThemeChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+        if (ThemePicker.SelectedItem is not Theme picked) return;
+        UpdateThemeDescription(picked);
+        try
+        {
+            // v1.18 item 7 (F-019). SetActiveAsync has always applied the theme whether or not the
+            // write succeeded, and used to return nothing — so the failure looked exactly like a
+            // success and the old theme was back after a restart. The apply is unchanged; the
+            // silence is not.
+            var change = await _themeService.SetActiveAsync(picked.Id);
+            var line = ThemeStatusSummary.ForThemeChange(picked.Name, change);
+            // A save that worked does not blank the line, it hands it back to the folder report —
+            // see _themeFolderStatus. Painted BEFORE the edge dialog so the message is on screen
+            // behind it rather than arriving after the user has finished with the modal.
+            ShowThemeStatus(line.Any ? line : _themeFolderStatus);
+            // Switching TO a user theme whose edge had to be raised is the same question startup
+            // asks — put here too, or the only way to see it would be to restart.
+            await EdgeRemediationWindow.AskIfPendingAsync(_themeService, Window.GetWindow(this));
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    /// <summary>
+    /// Recomputes what the themes folder has to say and puts it on the line.
+    /// <para>
+    /// The file names come from here rather than from the store because
+    /// <c>spec.md &gt; §1</c> puts <c>ROROROblox.Core</c> out of this cycle's reach and
+    /// <c>IThemeStore</c> reports no failures. <see cref="ThemeStatusSummary.ForFolder"/> carries
+    /// the argument for why reading the folder from out here is sound rather than a guess, and the
+    /// test that stops the one duplicated rule drifting.
+    /// </para>
+    /// </summary>
+    private void ReportThemeFolder(IReadOnlyList<Theme> loaded)
+    {
+        _themeFolderStatus = ThemeStatusSummary.ForFolder(loaded, ThemeFolderFileNames());
+        ShowThemeStatus(_themeFolderStatus);
+    }
+
+    /// <summary>
+    /// The <c>*.json</c> names in the user themes folder, matching <c>ThemeStore.ListAsync</c>'s
+    /// own enumeration exactly — same pattern, same top-directory-only scope. A folder that cannot
+    /// be enumerated yields nothing rather than throwing: the store already returned its built-ins
+    /// from the same folder without complaint, so a failure here says nothing new and must not take
+    /// down an <c>async void</c> Loaded handler.
+    /// </summary>
+    private IReadOnlyList<string> ThemeFolderFileNames()
+    {
+        try
+        {
+            return System.IO.Directory
+                .EnumerateFiles(_themeStore.UserThemesFolder, "*.json", System.IO.SearchOption.TopDirectoryOnly)
+                .Select(System.IO.Path.GetFileName)
+                .Where(name => !string.IsNullOrEmpty(name))
+                .Select(name => name!)
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void ShowThemeStatus(ThemeStatusSummary.Line line)
+    {
+        ThemeStatusLine.Text = line.Text;
+        ThemeStatusLine.Visibility = line.Any ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Sets the one-sentence line under the picker from <see cref="ThemeDescriptions.For"/>.
+    /// Collapsed (not Hidden) when the theme is a user theme and the lookup returns null, so no
+    /// empty gap is left where the line would have been. Called on initial load and on every
+    /// selection change — including a freshly-built user theme (<see cref="OnBuildThemeClick"/>),
+    /// which returns null just like any other user theme and must clear a stale built-in line.
+    /// </summary>
+    private void UpdateThemeDescription(Theme? theme)
+    {
+        var description = theme is null ? null : ThemeDescriptions.For(theme.Id);
+        ThemeDescriptionText.Text = description ?? string.Empty;
+        ThemeDescriptionText.Visibility = description is null ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private async void OnBuildThemeClick(object sender, RoutedEventArgs e)
+    {
+        var builder = new ThemeBuilderWindow(_themeStore, _themeService) { Owner = Window.GetWindow(this) };
+        if (builder.ShowDialog() == true && builder.SavedTheme is { } saved)
+        {
+            // Refresh the picker so the brand-new theme shows up + is selected.
+            _suppressClickHandlers = true;
+            try
+            {
+                var themes = await _themeStore.ListAsync();
+                ThemePicker.ItemsSource = themes;
+                var selected = themes.FirstOrDefault(t =>
+                    string.Equals(t.Id, saved.Id, StringComparison.OrdinalIgnoreCase));
+                ThemePicker.SelectedItem = selected;
+                // Suppressed the same way the initial load is — set explicitly or a prior
+                // built-in's sentence stays on screen over a brand-new user theme.
+                UpdateThemeDescription(selected);
+                // Recomputed, and it is not busywork: naming a built-in theme in the builder
+                // writes a file whose id the built-in already owns, so the save "succeeds",
+                // ListAsync drops it and `selected` above lands null. That was silent too.
+                ReportThemeFolder(themes);
+            }
+            finally
+            {
+                _suppressClickHandlers = false;
+            }
+
+            // Asked here rather than inside the builder: the builder is closing at the moment it
+            // applies the theme, and a dialog parented to a window on its way out is a flicker.
+            await EdgeRemediationWindow.AskIfPendingAsync(_themeService, Window.GetWindow(this));
+        }
+    }
+
+    private void OnOpenThemesFolderClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(_themeStore.UserThemesFolder);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _themeStore.UserThemesFolder,
+                UseShellExecute = true,
+                Verb = "open",
+            });
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    private void OnRunOnLoginToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        try
+        {
+            if (RunOnLoginToggle.IsChecked == true)
+            {
+                _startupRegistration.Enable();
+            }
+            else
+            {
+                _startupRegistration.Disable();
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntUpdateStartup", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            // Revert visual state.
+            SetToggle(RunOnLoginToggle, SafeIsStartupEnabled());
+        }
+    }
+
+    private async void OnLaunchWindowedToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        try
+        {
+            await _settings.SetLaunchWindowedAsync(LaunchWindowedToggle.IsChecked == true);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetToggle(LaunchWindowedToggle, await _settings.GetLaunchWindowedAsync());
+        }
+    }
+
+    private async void OnLaunchMainToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        try
+        {
+            await _settings.SetLaunchMainOnStartupAsync(LaunchMainToggle.IsChecked == true);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetToggle(LaunchMainToggle, await _settings.GetLaunchMainOnStartupAsync());
+        }
+    }
+
+    /// <summary>
+    /// The Settings-side half of careful mode. Writes the same persisted value
+    /// <c>SquadLaunchWindow.OnCarefulModeToggle</c> writes, through the same
+    /// <c>IAppSettings</c> accessor pair — there is one value and two views of it, not two flags.
+    /// <para>
+    /// On a failed write this reverts from the file rather than leaving the checkbox showing what
+    /// the user asked for, which is the same shape the modal uses: a control that shows an unsaved
+    /// state is how the two surfaces would start disagreeing.
+    /// </para>
+    /// </summary>
+    private async void OnCarefulSquadLaunchToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        try
+        {
+            await _settings.SetCarefulSquadLaunchAsync(CarefulSquadLaunchToggle.IsChecked == true);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetToggle(CarefulSquadLaunchToggle, await _settings.GetCarefulSquadLaunchAsync());
+        }
+    }
+
+    private async void OnAutoForceStopToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        var wanted = AutoForceStopToggle.IsChecked == true;
+        try
+        {
+            // No view-model push needed, unlike the Recycle toggle: StopAccountAsync reads this
+            // per stop rather than caching it, so the next press already has the new answer.
+            await _settings.SetAutoForceStopAsync(wanted);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSaveSetting", ex.Message),
+                "Multi Manager Roblox", MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetToggle(AutoForceStopToggle, !wanted);
+        }
+    }
+
+    private async void OnAlwaysShowRecycleToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        var wanted = AlwaysShowRecycleToggle.IsChecked == true;
+        try
+        {
+            await _settings.SetAlwaysShowRecycleAsync(wanted);
+            // Push it into the live view model too — the rows bind to the flag, not the file, so
+            // without this the change wouldn't show until the next start.
+            _mainViewModel.AlwaysShowRecycle = wanted;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetToggle(AlwaysShowRecycleToggle, await _settings.GetAlwaysShowRecycleAsync());
+        }
+    }
+
+    /// <summary>
+    /// Keeps <see cref="DiscordStatusLine"/> honest for as long as this window is open.
+    /// <para>
+    /// Fix round 1, Finding 2: <see cref="DiscordPresenceService.StatusLine"/> is a plain property
+    /// with no notification of its own — reading it once, right after <c>await ApplyAsync(...)</c>
+    /// returns, captures whatever it was set to SYNCHRONOUSLY inside that call (the immediate
+    /// "Presence is off." / "Connecting to Discord…" transient), not the real outcome. The real
+    /// outcome (Lachee's <c>Ready</c>/<c>ConnectionFailed</c> callbacks) arrives later, off the UI
+    /// thread, with nothing else in this window watching for it — so without this subscription the
+    /// panel would show a stale value for as long as it stayed open. Subscribed in
+    /// <see cref="OnLoaded"/>, unsubscribed in <see cref="OnClosed"/>.
+    /// </para>
+    /// <para>
+    /// <see cref="DiscordPresenceService.StatusChanged"/> can fire from Lachee's background RPC
+    /// thread (via <c>Ready</c>/<c>ConnectionFailed</c>) or from this window's own UI thread (via
+    /// the toggle handlers below calling <c>ApplyAsync</c> directly) — <c>Dispatcher.Invoke</c>
+    /// handles both: it marshals when off-thread and runs synchronously in place when already on
+    /// the dispatcher thread, so there's no need to branch on which case this is.
+    /// </para>
+    /// </summary>
+    private void OnDiscordStatusChanged(object? sender, EventArgs e)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if (_discordPresence is { } presence)
+            {
+                DiscordStatusLine.Text = presence.StatusLine;
+            }
+        });
+    }
+
+    /// <summary>
+    /// "Show what you're playing on Discord." The mutation goes through the owner, and the owner's
+    /// <c>Changed</c> event is what pushes it into the live presence service (App wires that
+    /// subscription) — this handler no longer calls <c>ApplyAsync</c> itself, so a writer that
+    /// isn't this window reaches presence exactly the same way. The status line is NOT read here
+    /// either — see <see cref="OnDiscordStatusChanged"/>'s remarks for why a one-time read would
+    /// show a stale value; the subscription set up in <see cref="OnLoaded"/> is what keeps
+    /// <see cref="DiscordStatusLine"/> correct through both the immediate transient and whatever
+    /// Lachee reports afterward.
+    /// </summary>
+    private async void OnDiscordPresenceToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        var wanted = DiscordPresenceToggle.IsChecked == true;
+        // FIX 7: keep the Join checkbox's enabled state tracking presence live, not just at
+        // OnLoaded — Join has no effect while presence is off (DiscordPresenceService.JoinEnabled).
+        DiscordJoinToggle.IsEnabled = wanted;
+        try
+        {
+            await _discordConfigService.MutateAsync(c => c with { PresenceEnabled = wanted });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            // A failed mutate publishes nothing, so Current still matches the disk — repaint from it.
+            _suppressClickHandlers = true;
+            SetToggle(DiscordPresenceToggle, CurrentDiscordConfig.PresenceEnabled);
+            DiscordJoinToggle.IsEnabled = CurrentDiscordConfig.PresenceEnabled;
+            _suppressClickHandlers = false;
+        }
+    }
+
+    /// <summary>"Let friends join your server from Discord." Same shape as <see cref="OnDiscordPresenceToggle"/>.</summary>
+    private async void OnDiscordJoinToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        var wanted = DiscordJoinToggle.IsChecked == true;
+        try
+        {
+            await _discordConfigService.MutateAsync(c => c with { JoinEnabled = wanted });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetToggle(DiscordJoinToggle, CurrentDiscordConfig.JoinEnabled);
+        }
+    }
+
+    // ---------- Alerts (plan 2026-08-03, Task 7) ----------
+
+    /// <summary>
+    /// Paint the alert controls from the loaded config. Called from <c>OnLoaded</c> inside the
+    /// same guarded block as the presence toggles.
+    /// </summary>
+    private void PopulateAlertControls()
+    {
+        var discordConfig = CurrentDiscordConfig;
+        SetRoutingChecks(discordConfig);
+        ShowWebhookMasked(MineWebhookInput, MineWebhookReveal, discordConfig.MineWebhookUrl);
+        ShowWebhookMasked(ClanWebhookInput, ClanWebhookReveal, discordConfig.ClanWebhookUrl);
+        PopulatePhoneControls();
+        RefreshAlertsStatus();
+        // Called from HERE and nowhere earlier, on purpose. The count itself reads only the view
+        // model's rows and would survive a failed config load — but Unmute all writes the whole
+        // DiscordConfig record, and on the failed-InitializeAsync path the owner may still hold
+        // startup's read rather than what is on disk now. Offering the button there would let one
+        // click wipe somebody's webhook URLs. Inside this method it can only appear once the
+        // fresh config is loaded.
+        RefreshMutedAccounts();
+
+        // Best-effort, fire-and-forget: name the channel each saved webhook posts to, so a clan
+        // webhook sitting in the personal slot is visible on open rather than after it matters.
+        if (!string.IsNullOrWhiteSpace(discordConfig.MineWebhookUrl))
+        {
+            _ = ProbeWebhookAsync(discordConfig.MineWebhookUrl, isClan: false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(discordConfig.ClanWebhookUrl))
+        {
+            _ = ProbeWebhookAsync(discordConfig.ClanWebhookUrl, isClan: true);
+        }
+    }
+
+    /// <summary>Paint the routing checkboxes from the EFFECTIVE sets — <c>DestinationsFor</c>
+    /// migrates a pre-fanout blob's singular field on read, so an old config shows its one
+    /// destination ticked rather than everything off.</summary>
+    private void SetRoutingChecks(DiscordConfig config)
+    {
+        var dropped = config.DestinationsFor(AlertKind.AccountDroppedOut);
+        var memory = config.DestinationsFor(AlertKind.MemoryWarning);
+        DroppedOutLocalCheck.IsChecked = dropped.Contains(AlertDestination.Local);
+        DroppedOutMineCheck.IsChecked = dropped.Contains(AlertDestination.Mine);
+        DroppedOutClanCheck.IsChecked = dropped.Contains(AlertDestination.Clan);
+        DroppedOutPhoneCheck.IsChecked = dropped.Contains(AlertDestination.Phone);
+        MemoryWarningLocalCheck.IsChecked = memory.Contains(AlertDestination.Local);
+        MemoryWarningMineCheck.IsChecked = memory.Contains(AlertDestination.Mine);
+        MemoryWarningClanCheck.IsChecked = memory.Contains(AlertDestination.Clan);
+        MemoryWarningPhoneCheck.IsChecked = memory.Contains(AlertDestination.Phone);
+        var recycled = config.DestinationsFor(AlertKind.Recycled);
+        RecycledLocalCheck.IsChecked = recycled.Contains(AlertDestination.Local);
+        RecycledMineCheck.IsChecked = recycled.Contains(AlertDestination.Mine);
+        RecycledClanCheck.IsChecked = recycled.Contains(AlertDestination.Clan);
+        RecycledPhoneCheck.IsChecked = recycled.Contains(AlertDestination.Phone);
+        var uptime = config.DestinationsFor(AlertKind.UptimeMark);
+        UptimeMarkLocalCheck.IsChecked = uptime.Contains(AlertDestination.Local);
+        UptimeMarkMineCheck.IsChecked = uptime.Contains(AlertDestination.Mine);
+        UptimeMarkClanCheck.IsChecked = uptime.Contains(AlertDestination.Clan);
+        UptimeMarkPhoneCheck.IsChecked = uptime.Contains(AlertDestination.Phone);
+        var autoRejoinPaused = config.DestinationsFor(AlertKind.AutoRejoinPaused);
+        AutoRejoinPausedLocalCheck.IsChecked = autoRejoinPaused.Contains(AlertDestination.Local);
+        AutoRejoinPausedMineCheck.IsChecked = autoRejoinPaused.Contains(AlertDestination.Mine);
+        AutoRejoinPausedClanCheck.IsChecked = autoRejoinPaused.Contains(AlertDestination.Clan);
+        AutoRejoinPausedPhoneCheck.IsChecked = autoRejoinPaused.Contains(AlertDestination.Phone);
+        // Idle joined the grid in v1.33 item 6. DestinationsFor is what makes a config written
+        // before IdleDestinations existed show Desktop ticked rather than everything off — the
+        // same migration-on-read the four above rely on, and the reason this reads through it
+        // instead of the property.
+        var idle = config.DestinationsFor(AlertKind.AccountIdle);
+        IdleLocalCheck.IsChecked = idle.Contains(AlertDestination.Local);
+        IdleMineCheck.IsChecked = idle.Contains(AlertDestination.Mine);
+        IdleClanCheck.IsChecked = idle.Contains(AlertDestination.Clan);
+        IdlePhoneCheck.IsChecked = idle.Contains(AlertDestination.Phone);
+        // MetricBreach's routing lives in the same config as the four above it. Its ON/OFF switch
+        // does NOT — MetricAlertsEnabledToggle is painted from IAppSettings in OnLoaded.
+        var metric = config.DestinationsFor(AlertKind.MetricBreach);
+        MetricBreachLocalCheck.IsChecked = metric.Contains(AlertDestination.Local);
+        MetricBreachMineCheck.IsChecked = metric.Contains(AlertDestination.Mine);
+        MetricBreachClanCheck.IsChecked = metric.Contains(AlertDestination.Clan);
+        MetricBreachPhoneCheck.IsChecked = metric.Contains(AlertDestination.Phone);
+        // ...which is why the enabled state is synced here too: the four boxes' TICKS come from the
+        // config above, their AVAILABILITY from the switch, and every path that repaints one wants
+        // the other to agree. Both callers of this method (PopulateAlertControls in OnLoaded, and
+        // OnDiscordConfigChanged) run after the switch has been painted.
+        SyncMetricDestinationsEnabled();
+    }
+
+    /// <summary>
+    /// The four metric destination boxes follow the switch above them (final whole-branch review,
+    /// 2026-09-11). Left enabled while the switch was off, ticking one saved routing that could
+    /// never fire while the status line went on saying — correctly — that nothing was configured: a
+    /// control that answers the click and changes nothing else on the page reads as broken. The
+    /// page already had this shape for <c>DiscordJoinToggle</c>, which follows presence for the
+    /// same reason; this is that precedent, not a new one.
+    /// <para>
+    /// ENABLED STATE ONLY. <see cref="ReadChecks"/> reads <c>IsChecked</c>, which disabling does
+    /// not touch, so a saved routing set survives the switch going off and comes back exactly as it
+    /// was — turning the feature off is not a reason to forget where the user wanted it sent.
+    /// </para>
+    /// </summary>
+    private void SyncMetricDestinationsEnabled()
+    {
+        var on = MetricAlertsEnabledToggle.IsChecked == true;
+        MetricBreachLocalCheck.IsEnabled = on;
+        MetricBreachMineCheck.IsEnabled = on;
+        MetricBreachClanCheck.IsEnabled = on;
+        MetricBreachPhoneCheck.IsEnabled = on;
+    }
+
+    private IReadOnlyList<AlertDestination> ReadChecks(AlertKind kind)
+    {
+        var boxes = kind switch
+        {
+            AlertKind.AccountDroppedOut => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (DroppedOutLocalCheck, AlertDestination.Local),
+                (DroppedOutMineCheck, AlertDestination.Mine),
+                (DroppedOutClanCheck, AlertDestination.Clan),
+                (DroppedOutPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.MemoryWarning => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (MemoryWarningLocalCheck, AlertDestination.Local),
+                (MemoryWarningMineCheck, AlertDestination.Mine),
+                (MemoryWarningClanCheck, AlertDestination.Clan),
+                (MemoryWarningPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.Recycled => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (RecycledLocalCheck, AlertDestination.Local),
+                (RecycledMineCheck, AlertDestination.Mine),
+                (RecycledClanCheck, AlertDestination.Clan),
+                (RecycledPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.UptimeMark => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (UptimeMarkLocalCheck, AlertDestination.Local),
+                (UptimeMarkMineCheck, AlertDestination.Mine),
+                (UptimeMarkClanCheck, AlertDestination.Clan),
+                (UptimeMarkPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.AutoRejoinPaused => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (AutoRejoinPausedLocalCheck, AlertDestination.Local),
+                (AutoRejoinPausedMineCheck, AlertDestination.Mine),
+                (AutoRejoinPausedClanCheck, AlertDestination.Clan),
+                (AutoRejoinPausedPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.MetricBreach => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (MetricBreachLocalCheck, AlertDestination.Local),
+                (MetricBreachMineCheck, AlertDestination.Mine),
+                (MetricBreachClanCheck, AlertDestination.Clan),
+                (MetricBreachPhoneCheck, AlertDestination.Phone),
+            },
+            AlertKind.AccountIdle => new (System.Windows.Controls.CheckBox Box, AlertDestination Destination)[]
+            {
+                (IdleLocalCheck, AlertDestination.Local),
+                (IdleMineCheck, AlertDestination.Mine),
+                (IdleClanCheck, AlertDestination.Clan),
+                (IdlePhoneCheck, AlertDestination.Phone),
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+        return boxes.Where(b => b.Box.IsChecked == true).Select(b => b.Destination).ToList();
+    }
+
+    /// <summary>
+    /// The status line is the feature's honesty, so it is recomputed after every change rather
+    /// than set once. <see cref="AlertStatusLine"/> owns which sentence belongs to which state —
+    /// see its remarks for why that decision does not live here.
+    /// </summary>
+    /// <summary>
+    /// Persist a settings change through the owner, which makes it live immediately — the owner's
+    /// <c>Current</c> is what <see cref="AlertDispatcher"/> reads on every dispatch. Before the
+    /// owner existed the dispatcher's cache was refreshed only when this dialog closed. That meant
+    /// a user who set a destination and then sat watching for an alert with Settings still open got
+    /// nothing — the dispatcher was still reading the config from app startup. Measured live:
+    /// webhook saved 00:07:26, a real memory crossing at 00:08:46 logged "routed nowhere." A
+    /// setting that does not take effect until you close the window it lives in is
+    /// indistinguishable from a broken feature.
+    /// <para>
+    /// The mutation runs inside the owner's gate, possibly off the UI thread — callers capture
+    /// control state into locals FIRST and close over values, never over controls.
+    /// </para>
+    /// </summary>
+    private Task SaveDiscordConfigAsync(Func<DiscordConfig, DiscordConfig> mutate)
+        => _discordConfigService.MutateAsync(mutate);
+
+    private void RefreshAlertsStatus()
+    {
+        var phone = _phoneNotifyService.Current;
+        var line = AlertStatusLine.Compose(
+            CurrentDiscordConfig,
+            _alertDispatcher.MineWebhookRejected,
+            _alertDispatcher.ClanWebhookRejected,
+            _mineChannelName,
+            _clanChannelName,
+            _alertDispatcher.PhoneRejected,
+            phone.IsConfigured,
+            phone.Provider switch
+            {
+                ROROROblox.Core.Notify.PhoneProvider.Pushover => "Pushover",
+                ROROROblox.Core.Notify.PhoneProvider.Ntfy => "ntfy",
+                _ => null,
+            },
+            // The metric opt-in, read off the checkbox rather than IAppSettings: this method is
+            // synchronous and called from a dozen places, one of them a dispatcher continuation,
+            // and the checkbox is this page's single copy of the setting — painted from
+            // GetMetricAlertsEnabledAsync in OnLoaded and rewritten (or reverted from the file) by
+            // OnMetricAlertsEnabledToggle. Composing from it keeps the sentence agreeing with the
+            // control the user is looking at. Without this the line would count MetricBreach's
+            // destinations as routed while the feature was off, which is the one thing
+            // AlertStatusLine exists not to do.
+            MetricAlertsEnabledToggle.IsChecked == true,
+            // Same shape as the metric opt-in above, off the accounts themselves rather than a
+            // checkbox on this page: auto-rejoin has no page-local "feature enabled" control, it is
+            // opted into per account from the main window's row menu. Read fresh every call rather
+            // than cached. Settings is a non-modal shell page (F-013), so the row menu stays usable
+            // and a pause can turn an account's auto-rejoin off while this page is shown: the
+            // AutoRejoinUsageWatcher set up in OnLoaded calls back here on every such change.
+            autoRejoinInUse: _mainViewModel.Accounts.Any(a => a.AutoRejoin));
+
+        // The glyph is the view's, not the composer's — same rule MainWindow.xaml records for the
+        // compat banner. The Tag drives the brush from the Style so the colour stays in markup where
+        // the theme gates can see it (F-094, F-098).
+        AlertsStatusLine.Text = line.IsFailure ? $"▲ {line.Text}" : line.Text;
+        AlertsStatusLine.Tag = line.IsFailure ? "failure" : null;
+    }
+
+    // ---------- Phone push (spec 2026-09-04) ----------
+
+    private ROROROblox.Core.Notify.PhoneNotifyConfig CurrentPhoneConfig => _phoneNotifyService.Current;
+
+    /// <summary>Paint the phone controls from the loaded config. Called from
+    /// <see cref="PopulateAlertControls"/>, inside the same suppression guard.</summary>
+    private void PopulatePhoneControls()
+    {
+        var phone = CurrentPhoneConfig;
+        foreach (var item in PhoneProviderPicker.Items.OfType<System.Windows.Controls.ComboBoxItem>())
+        {
+            if (Equals(item.Tag as string, phone.Provider.ToString()))
+            {
+                PhoneProviderPicker.SelectedItem = item;
+                break;
+            }
+        }
+
+        UpdatePhonePanels(phone.Provider);
+        ShowWebhookMasked(PushoverUserKeyInput, PushoverUserKeyReveal, phone.PushoverUserKey);
+        ShowWebhookMasked(PushoverAppTokenInput, PushoverAppTokenReveal, phone.PushoverAppToken);
+        ShowWebhookMasked(NtfyTopicInput, NtfyTopicReveal, phone.NtfyTopic);
+        // The reveal helper unlocks fields for editing; the topic is generated, never hand-edited.
+        NtfyTopicInput.IsReadOnly = true;
+        NtfyServerInput.Text = phone.NtfyServerUrl;
+    }
+
+    private void UpdatePhonePanels(ROROROblox.Core.Notify.PhoneProvider provider)
+    {
+        PushoverFields.Visibility = provider == ROROROblox.Core.Notify.PhoneProvider.Pushover
+            ? Visibility.Visible : Visibility.Collapsed;
+        NtfyFields.Visibility = provider == ROROROblox.Core.Notify.PhoneProvider.Ntfy
+            ? Visibility.Visible : Visibility.Collapsed;
+        PhoneTestButton.Visibility = provider == ROROROblox.Core.Notify.PhoneProvider.None
+            ? Visibility.Collapsed : Visibility.Visible;
+        RefreshNtfyQr();
+    }
+
+    private async void OnPhoneProviderChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var provider = PhoneProviderPicker.SelectedItem is System.Windows.Controls.ComboBoxItem { Tag: string tag }
+            && Enum.TryParse<ROROROblox.Core.Notify.PhoneProvider>(tag, out var parsed)
+                ? parsed
+                : ROROROblox.Core.Notify.PhoneProvider.None;
+
+        // A different provider is a different endpoint whose credentials were never rejected —
+        // without this, a Pushover 401 latched earlier silently killed a switch to ntfy whose
+        // topic was already saved in an earlier session (review 2026-09-04).
+        _alertDispatcher.ResetPhoneRejection();
+
+        try
+        {
+            await _phoneNotifyService.MutateAsync(c => c with { Provider = provider });
+            UpdatePhonePanels(provider);
+            RefreshAlertsStatus();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSavePhone", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+
+            // Persist failed: put the picker back on what notify.dat actually holds, so the UI
+            // cannot show a provider the saved config does not have. Sibling handlers paint only
+            // after the persist; this one now does too (review 2026-09-04).
+            _suppressClickHandlers = true;
+            foreach (var item in PhoneProviderPicker.Items.OfType<System.Windows.Controls.ComboBoxItem>())
+            {
+                if (Equals(item.Tag as string, CurrentPhoneConfig.Provider.ToString()))
+                {
+                    PhoneProviderPicker.SelectedItem = item;
+                    break;
+                }
+            }
+            _suppressClickHandlers = false;
+            UpdatePhonePanels(CurrentPhoneConfig.Provider);
+        }
+    }
+
+    /// <summary>Show / Hide on a saved phone credential — <see cref="OnRevealWebhookToggled"/>'s
+    /// contract (Checked/Unchecked, not Click; see that handler for why), over three fields.</summary>
+    private void OnRevealPhoneToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingWebhookReveal) return;
+
+        var (input, reveal, saved) = PhoneFieldFor(sender);
+        if (reveal.IsChecked == true)
+        {
+            if (RevealNeedsConfirming(input))
+            {
+                ArmRevealConfirm(input, reveal);
+                return;
+            }
+
+            input.Text = saved ?? "";
+            // The topic stays read-only even revealed — it is generated, and a hand-edited topic
+            // is a weaker secret. The Pushover fields unlock like the webhook fields do.
+            input.IsReadOnly = ReferenceEquals(input, NtfyTopicInput);
+            reveal.Content = Loc.Get("Shell_Pref_Reveal_Hide");
+            input.Focus();
+            input.SelectAll();
+        }
+        else
+        {
+            ShowWebhookMasked(input, reveal, saved);
+            NtfyTopicInput.IsReadOnly = true;
+        }
+
+        RefreshNtfyQr();
+    }
+
+    /// <summary>
+    /// Repaints the phone-setup QR codes. Cheap enough to call from every path that can change
+    /// what they should show, which is the point — there is no state to keep in sync.
+    ///
+    /// The two providers get opposite treatment, and the asymmetry is the whole design:
+    ///
+    /// <list type="bullet">
+    /// <item><b>Pushover</b> codes are fixed public pages. They carry no credential — Pushover's
+    /// secrets travel phone-to-PC, and only the DESTINATION travels PC-to-phone — so they render
+    /// as soon as the panel is on screen.</item>
+    /// <item><b>ntfy</b>'s code embeds the topic, and the topic grants subscribe AND publish. It
+    /// is therefore gated on the same reveal as the topic text AND force-hidden while streamer
+    /// mode is on. A QR is strictly more exposed than the string it replaces: a viewer can scan
+    /// one off a single paused frame, which nobody does with 33 base32 characters.</item>
+    /// </list>
+    ///
+    /// When it must not show, the bitmap is <b>dropped</b>, not merely collapsed — a hidden
+    /// element still holds its source, and "not currently rendered" is a weaker promise than
+    /// "not present".
+    /// </summary>
+    private void RefreshNtfyQr()
+    {
+        var link = PhoneSetupLinks.NtfySubscribe(
+            CurrentPhoneConfig.NtfyServerUrl, CurrentPhoneConfig.NtfyTopic);
+
+        // StreamerModeToggle is bound to MainViewModel.StreamerModeOn, so reading the control
+        // gives the same answer as reading the view model without needing a reference to it —
+        // and does it on the UI thread, which the view model's notifications are not.
+        var hide = link is null
+                   || NtfyTopicReveal.IsChecked != true
+                   || StreamerModeToggle.IsChecked == true;
+
+        NtfyQrImage.Source = hide ? null : QrImage.From(link);
+        NtfyQrPanel.Visibility = hide ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private (System.Windows.Controls.TextBox Input, System.Windows.Controls.Primitives.ToggleButton Reveal, string? Saved)
+        PhoneFieldFor(object sender)
+    {
+        if (ReferenceEquals(sender, PushoverAppTokenReveal) || ReferenceEquals(sender, PushoverAppTokenInput))
+        {
+            return (PushoverAppTokenInput, PushoverAppTokenReveal, CurrentPhoneConfig.PushoverAppToken);
+        }
+
+        if (ReferenceEquals(sender, NtfyTopicReveal) || ReferenceEquals(sender, NtfyTopicInput))
+        {
+            return (NtfyTopicInput, NtfyTopicReveal, CurrentPhoneConfig.NtfyTopic);
+        }
+
+        if (ReferenceEquals(sender, PushoverUserKeyReveal) || ReferenceEquals(sender, PushoverUserKeyInput))
+        {
+            return (PushoverUserKeyInput, PushoverUserKeyReveal, CurrentPhoneConfig.PushoverUserKey);
+        }
+
+        // Loud, not silent: a catch-all here once mapped ANY unrecognised sender to the Pushover
+        // user key, so a future fourth field wired to the shared handlers without extending this
+        // map would have revealed — and could then save over — the wrong credential (review
+        // 2026-09-04). A throw fails on the first dev click instead.
+        throw new ArgumentException(
+            "Unmapped phone credential control — extend PhoneFieldFor before wiring a new field to the shared handlers.",
+            nameof(sender));
+    }
+
+    /// <summary>One commit handler for both Pushover fields — same anti-drift reasoning as
+    /// <see cref="OnWebhookCommitted"/>, and the same mask-is-not-an-edit and
+    /// wrong-paste-leaves-saved-value rules.</summary>
+    private async void OnPushoverKeyCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var isToken = ReferenceEquals(sender, PushoverAppTokenInput);
+        var (input, reveal, saved) = PhoneFieldFor(sender);
+
+        if (WebhookUrlMasker.IsMasked(input.Text)) return;
+
+        var verdict = ROROROblox.Core.Notify.PhoneCredentialValidator.InspectPushoverKey(input.Text);
+        PhonePushoverVerdict.Text = Localization.CoreMessageCatalog.ForPushoverKey(
+            verdict.Kind, isToken ? Loc.Get("Shell_Pref_PushoverAppToken") : Loc.Get("Shell_Pref_PushoverUserKey"));
+
+        if (verdict.Kind is not (ROROROblox.Core.Notify.PhoneCredentialKind.Valid
+            or ROROROblox.Core.Notify.PhoneCredentialKind.Empty))
+        {
+            return;
+        }
+
+        var value = verdict.Kind == ROROROblox.Core.Notify.PhoneCredentialKind.Valid ? verdict.Normalized : null;
+        if (value == saved) return;
+
+        // Fresh credentials get a fresh chance, same as a newly pasted webhook.
+        _alertDispatcher.ResetPhoneRejection();
+        ShowWebhookMasked(input, reveal, value);
+
+        try
+        {
+            await _phoneNotifyService.MutateAsync(c => isToken
+                ? c with { PushoverAppToken = value }
+                : c with { PushoverUserKey = value });
+            RefreshAlertsStatus();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveKey", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void OnGenerateNtfyTopicClick(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(CurrentPhoneConfig.NtfyTopic))
+        {
+            var answer = MessageBox.Show(Window.GetWindow(this),
+                Loc.Get("Shell_Pref_NtfyTopicWarn"),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.OK) return;
+        }
+
+        var topic = ROROROblox.Core.Notify.NtfyTopicGenerator.NewTopic();
+        _alertDispatcher.ResetPhoneRejection();
+
+        try
+        {
+            await _phoneNotifyService.MutateAsync(c => c with { NtfyTopic = topic });
+
+            // Repaint through the helper FIRST: it restores the Show/Hide toggle's visibility
+            // (Collapsed until a first topic exists) and forces IsChecked to false, so the
+            // assignment below is a real false-to-true transition whose Checked handler paints
+            // the NEW topic. A bare IsChecked=true was a no-op while the field was already
+            // revealed — the OLD topic stayed on screen under a "subscribe to this exact topic"
+            // instruction, and on a first-ever topic the Hide button stayed Collapsed over a
+            // revealed bearer credential (review 2026-09-04).
+            ShowWebhookMasked(NtfyTopicInput, NtfyTopicReveal, topic);
+            NtfyTopicInput.IsReadOnly = true;
+
+            // Revealed on purpose: the user's next act is subscribing to this exact string on
+            // their phone. Hide puts it back behind the mask.
+            NtfyTopicReveal.IsChecked = true;
+            PhoneNtfyVerdict.Text = Loc.Get("Shell_Pref_NtfySubscribeHint");
+            RefreshAlertsStatus();
+            RefreshNtfyQr();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveTopic", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void OnNtfyServerCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var verdict = ROROROblox.Core.Notify.PhoneCredentialValidator.InspectNtfyServer(NtfyServerInput.Text);
+        PhoneNtfyVerdict.Text = Localization.CoreMessageCatalog.ForNtfyServer(verdict.Kind);
+
+        // Empty restores the default rather than saving a blank — a blank server is not a choice,
+        // it is an accident on the way to one.
+        var value = verdict.Kind switch
+        {
+            ROROROblox.Core.Notify.PhoneCredentialKind.Valid => verdict.Normalized!,
+            ROROROblox.Core.Notify.PhoneCredentialKind.Empty => "https://ntfy.sh",
+            _ => null,
+        };
+        if (value is null) return;
+
+        // Repaint BEFORE the no-change return: clearing the field back to the default must put
+        // the default on screen even when the saved value already is the default — the early
+        // return used to leave a blank box over a configured server (review 2026-09-04).
+        NtfyServerInput.Text = value;
+        if (value == CurrentPhoneConfig.NtfyServerUrl) return;
+
+        _alertDispatcher.ResetPhoneRejection();
+
+        try
+        {
+            await _phoneNotifyService.MutateAsync(c => c with { NtfyServerUrl = value });
+            RefreshAlertsStatus();
+            RefreshNtfyQr();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveServer", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Sends a real notification down the real path, like <see cref="OnSendTestClick"/> — "it
+    /// says configured but nothing buzzes" is the failure that otherwise surfaces at 3am. A test
+    /// is a MemoryWarning-kind send on purpose: it must not carry the drop's quiet-hours-bypass
+    /// priority.
+    /// </summary>
+    private async void OnPhoneTestClick(object sender, RoutedEventArgs e)
+    {
+        var phone = CurrentPhoneConfig;
+        if (!phone.IsConfigured)
+        {
+            AlertsStatusLine.Text = Loc.Get("Shell_Pref_FinishPhoneSetup");
+            AlertsStatusLine.Tag = null;
+            return;
+        }
+
+        PhoneTestButton.IsEnabled = false;
+        AlertsStatusLine.Text = Loc.Get("Shell_Pref_Sending");
+        AlertsStatusLine.Tag = null;
+        try
+        {
+            var result = await _phoneAlertSender.SendAsync(phone, AlertKind.MemoryWarning,
+                new WebhookPayload("Multi Manager Roblox test", "If your phone buzzed, phone alerts work."));
+
+            if (result == ROROROblox.App.Notify.PhoneSendResult.Sent)
+            {
+                // A delivered test is proof the saved credentials work — clear any stale session
+                // latch so real alerts flow again without a re-paste. Unlike a 404'd webhook, a
+                // latched phone rejection CAN coexist with working credentials (a transient 403
+                // from a self-hosted server, the pre-cap oversize 400), so the passing test is
+                // the honest reset signal (review 2026-09-04).
+                _alertDispatcher.ResetPhoneRejection();
+            }
+
+            AlertsStatusLine.Text = result switch
+            {
+                ROROROblox.App.Notify.PhoneSendResult.Sent =>
+                    Loc.Get("Shell_Pref_PhoneTestSent"),
+                ROROROblox.App.Notify.PhoneSendResult.EndpointRejected =>
+                    phone.Provider == ROROROblox.Core.Notify.PhoneProvider.Pushover
+                        ? Loc.Get("Shell_Pref_PushoverRejected")
+                        : Loc.Get("Shell_Pref_NtfyRefused"),
+                ROROROblox.App.Notify.PhoneSendResult.RateLimited =>
+                    Loc.Get("Shell_Pref_PushRateLimited"),
+                _ => Loc.Get("Shell_Pref_PushUnreachable"),
+            };
+
+            // Text and colour must agree: the style paints Tag="failure" red and everything else
+            // cyan, and this handler writes Text without going through RefreshAlertsStatus — a
+            // stale failure Tag was painting "Sent — your phone should buzz" in the warning red
+            // (review 2026-09-04).
+            AlertsStatusLine.Tag =
+                result == ROROROblox.App.Notify.PhoneSendResult.Sent ? null : "failure";
+        }
+        finally
+        {
+            PhoneTestButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Pushover's application form has an icon slot; this hands the member the same 128x128
+    /// mark Este's own registration uses, so nobody hunts a repo for it (Este, 2026-09-05).
+    /// The PNG is embedded from docs/store/graphics — one source of truth.
+    /// </summary>
+    private void OnSavePushoverIconClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            FileName = "rororo-icon-128.png",
+            Filter = Loc.Get("Shell_Pref_IconFilter"),
+            Title = Loc.Get("Shell_Pref_SaveIconTitle"),
+        };
+        if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+
+        try
+        {
+            using var resource = typeof(SettingsPage).Assembly
+                .GetManifestResourceStream("ROROROblox.App.Notify.pushover-icon-128.png")
+                ?? throw new InvalidOperationException("The embedded icon resource is missing.");
+            using var file = System.IO.File.Create(dialog.FileName);
+            resource.CopyTo(file);
+            PhonePushoverVerdict.Text = Loc.Get("Shell_Pref_IconSaved");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveIcon", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Re-entrancy guard for the programmatic writes to <c>MetricAlertsEnabledToggle.IsChecked</c>.
+    /// Its own flag rather than <c>_suppressClickHandlers</c> because that one is cleared from
+    /// <see cref="OnDiscordConfigChanged"/>'s <c>finally</c>, on a dispatcher callback this page
+    /// does not schedule — see the paint site in <see cref="OnLoaded"/>. Set and cleared around one
+    /// assignment, never held across an await, the same discipline
+    /// <see cref="_syncingWebhookReveal"/> records.
+    /// </summary>
+    private bool _paintingMetricAlertsToggle;
+
+    /// <summary>
+    /// Writes the toggle without its own handler answering. The <c>finally</c> is the point: a
+    /// throw between raising and lowering a suppression flag leaves the page with every guarded
+    /// handler dead for the rest of the session (review fix 4, 2026-09-11).
+    /// </summary>
+    private void PaintMetricAlertsToggle(bool enabled)
+    {
+        try
+        {
+            _paintingMetricAlertsToggle = true;
+            MetricAlertsEnabledToggle.IsChecked = enabled;
+        }
+        finally
+        {
+            _paintingMetricAlertsToggle = false;
+        }
+    }
+
+    /// <summary>
+    /// The metric-alert opt-in. Deliberately NOT <see cref="OnAlertRoutingChanged"/>: that handler
+    /// writes the Discord config (encrypted <c>discord.dat</c>) and this value lives in
+    /// <c>settings.json</c> behind <see cref="IAppSettings"/>. Same row on screen, two different
+    /// files — a handler that wrote one and forgot the other would half-work, and nothing in the
+    /// suite would say so.
+    /// <para>
+    /// Then it nudges the running gate. <c>App</c> re-reads this setting on the view model's 30s
+    /// tick and only while a rules file exists, so without the nudge a user who ticks this box and
+    /// reports a number immediately waits up to 30 seconds — or forever, if they have not written a
+    /// rules file yet. <c>App.SetMetricAlertsGate</c> is that one-line bypass.
+    /// </para>
+    /// <para>
+    /// The gate is nudged only after the write returns, and on the failure path the checkbox is
+    /// reverted from the file and the gate is left alone: a gate that says yes while settings.json
+    /// says no is the disagreement this ordering exists to prevent.
+    /// </para>
+    /// </summary>
+    private async void OnMetricAlertsEnabledToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || _paintingMetricAlertsToggle) return;
+
+        var wanted = MetricAlertsEnabledToggle.IsChecked == true;
+        // Before the await, exactly as OnDiscordPresenceToggle does for the Join checkbox: the
+        // destinations below follow this switch, and they should follow it at the speed of the
+        // click rather than at the speed of a file write. The save can still fail, and the revert
+        // path below puts this back with the checkbox.
+        SyncMetricDestinationsEnabled();
+        try
+        {
+            await _settings.SetMetricAlertsEnabledAsync(wanted);
+            // NUDGE FROM THE CONTROL AS IT STANDS NOW, not from `wanted` (review fix 3,
+            // 2026-09-11). Two quick clicks put two of these in flight: the writes serialize
+            // behind the settings semaphore, so settings.json ends at the second click's value,
+            // but the continuations can resume in either order and a captured `wanted` would let
+            // the first one land LAST and leave the gate believing the opposite of the file. The
+            // 30s tick would normally heal that, except it skips the read entirely while there is
+            // no rules file — which is precisely the user this nudge exists for. Re-reading the
+            // checkbox costs nothing and is the last thing the user actually asked for.
+            App.SetMetricAlertsGate(MetricAlertsEnabledToggle.IsChecked == true);
+            // The status line counts MetricBreach's destinations only while this is on, so the
+            // sentence under the rows is wrong until it is recomposed.
+            RefreshAlertsStatus();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            // Revert from the file, not from `!wanted` — the write may have failed after landing.
+            // The read is awaited OUTSIDE the suppression window on purpose: a flag held across an
+            // await is how a real user click got swallowed earlier in this cycle (see
+            // _syncingWebhookReveal's note).
+            var saved = await _settings.GetMetricAlertsEnabledAsync();
+            PaintMetricAlertsToggle(saved);
+            SyncMetricDestinationsEnabled();
+        }
+    }
+
+    private async void OnAlertRoutingChanged(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        // Read the checkboxes here, on the UI thread — the mutate lambda may run off it.
+        var droppedOut = ReadChecks(AlertKind.AccountDroppedOut);
+        var memoryWarning = ReadChecks(AlertKind.MemoryWarning);
+        var recycled = ReadChecks(AlertKind.Recycled);
+        var uptimeMarks = ReadChecks(AlertKind.UptimeMark);
+        var metricBreaches = ReadChecks(AlertKind.MetricBreach);
+        var autoRejoinPaused = ReadChecks(AlertKind.AutoRejoinPaused);
+        var idle = ReadChecks(AlertKind.AccountIdle);
+
+        try
+        {
+            await SaveDiscordConfigAsync(c => c with
+            {
+                DroppedOutDestinations = droppedOut,
+                MemoryWarningDestinations = memoryWarning,
+                RecycledDestinations = recycled,
+                UptimeMarkDestinations = uptimeMarks,
+                MetricBreachDestinations = metricBreaches,
+                AutoRejoinPausedDestinations = autoRejoinPaused,
+                IdleDestinations = idle,
+                // The singular fields are the rollback mirror: an older binary reads only them,
+                // and "first ticked destination" beats "silently dropped" — the destination-4
+                // hazard the phone spec records. The newer kinds need no mirror: Recycled,
+                // UptimeMark and now MetricBreach (2026-09-11) postdate the singular fields
+                // entirely, so there is no older binary that could read one.
+                DroppedOutDestination = droppedOut.Count > 0 ? droppedOut[0] : AlertDestination.None,
+                MemoryWarningDestination = memoryWarning.Count > 0 ? memoryWarning[0] : AlertDestination.None,
+            });
+            RefreshAlertsStatus();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveAlertRouting", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Commit on LostFocus rather than TextChanged: a webhook URL is pasted whole, and validating
+    /// every keystroke would flash four different rejections at someone typing one in by hand.
+    /// <para>
+    /// One handler serves both fields. The personal and clan webhooks differ only in which slot
+    /// they write and which rejection they clear — duplicating this logic per field is how the two
+    /// drift into validating differently, and the clan one (the shared room) is the worse half to
+    /// get wrong.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// Puts a saved webhook on screen as a mask, read-only (F-076).
+    /// <para>
+    /// Read-only matters as much as the mask: a user cannot meaningfully edit a credential whose
+    /// middle they cannot see, and letting them try invites a half-edited URL that validates as
+    /// garbage. Revealing is the deliberate act that unlocks editing.
+    /// </para>
+    /// </summary>
+    /// <summary>Re-entrancy guard for the programmatic <c>IsChecked</c> write below. Set and cleared
+    /// around one assignment only — never held across an await, which is how a suppression flag
+    /// swallowed a real user click earlier in this cycle.</summary>
+    private bool _syncingWebhookReveal;
+
+    /// <summary>
+    /// Fields whose Show button has been clicked once while streamer mode is on, and so may be
+    /// revealed by a second click. Reference identity, not names. Cleared whenever the field goes
+    /// back behind its mask, so every reveal while streamer mode is on costs two clicks.
+    /// <para>
+    /// No timer. An armed field stays armed until it is masked again or the page is closed, because
+    /// a confirmation that expires while the user is reading the warning is worse than one that
+    /// waits: the second click would silently become a first click again.
+    /// </para>
+    /// </summary>
+    private readonly HashSet<TextBox> _revealConfirmArmed = [];
+
+    private void ShowWebhookMasked(
+        System.Windows.Controls.TextBox input,
+        System.Windows.Controls.Primitives.ToggleButton reveal,
+        string? savedUrl)
+    {
+        var hasSaved = !string.IsNullOrWhiteSpace(savedUrl);
+
+        // Back behind the mask re-arms the confirm. Without this, one confirmed reveal would make
+        // every later reveal of that field single-click for the rest of the session.
+        _revealConfirmArmed.Remove(input);
+
+        input.Text = WebhookUrlMasker.Mask(savedUrl);
+        input.IsReadOnly = hasSaved;
+
+        try
+        {
+            _syncingWebhookReveal = true;
+            reveal.IsChecked = false;
+        }
+        finally
+        {
+            _syncingWebhookReveal = false;
+        }
+
+        reveal.Content = Loc.Get("Shell_Pref_Reveal_Show");
+        // Nothing saved means nothing to hide: the field is an ordinary empty box you can paste
+        // into, and a Show button over an empty field would be a control that does nothing.
+        reveal.Visibility = hasSaved ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Show / Hide on a saved webhook. Revealing also unlocks the field, so "read it" and "replace
+    /// it" are the same gesture rather than two controls.
+    /// <para>
+    /// Wired to Checked and Unchecked rather than Click, and that is load-bearing: a ToggleButton
+    /// driven through UI Automation's TogglePattern calls OnToggle and never raises Click. On Click
+    /// alone, assistive technology could flip this control's visual state while the field stayed
+    /// masked — the button would say one thing and the field show another. Checked/Unchecked fire
+    /// for the mouse, the keyboard, and automation alike.
+    /// </para>
+    /// </summary>
+    private void OnRevealWebhookToggled(object sender, RoutedEventArgs e)
+    {
+        // Only the programmatic re-sync in ShowWebhookMasked is filtered. Deliberately NOT guarded
+        // by _suppressClickHandlers: that flag is held across the awaits in OnLoaded, and guarding a
+        // user-driven toggle with it swallowed a real click once already (streamer mode, wave 1).
+        if (_syncingWebhookReveal) return;
+
+        var isClan = ReferenceEquals(sender, ClanWebhookReveal);
+        var input = isClan ? ClanWebhookInput : MineWebhookInput;
+        var reveal = isClan ? ClanWebhookReveal : MineWebhookReveal;
+        var saved = isClan ? CurrentDiscordConfig.ClanWebhookUrl : CurrentDiscordConfig.MineWebhookUrl;
+
+        if (reveal.IsChecked == true)
+        {
+            // Streamer mode on: warn once, reveal on the second click. A webhook URL is short
+            // enough to read off a single paused frame and grants posting rights to the channel.
+            if (RevealNeedsConfirming(input))
+            {
+                ArmRevealConfirm(input, reveal);
+                return;
+            }
+
+            input.Text = saved ?? "";
+            input.IsReadOnly = false;
+            reveal.Content = Loc.Get("Shell_Pref_Reveal_Hide");
+            input.Focus();
+            input.SelectAll();   // so a paste replaces rather than appends
+        }
+        else
+        {
+            ShowWebhookMasked(input, reveal, saved);
+        }
+    }
+
+    /// <summary>
+    /// Opens one of the two Pushover pages in the PC's browser.
+    /// <para>
+    /// This is what the Pushover QR codes were reaching for and getting wrong. Their URLs were
+    /// correct; their direction was not. Pushover setup happens on the PC start to finish — the
+    /// application is created in a browser, and <c>SavePushoverIconButton</c> right here saves the
+    /// icon TO THE PC for upload on that same form — so the useful control opens the page on the
+    /// screen the fields are already on, and the copy-paste is two keystrokes between two windows.
+    /// A QR sent the user to a phone to read a value they then typed back into the PC.
+    /// </para>
+    /// <para>
+    /// Best-effort, like every other shell launch in this app: a machine with no registered browser
+    /// is not a state worth a dialog about, and the page's body copy still names both URLs.
+    /// </para>
+    /// </summary>
+    private void OnOpenPushoverPageClick(object sender, RoutedEventArgs e)
+    {
+        var url = ReferenceEquals(sender, PushoverAppFormButton)
+            ? ROROROblox.Core.Notify.PhoneSetupLinks.PushoverApplicationForm
+            : ROROROblox.Core.Notify.PhoneSetupLinks.PushoverDashboard;
+
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        }
+        catch (Exception)
+        {
+            // Best-effort.
+        }
+    }
+
+    /// <summary>
+    /// Clears a saved credential and commits the clear, so removing one stops being "reveal it,
+    /// select all of it, delete it, then click somewhere else".
+    /// <para>
+    /// Asked for directly on 2026-09-12: <i>"Whenever I clicked on it, I had to click show and
+    /// highlight it all. There should be a delete or remove button or something."</i> The masked
+    /// field is read-only while something is saved, which is what forced the reveal first.
+    /// </para>
+    /// <para>
+    /// NO CONFIRMATION, deliberately, and it is worth saying why so nobody adds one reflexively.
+    /// Every value this clears is retrievable from the service that issued it — Discord shows a
+    /// channel's webhook URL in its integration settings, and Pushover shows the user key and the
+    /// application token on the site. Nothing here is the only copy. A confirm on a recoverable
+    /// action is the friction this button exists to remove, charged back at the moment of use.
+    /// </para>
+    /// <para>
+    /// The ntfy topic has no Remove button, which is not an omission. It is generated rather than
+    /// pasted, "New topic" already replaces it, and a saved-but-topicless ntfy config is a state
+    /// with no way back into it from this page.
+    /// </para>
+    /// </summary>
+    private void OnRemoveSecretClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button button) return;
+
+        var input = InputForRemoveButton(button);
+        if (input is null) return;
+
+        // The field is read-only while it holds a saved value behind the mask. Clearing it means
+        // writing an empty edit, so the read-only has to come off first.
+        input.IsReadOnly = false;
+        input.Text = string.Empty;
+        _revealConfirmArmed.Remove(input);
+
+        // Commit through the field's OWN handler, same as Enter does: an empty value is already a
+        // valid edit there (Empty is accepted alongside Valid) and already saves null. Writing the
+        // config here instead would be a second place that clears a credential.
+        CommitHandlerFor(input)?.Invoke(input, new RoutedEventArgs());
+    }
+
+    private TextBox? InputForRemoveButton(System.Windows.Controls.Button button)
+    {
+        if (ReferenceEquals(button, MineWebhookRemove)) return MineWebhookInput;
+        if (ReferenceEquals(button, ClanWebhookRemove)) return ClanWebhookInput;
+        if (ReferenceEquals(button, PushoverUserKeyRemove)) return PushoverUserKeyInput;
+        if (ReferenceEquals(button, PushoverAppTokenRemove)) return PushoverAppTokenInput;
+        return null;
+    }
+
+    /// <summary>
+    /// Whether clicking Show on <paramref name="input"/> should warn instead of revealing: streamer
+    /// mode is on and this field has not already been warned about.
+    /// <para>
+    /// A prompt rather than a refusal, because the state is genuinely ambiguous — someone may be
+    /// live and have forgotten, or be off air with the toggle still set from last night. Refusing
+    /// outright would stop a user reading their own key on their own machine; revealing silently is
+    /// how a credential ends up in a VOD. Two clicks resolves it without deciding for them.
+    /// </para>
+    /// <para>
+    /// Not a modal, deliberately. A dialog whose default button reveals a credential is exactly the
+    /// shape <c>ModalDefaultButtonSafetyTests</c> exists to catch — a stray Enter would put the key
+    /// on the stream. The verdict line under each field is already the surface that reports its
+    /// state, and a TextBlock cannot be triggered by a keystroke.
+    /// </para>
+    /// </summary>
+    private bool RevealNeedsConfirming(TextBox input) =>
+        StreamerModeToggle.IsChecked == true && !_revealConfirmArmed.Contains(input);
+
+    /// <summary>
+    /// Arms the confirm on a field and says so in its verdict line, leaving the value hidden. The
+    /// toggle is put back to unchecked through <see cref="_syncingWebhookReveal"/> so this does not
+    /// re-enter the handler that called it.
+    /// </summary>
+    private void ArmRevealConfirm(TextBox input, System.Windows.Controls.Primitives.ToggleButton reveal)
+    {
+        _revealConfirmArmed.Add(input);
+        VerdictLineFor(input).Text = Loc.Get("Shell_Pref_Reveal_StreamerConfirm");
+
+        try
+        {
+            _syncingWebhookReveal = true;
+            reveal.IsChecked = false;
+        }
+        finally
+        {
+            _syncingWebhookReveal = false;
+        }
+    }
+
+    /// <summary>
+    /// The line under a field where its state is already reported. Both Pushover fields share one,
+    /// which is how the page was built — the warning names no value, so sharing costs nothing here.
+    /// </summary>
+    private TextBlock VerdictLineFor(TextBox input)
+    {
+        if (ReferenceEquals(input, ClanWebhookInput)) return ClanWebhookVerdict;
+        if (ReferenceEquals(input, MineWebhookInput)) return MineWebhookVerdict;
+        if (ReferenceEquals(input, NtfyTopicInput)) return PhoneNtfyVerdict;
+        return PhonePushoverVerdict;
+    }
+
+    /// <summary>
+    /// Every field on this page that holds a credential behind a Show toggle: both Discord webhook
+    /// URLs, the Pushover user key and app token, and the ntfy topic.
+    /// <para>
+    /// One list, so streamer mode cannot protect four of five. Before 2026-09-12 it protected NONE
+    /// of them — <c>StreamerModeToggle</c> was read in exactly one place on this page, the ntfy QR
+    /// refresh, so a revealed webhook URL or Pushover key simply stayed on screen when streamer
+    /// mode came on. <see cref="ROROROblox.Tests.StreamerSecretFieldFenceTests"/> fails if the
+    /// markup grows a sixth reveal toggle that is not listed here.
+    /// </para>
+    /// </summary>
+    private IEnumerable<(TextBox Input, System.Windows.Controls.Primitives.ToggleButton Reveal, string? Saved)> SecretFields()
+    {
+        yield return (MineWebhookInput, MineWebhookReveal, CurrentDiscordConfig.MineWebhookUrl);
+        yield return (ClanWebhookInput, ClanWebhookReveal, CurrentDiscordConfig.ClanWebhookUrl);
+        yield return (PushoverUserKeyInput, PushoverUserKeyReveal, CurrentPhoneConfig.PushoverUserKey);
+        yield return (PushoverAppTokenInput, PushoverAppTokenReveal, CurrentPhoneConfig.PushoverAppToken);
+        yield return (NtfyTopicInput, NtfyTopicReveal, CurrentPhoneConfig.NtfyTopic);
+    }
+
+    /// <summary>
+    /// Puts every revealed credential back behind its mask, and re-arms the confirm on each. Called
+    /// when streamer mode turns ON.
+    /// <para>
+    /// No confirmation prompt here, deliberately, and the asymmetry with
+    /// <see cref="RevealNeedsConfirming"/> is the point: switching streamer mode on IS the user
+    /// asking for things to be hidden. Asking "are you sure?" would be asking them to repeat
+    /// themselves about a credential already on screen. The ambiguous case is the other one —
+    /// clicking Show while streamer mode is already on — and that is where the confirm lives.
+    /// </para>
+    /// </summary>
+    private void ReMaskRevealedSecrets()
+    {
+        foreach (var (input, reveal, saved) in SecretFields())
+        {
+            _revealConfirmArmed.Remove(input);
+            if (reveal.IsChecked != true) continue;
+            ShowWebhookMasked(input, reveal, saved);
+        }
+
+        // The topic is generated, so it stays read-only even when it was revealed for editing.
+        NtfyTopicInput.IsReadOnly = true;
+    }
+
+    /// <summary>
+    /// Enter commits, on every field on this page that commits at all.
+    /// <para>
+    /// Found by hand on 2026-09-12. Eight text fields committed on <c>LostFocus</c> and nothing
+    /// else, and this page has no Save button — so typing a value and pressing Enter did nothing,
+    /// and "nothing happened" is indistinguishable from "the save failed". On the webhook fields
+    /// the no-op was at least visible, because the field re-masks itself on commit and simply did
+    /// not; the tester had to click into another box before anything took. Everywhere else it was
+    /// silent.
+    /// </para>
+    /// <para>
+    /// This dispatches to the field's OWN <c>LostFocus</c> handler rather than committing anything
+    /// itself, so no commit logic moves and there stays exactly one place per field where a value
+    /// is written. Forcing focus away instead and letting the real handler fire reads as tidier and
+    /// is not: logical and keyboard focus are separate things in WPF, so whether <c>LostFocus</c>
+    /// actually fires depends on where focus lands — which works until someone reorders the page.
+    /// </para>
+    /// <para>
+    /// Committing twice is safe by existing design, and worth knowing since Enter now commits and
+    /// the later focus loss commits again: every masking field opens with "a mask is not an edit"
+    /// and returns early, and each handler also returns when the value is unchanged. The second
+    /// pass is a no-op rather than a save of the mask string.
+    /// </para>
+    /// <para><see cref="ROROROblox.Tests.SettingsCommitOnEnterFenceTests"/> fails if a committing
+    /// field is missing the markup that routes Enter here.</para>
+    /// </summary>
+    private void OnCommitOnEnter(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key != System.Windows.Input.Key.Enter) return;
+        if (sender is not TextBox box) return;
+
+        var commit = CommitHandlerFor(box);
+        if (commit is null) return;
+
+        // Handled so Enter does not travel on to a default button. Nothing on this page sets
+        // IsDefault today; this line is what keeps that from becoming a surprise later.
+        e.Handled = true;
+        commit(box, new RoutedEventArgs());
+    }
+
+    /// <summary>
+    /// The commit each field already had wired to <c>LostFocus</c>. Reference equality against the
+    /// named controls rather than a string lookup, so renaming a control is a compile error here
+    /// instead of a silently dead branch.
+    /// </summary>
+    private RoutedEventHandler? CommitHandlerFor(TextBox box)
+    {
+        if (ReferenceEquals(box, MineWebhookInput) || ReferenceEquals(box, ClanWebhookInput)) return OnWebhookCommitted;
+        if (ReferenceEquals(box, PushoverUserKeyInput) || ReferenceEquals(box, PushoverAppTokenInput)) return OnPushoverKeyCommitted;
+        if (ReferenceEquals(box, NtfyServerInput)) return OnNtfyServerCommitted;
+        if (ReferenceEquals(box, MemoryReserveMbInput)) return OnMemoryReserveCommitted;
+        if (ReferenceEquals(box, MemoryCapMbInput)) return OnMemoryCapCommitted;
+        if (ReferenceEquals(box, ProjectionWarnMinutesInput)) return OnProjectionWarnCommitted;
+        return null;
+    }
+
+    private async void OnWebhookCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var isClan = ReferenceEquals(sender, ClanWebhookInput);
+        var input = isClan ? ClanWebhookInput : MineWebhookInput;
+        var verdictLine = isClan ? ClanWebhookVerdict : MineWebhookVerdict;
+        var saved = isClan ? CurrentDiscordConfig.ClanWebhookUrl : CurrentDiscordConfig.MineWebhookUrl;
+
+        // A mask is not an edit. Tabbing past a hidden field must leave the saved value alone and
+        // say nothing — without this the mask reaches the validator, fails, and reports "that isn't
+        // a webhook URL" about a webhook that is saved and working.
+        if (WebhookUrlMasker.IsMasked(input.Text)) return;
+
+        var verdict = WebhookUrlValidator.Inspect(input.Text);
+        verdictLine.Text = Localization.CoreMessageCatalog.For(verdict.Kind);
+
+        // Anything that isn't a webhook leaves the SAVED value alone. Clobbering a working webhook
+        // because someone pasted an invite over it and then tabbed away is a silent downgrade to
+        // desktop-only — precisely the failure the status line exists to surface, self-inflicted.
+        if (verdict.Kind is not (WebhookUrlKind.Valid or WebhookUrlKind.Empty)) return;
+
+        var url = verdict.Kind == WebhookUrlKind.Valid ? verdict.NormalizedUrl : null;
+        if (url == saved) return;
+
+        // A newly pasted webhook is a fresh chance for a destination the user previously killed.
+        if (isClan)
+        {
+            _clanChannelName = null;
+            _alertDispatcher.ResetClanRejection();
+        }
+        else
+        {
+            _mineChannelName = null;
+            _alertDispatcher.ResetMineRejection();
+        }
+
+        // Straight back behind the mask once it is saved. Leaving a just-pasted webhook revealed
+        // means the credential stays on screen for the rest of the session — the same exposure,
+        // just later.
+        ShowWebhookMasked(input, isClan ? ClanWebhookReveal : MineWebhookReveal, url);
+        RefreshAlertsStatus();
+
+        try
+        {
+            await SaveDiscordConfigAsync(c => isClan
+                ? c with { ClanWebhookUrl = url }
+                : c with { MineWebhookUrl = url });
+            if (url is not null) await ProbeWebhookAsync(url, isClan);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), Loc.Format("Shell_Pref_CouldntSaveWebhook", ex.Message),
+                Loc.Get("Shell_Pref_Title"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Name the channel a webhook posts to. Doubly worth it with two fields: the mistake this
+    /// catches is a clan webhook pasted into the personal slot (or the reverse), which is invisible
+    /// until something lands in front of the wrong audience.
+    /// </summary>
+    private async Task ProbeWebhookAsync(string url, bool isClan)
+    {
+        var identity = await _webhookProbe.DescribeAsync(url);
+        if (identity is null) return;
+
+        if (isClan) { _clanChannelName = identity.ChannelName; }
+        else { _mineChannelName = identity.ChannelName; }
+
+        (isClan ? ClanWebhookVerdict : MineWebhookVerdict).Text =
+            Loc.Format("Shell_Pref_PostsTo", identity.ChannelName, identity.GuildName);
+        RefreshAlertsStatus();
+    }
+
+    /// <summary>
+    /// Sends a real message down the real path. "It says connected but nothing arrives" is the
+    /// failure that otherwise surfaces at 3am, to someone who has already stopped watching.
+    /// </summary>
+    private async void OnSendTestClick(object sender, RoutedEventArgs e)
+    {
+        // Test every webhook that is configured, not just the personal one. A clan webhook that
+        // silently does not work is the worse failure of the two — nobody notices a channel that
+        // never gets posts, and the person who set it up is the last to find out.
+        var discordConfig = CurrentDiscordConfig;
+        var targets = new List<(string Label, string Url)>();
+        if (!string.IsNullOrWhiteSpace(discordConfig.MineWebhookUrl))
+        {
+            targets.Add((Loc.Get("Shell_Pref_MyChannel"), discordConfig.MineWebhookUrl));
+        }
+
+        if (!string.IsNullOrWhiteSpace(discordConfig.ClanWebhookUrl))
+        {
+            targets.Add((Loc.Get("Shell_Pref_ClanChannel"), discordConfig.ClanWebhookUrl));
+        }
+
+        if (targets.Count == 0)
+        {
+            AlertsStatusLine.Text = Loc.Get("Shell_Pref_PasteWebhookFirst");
+            return;
+        }
+
+        SendTestButton.IsEnabled = false;
+        AlertsStatusLine.Text = Loc.Get("Shell_Pref_Sending");
+        try
+        {
+            var results = new List<string>();
+            foreach (var (label, url) in targets)
+            {
+                var result = await _webhookSender.SendAsync(url,
+                    new WebhookPayload("Multi Manager Roblox test", "If you can read this, alerts work."));
+
+                results.Add(result switch
+                {
+                    WebhookSendResult.Sent => Loc.Format("Shell_Pref_TestResult_Sent", label),
+                    WebhookSendResult.WebhookGone => Loc.Format("Shell_Pref_TestResult_Gone", label),
+                    WebhookSendResult.RateLimited => Loc.Format("Shell_Pref_TestResult_RateLimited", label),
+                    _ => Loc.Format("Shell_Pref_TestResult_Unreachable", label),
+                });
+
+                if (result == WebhookSendResult.WebhookGone) RefreshAlertsStatus();
+            }
+
+            AlertsStatusLine.Text = string.Join("  ", results);
+        }
+        finally
+        {
+            SendTestButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// The step before the step. Every "how to make a webhook" guide starts at Server Settings →
+    /// Integrations, which quietly assumes you own a server — and plenty of people have only ever
+    /// joined one. A server you make for yourself is free, private, and takes three clicks.
+    /// </summary>
+    private void OnNoServerHelpClick(object sender, RoutedEventArgs e) =>
+        MessageBox.Show(Window.GetWindow(this),
+            Loc.Get("Shell_Pref_NoServerHelp"),
+            Loc.Get("Shell_Pref_NoServerHelpTitle"),
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+
+    // ---------- Muted accounts (v1.18, spec §4.3 — F-024) ----------
+
+    /// <summary>
+    /// Paints the muted-account block, or takes it off the page.
+    /// <para>
+    /// Zero muted collapses the whole block rather than rendering "0 accounts are muted" or leaving
+    /// an unmute button over nothing — <c>prd.md &gt; Story 1.3</c> asks for a clean state, and a
+    /// count of zero is a control reporting the absence of a thing the user never did.
+    /// <see cref="MutedAccountsSummary.Summary.Any"/> is what decides that, so the rule is a
+    /// property a test can assert on rather than a comparison living in this handler.
+    /// </para>
+    /// </summary>
+    private void RefreshMutedAccounts()
+    {
+        var summary = MutedAccountsSummary.Describe(_mainViewModel.Accounts);
+        MutedAccountsLine.Text = summary.Text;
+        MutedAccountsRow.Visibility = summary.Any ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Unmute everything, in the order that survives a failed write.
+    /// <para>
+    /// Live rows first, then the file. <see cref="MutedAccountsSummary.UnmuteRows"/> hands back
+    /// exactly the rows it changed, so a save that throws is undone by re-muting those and nothing
+    /// else — no reconstruction from an id set, and no chance of switching a mute back on for a row
+    /// that never had one.
+    /// </para>
+    /// <para>
+    /// The write goes through the owner as ONE mutation rather than through
+    /// <c>MainViewModel.SetAlertsMutedAsync</c> per row — not for safety any more (the owner
+    /// serializes writers, so per-row calls would compose correctly), but because one write is one
+    /// disk round-trip and one <c>Changed</c> event instead of N of each.
+    /// </para>
+    /// </summary>
+    private async void OnUnmuteAllClick(object sender, RoutedEventArgs e)
+    {
+        var cleared = MutedAccountsSummary.UnmuteRows(_mainViewModel.Accounts);
+        RefreshMutedAccounts();
+
+        try
+        {
+            await SaveDiscordConfigAsync(MutedAccountsSummary.WithoutMutes);
+        }
+        catch (Exception ex)
+        {
+            foreach (var row in cleared)
+            {
+                row.AlertsMuted = true;
+            }
+
+            RefreshMutedAccounts();
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSaveThat", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    // ---------- The theme prompt, reversible (v1.18, spec §4.3 — F-078) ----------
+
+    /// <summary>
+    /// Asks the outline question again, for the theme on screen.
+    /// <para>
+    /// ONE CONSENT PATH, NOT TWO. This reaches the same dialog through the same
+    /// <see cref="EdgeRemediationWindow.AskIfPendingAsync"/> the startup path, the picker and the
+    /// theme builder use, so the answer is phrased and recorded exactly once —
+    /// <c>ThemeService.AnswerEdgeQuestionAsync</c> into
+    /// <c>IAppSettings.SetEdgeRemediationAnswerAsync</c>. All
+    /// <see cref="ThemeService.ReopenEdgeQuestion"/> does is make there be a question again; it
+    /// writes nothing.
+    /// </para>
+    /// <para>
+    /// Nothing to ask is said out loud rather than left as a dead click. This is a button somebody
+    /// can find without having seen the prompt (that is Story 1.4's requirement), so the common case
+    /// is pressing it on a built-in theme — and a button that silently does nothing is the defect
+    /// this cycle is about wearing a different hat. It is a MessageBox and not the section's status
+    /// line because there is no theme status line yet; the one spec §5 describes reports FAILURES,
+    /// and "this theme has nothing to choose" is not one.
+    /// </para>
+    /// </summary>
+    private async void OnReviewEdgeClick(object sender, RoutedEventArgs e)
+    {
+        if (!_themeService.ReopenEdgeQuestion())
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Get("Shell_Pref_NoThemeChoice"),
+                Loc.Get("Shell_Pref_ButtonOutlinesTitle"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        await EdgeRemediationWindow.AskIfPendingAsync(_themeService, Window.GetWindow(this));
+    }
+
+    /// <summary>
+    /// Streamer mode, moved here from the main window (audit finding F-008).
+    /// <para>
+    /// Writes through <see cref="MainViewModel.StreamerModeOn"/>, whose setter fire-and-forgets to
+    /// <c>IStreamerIdentityProvider.SetActiveAsync</c> — it does NOT wait for the provider, and the
+    /// write can fail silently (see the register's follow-up on that inherited behaviour). What
+    /// keeps this checkbox honest is not the write but the read: <see cref="OnViewModelPropertyChanged"/>
+    /// re-reads on the provider's confirmation, so the checkbox, the tray checkmark and the row
+    /// rendering end up as three views of one source of truth rather than three flags that drift.
+    /// </para>
+    /// </summary>
+
+    /// <summary>Reroll every fake name and avatar at once. Same command the main window used to
+    /// invoke; the button moved with the toggle it belongs to.</summary>
+    private void OnRerollAllClick(object sender, RoutedEventArgs e)
+    {
+        if (_mainViewModel.RerollAllCommand.CanExecute(null))
+        {
+            _mainViewModel.RerollAllCommand.Execute(null);
+        }
+    }
+
+    // ---------- Cadence and sound (v1.33 items 2 and 5, controls in item 6) ----------
+
+    /// <summary>
+    /// The six per-kind override pickers, paired with the kind each one paces. Uptime marks are
+    /// absent on purpose and the reason is written at length beside their row in the markup: the
+    /// two-hour <c>UptimeMarkTracker.MarkInterval</c> is upstream of the router, so every value an
+    /// override could hold is either a no-op or a silent thinning of the only dead-PC signal this
+    /// app has. <c>MetricRecovered</c> is absent too, and for the opposite reason — it rides
+    /// <c>MetricBreach</c>'s destinations by design, so it rides its pace.
+    /// <para>
+    /// A method rather than a field because the controls do not exist until <c>InitializeComponent</c>
+    /// has run, and a field initialiser on a partial WPF class runs before it.
+    /// </para>
+    /// </summary>
+    private IEnumerable<(AlertKind Kind, System.Windows.Controls.ComboBox Picker)> CadenceOverridePickers()
+    {
+        yield return (AlertKind.AccountDroppedOut, DroppedOutCadencePicker);
+        yield return (AlertKind.MemoryWarning, MemoryWarningCadencePicker);
+        yield return (AlertKind.AccountIdle, IdleCadencePicker);
+        yield return (AlertKind.Recycled, RecycledCadencePicker);
+        yield return (AlertKind.AutoRejoinPaused, AutoRejoinPausedCadencePicker);
+        yield return (AlertKind.MetricBreach, MetricBreachCadencePicker);
+    }
+
+    /// <summary>
+    /// Paint the global pace and the six overrides from <c>settings.json</c>.
+    /// <para>
+    /// The global falls back to the shipped five rather than to the first item in the list. An
+    /// unrecognised stored value is a hand-edited file, and the honest thing to show for it is the
+    /// pace <c>AlertCadence.FromSettings</c> will actually apply, which for anything it cannot read
+    /// is the default. Showing "Every time" because it happens to be first would be the page
+    /// claiming a setting the router does not hold.
+    /// </para>
+    /// <para>
+    /// An override whose stored minutes match no item also lands on "Follow the pace above", which
+    /// is again what the resolver does with it — a per-entry drop, so the kind follows the global.
+    /// </para>
+    /// </summary>
+    private async Task PopulateCadenceAndSoundAsync()
+    {
+        // ALL THREE READS FIRST, AND NONE INSIDE THE SUPPRESSION WINDOW BELOW. A flag held across
+        // an await is how a real user click got swallowed earlier in this cycle — the defect
+        // _syncingWebhookReveal's note records — and three settings reads are three awaits. The
+        // window below contains no await at all, which is the property that makes it safe rather
+        // than merely short.
+        var globalMinutes = await _settings.GetAlertCadenceMinutesAsync();
+        var overridesJson = await _settings.GetAlertCadenceOverridesJsonAsync();
+        var storedSound = await _settings.GetAlertSoundAsync();
+        var cadence = AlertCadence.FromSettings(globalMinutes, overridesJson);
+
+        _suppressClickHandlers = true;
+        try
+        {
+            if (!Select(AlertCadencePicker, globalMinutes.ToString(CultureInfo.InvariantCulture)))
+            {
+                Select(AlertCadencePicker, "5");
+            }
+
+            foreach (var (kind, picker) in CadenceOverridePickers())
+            {
+                // The resolved pace for this kind equals the global exactly when it has no usable
+                // override, which is what "Follow the pace above" means. Read off the resolver
+                // rather than re-parsing the JSON here: one parser for one format.
+                var resolved = cadence.For(kind);
+                var tag = resolved == cadence.Global
+                    ? string.Empty
+                    : ((int)resolved.TotalMinutes).ToString(CultureInfo.InvariantCulture);
+                if (!Select(picker, tag))
+                {
+                    Select(picker, string.Empty);
+                }
+            }
+
+            // Through FromSetting then back through ToSetting rather than matching the raw stored
+            // string: a hand-edited "silent" or an unreadable value both land on the mode the
+            // player will actually use, so the picker cannot show something the app is not doing.
+            var sound = AlertSoundSetting.FromSetting(storedSound);
+            Select(AlertSoundPicker, AlertSoundSetting.ToSetting(sound));
+        }
+        finally
+        {
+            _suppressClickHandlers = false;
+        }
+
+        // Returns whether it found the item, so a caller can fall back rather than leaving a
+        // picker on whatever it happened to show. Selecting nothing is not an option here: an
+        // unselected ComboBox reads as "no opinion", and every one of these settings has a value.
+        static bool Select(System.Windows.Controls.ComboBox box, string tag)
+        {
+            var item = box.Items.OfType<System.Windows.Controls.ComboBoxItem>()
+                .FirstOrDefault(i => string.Equals(i.Tag as string, tag, StringComparison.Ordinal));
+            if (item is null) return false;
+            box.SelectedItem = item;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The global pace. Writes the setting, then nudges the running cache so the next alert is
+    /// paced the way the user just asked rather than up to 30 seconds later.
+    /// <para>
+    /// <b>Both halves, in this order, and the nudge is built from the CONTROLS as they stand</b>
+    /// rather than from a value captured before the await — the correction review fix 3 made to
+    /// <see cref="OnMetricAlertsEnabledToggle"/> on 2026-09-11, for the same reason. Two quick
+    /// changes put two of these in flight; the writes serialise behind the settings semaphore so
+    /// the file ends at the second one's value, but the continuations can resume in either order
+    /// and a captured value would let the first land last and leave the cache disagreeing with the
+    /// file. <c>App.SetAlertCadence</c>'s generation counter stops the 30s tick from overwriting
+    /// either of them, which is the half that could not be fixed on this side of the seam.
+    /// </para>
+    /// </summary>
+    private async void OnAlertCadenceChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+        if (AlertCadencePicker.SelectedItem is not System.Windows.Controls.ComboBoxItem { Tag: string tag }
+            || !int.TryParse(tag, out var minutes))
+        {
+            return;
+        }
+
+        try
+        {
+            await _settings.SetAlertCadenceMinutesAsync(minutes);
+            await NudgeCadenceCacheAsync();
+        }
+        catch (Exception ex)
+        {
+            await ShowCadenceSaveFailureAsync(ex);
+        }
+    }
+
+    /// <summary>
+    /// A per-kind override. Writes the whole map every time rather than one entry, because the map
+    /// is one settings key — and reading the pickers is the only way to know what the other five
+    /// currently say.
+    /// </summary>
+    private async void OnAlertCadenceOverrideChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        try
+        {
+            await _settings.SetAlertCadenceOverridesJsonAsync(ReadOverridesJson());
+            await NudgeCadenceCacheAsync();
+        }
+        catch (Exception ex)
+        {
+            await ShowCadenceSaveFailureAsync(ex);
+        }
+    }
+
+    /// <summary>
+    /// The six pickers as the string <c>AlertCadenceOverridesJson</c> holds. An empty Tag is
+    /// "follow the global" and contributes no entry — absence is how the resolver spells that, so
+    /// the page must not write a row meaning the same thing.
+    /// <para>
+    /// Serialised by <c>AlertCadence.ToOverridesJson</c>, never here: that method keys by member
+    /// NAME and drops a negative count, both of which are refusals the reader already makes, and a
+    /// second encoder is how the two drift.
+    /// </para>
+    /// </summary>
+    private string ReadOverridesJson()
+    {
+        var map = new Dictionary<AlertKind, int>();
+        foreach (var (kind, picker) in CadenceOverridePickers())
+        {
+            if (picker.SelectedItem is not System.Windows.Controls.ComboBoxItem { Tag: string tag }) continue;
+            if (tag.Length == 0) continue;
+            if (!int.TryParse(tag, out var minutes)) continue;
+            map[kind] = minutes;
+        }
+
+        return AlertCadence.ToOverridesJson(map);
+    }
+
+    /// <summary>
+    /// Re-resolve both cadence keys from the controls and hand the result to the running
+    /// dispatcher. Reads the file for the global rather than the picker so a cadence saved by one
+    /// handler and an override saved by the other can never be combined into a pace neither of
+    /// them chose.
+    /// </summary>
+    private async Task NudgeCadenceCacheAsync()
+    {
+        var minutes = await _settings.GetAlertCadenceMinutesAsync();
+        App.SetAlertCadence(AlertCadence.FromSettings(minutes, ReadOverridesJson()));
+    }
+
+    /// <summary>
+    /// Says so, then repaints from the file. Reverting from the file rather than from the previous
+    /// selection for the reason <see cref="OnMetricAlertsEnabledToggle"/> records: the write may
+    /// have failed after landing, and the file is the only thing that knows.
+    /// </summary>
+    private async Task ShowCadenceSaveFailureAsync(Exception ex)
+    {
+        MessageBox.Show(Window.GetWindow(this),
+            Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+            Loc.Get("Shell_Pref_Title"),
+            MessageBoxButton.OK,
+            MessageBoxImage.Warning);
+
+        try
+        {
+            await PopulateCadenceAndSoundAsync();
+        }
+        catch
+        {
+            // Swallowed, and the reason is the dialog above. If the repaint read fails too it is
+            // the same settings file failing twice, and a second message box about it would be
+            // noise on top of the one the user is already reading. The controls keep whatever they
+            // show, which is the value the user picked — wrong, but not silently wrong, because
+            // they have just been told the save did not land. This handler is reached from an
+            // async void method, so an unguarded throw here is a crash rather than a log line.
+        }
+    }
+
+    /// <summary>
+    /// The alert sound. Same write-then-nudge shape as the cadence, and the nudge matters more
+    /// here: the stale direction is a noise after an explicit request for silence.
+    /// </summary>
+    /// <summary>
+    /// Plays whatever the picker currently holds, through the production
+    /// <see cref="ROROROblox.App.Tray.IAlertSoundPlayer"/>.
+    /// <para>
+    /// Deliberately NOT disabled when Silent is selected. Silence is what an alert would do, so
+    /// silence is the honest preview; a greyed-out button would be answering a different question
+    /// from the one the user is asking.
+    /// </para>
+    /// <para>
+    /// No try/catch: <c>AlertSoundPlayer.Play</c> already swallows and logs its own failures, and
+    /// wrapping it again would only add a second place for the same decision to be made
+    /// differently later.
+    /// </para>
+    /// </summary>
+    private void OnHearAlertSoundClick(object sender, RoutedEventArgs e) => _alertSoundPlayer.Play();
+
+    private async void OnAlertSoundChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+        if (AlertSoundPicker.SelectedItem is not System.Windows.Controls.ComboBoxItem { Tag: string tag })
+        {
+            return;
+        }
+
+        try
+        {
+            // Through FromSetting rather than trusting the Tag, so a typo in the markup lands on
+            // Chime — the direction every unreadable value in this setting degrades towards —
+            // instead of persisting a string the next read would reject.
+            var sound = AlertSoundSetting.FromSetting(tag);
+            await _settings.SetAlertSoundAsync(AlertSoundSetting.ToSetting(sound));
+            App.SetAlertSound(sound);
+        }
+        catch (Exception ex)
+        {
+            await ShowCadenceSaveFailureAsync(ex);
+        }
+    }
+
+    private async void OnIdleWarnThresholdChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+        if (IdleWarnThresholdPicker.SelectedItem is not System.Windows.Controls.ComboBoxItem { Tag: string tag }
+            || !int.TryParse(tag, out var minutes))
+        {
+            return;
+        }
+        try
+        {
+            await _settings.SetIdleWarnThresholdMinutesAsync(minutes);
+            // Same per-edit re-push as the mute toggle above (F-013).
+            await _mainViewModel.InitializeIdleSettingsAsync(_settings);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this),
+                Loc.Format("Shell_Pref_CouldntSavePreference", ex.Message),
+                Loc.Get("Shell_Pref_Title"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    // ---------- Memory watchdog (v1.18, spec §4.1 — F-023) ----------
+
+    // EVERY SETTING NAME IN THE COMMENTS BELOW IS WRITTEN WITH ITS OWNER, and that is not style.
+    // SettingsReachabilityTests' secondary edge matches a bare setting name anywhere in an App
+    // .cs/.xaml file — comments and doc comments included, since it reads lines, not syntax — and
+    // the one thing it excludes is a preceding "." (a member read is a consumer, not a control).
+    // So a bare setting name in a sentence reports that setting reachable, and the same name
+    // written with its owner does not. Proved on 2026-08-10 while checking this item's own fence
+    // still bites: with the projection setting's control renamed and both of its accessor calls
+    // swapped out, the fence still went green on two doc comments. Do not tidy the owners off.
+
+    // WHERE THESE BOUNDS COME FROM, and why they are the view layer's rather than the setter's.
+    // spec §4.1: "a setter that clamps is indistinguishable from a setter that worked", so the
+    // refusal has to happen where there is a screen to say it on. Every number below is read off
+    // what the watchdog actually does with the value, not picked for looking round.
+    //
+    // RESERVE, floor above zero. The headroom axis is gated on `ReserveBytes > 0`
+    // (MemoryWatchdog.cs:226), so a zero reserve silently deletes the third trigger F-082 added —
+    // and unlike the cap, IAppSettings declares no meaning for zero here. 256 rather than
+    // MemoryDefaults' own 1024 floor because that floor governs a DERIVED value; someone on a small
+    // machine asking for a tighter reserve is making a choice, not a mistake. Ceiling 65536 (64 GB)
+    // because a reserve above installed RAM latches the headroom warning on permanently, which is
+    // the cry-wolf failure MemoryWatchdog's three deadbands exist to prevent.
+    private const int ReserveFloorMb = 256;
+    private const int ReserveCeilingMb = 65536;
+
+    // CAP, and zero is ACCEPTED rather than being the floor. IAppSettings calls it "a distinct,
+    // meaningful user choice: it disables the cap trigger entirely", and MemoryWatchdog.cs:268-275
+    // carries a re-arm clause written for exactly that value. Any OTHER value floors at 256,
+    // under which a client that has only just launched is already over — MemoryDefaults.
+    // ExpectedClientMb is a measured 2650 — so the cap would fire on every healthy client on the
+    // first tick. Same 64 GB ceiling, same reason.
+    private const int CapFloorMb = 256;
+    private const int CapCeilingMb = 65536;
+
+    // PROJECTION, floor 1. The trigger is `minutes < MemoryWatchdog.ProjectionWarnMinutes`
+    // (MemoryWatchdog.cs:287) over a `minutes` clamped to non-negative, so zero makes the axis
+    // structurally unable to fire — the same defect shape as the F-082 cap that could not trigger
+    // at any RAM tier from 16 GB up. Ceiling one day: the watchdog will not claim a slope until it
+    // has MinimumObservation (10 minutes) of samples, and past a day any nonzero growth rate leaves
+    // the warning permanently on.
+    private const int ProjectionFloorMinutes = 1;
+    private const int ProjectionCeilingMinutes = 1440;
+
+    /// <summary>
+    /// Paints the four memory controls from the file, and READS rather than caches. Hand-editing
+    /// <c>settings.json</c> has to keep working, and every accessor here goes back to disk
+    /// (<c>AppSettings.LoadAsync</c>) on each call — so re-opening this window shows whatever is in
+    /// the file, including a value a text editor put there.
+    /// </summary>
+    private async Task PopulateMemoryControlsAsync()
+    {
+        // FIRST, and deliberately. This line reads no settings — it reads the machine — so it must
+        // survive a settings read that throws. OnLoaded catches out of this method and paints a
+        // "couldn't read your memory settings" warning; if the automatic line were painted after
+        // the accessors, that path would leave the boxes blank AND unexplained, which is the exact
+        // state this item exists to end.
+        var automatic = _automaticMemory.Describe();
+        AutomaticMemoryLine.Text = automatic.Text;
+
+        // The ghost is the same figure the sentence above quotes — one derivation, two places it
+        // shows (Este, 2026-09-05: a blank box read as "nothing is happening"). Set before the
+        // settings reads for the same reason the sentence is: a throwing settings load must
+        // still leave the boxes explained.
+        // "(auto)" and not a sentence: the box is 184px and the number is the payload — the
+        // sentence above and the hint below carry the words (Este, 2026-09-05: the first ghost
+        // overflowed its box).
+        MemoryReserveGhost.Text = Loc.Format("Shell_Pref_AutoValue", automatic.ReserveMb);
+        MemoryCapGhost.Text = Loc.Format("Shell_Pref_AutoValue", automatic.CapMb);
+        UpdateMemoryGhosts();
+
+        SetToggle(MemoryWatchdogEnabledToggle, await _settings.GetMemoryWatchdogEnabledAsync());
+        MemoryReserveMbInput.Text = FormatOptional(await _settings.GetMemoryReserveMbAsync());
+        MemoryCapMbInput.Text = FormatOptional(await _settings.GetMemoryCapMbAsync());
+        ProjectionWarnMinutesInput.Text =
+            (await _settings.GetProjectionWarnMinutesAsync()).ToString(CultureInfo.InvariantCulture);
+        UpdateMemoryGhosts();
+        ClearMemoryWarning();
+    }
+
+    /// <summary>Blank is not empty, it is "never set" — the state App.xaml.cs derives from.</summary>
+    private static string FormatOptional(int? value) =>
+        value?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
+
+    /// <summary>A ghost shows exactly while its box is blank — the picked value stays visible
+    /// without becoming an explicit setting (blank still means "Multi Manager Roblox picks").</summary>
+    private void UpdateMemoryGhosts()
+    {
+        MemoryReserveGhost.Visibility = string.IsNullOrEmpty(MemoryReserveMbInput.Text)
+            ? Visibility.Visible : Visibility.Collapsed;
+        MemoryCapGhost.Visibility = string.IsNullOrEmpty(MemoryCapMbInput.Text)
+            ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void OnMemoryInputTextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        => UpdateMemoryGhosts();
+
+    private void ShowMemoryWarning(string message)
+    {
+        // U+25B2, a Segoe UI geometric glyph with Emoji_Presentation=No — not emoji, and the same
+        // one AccountSummary's idle chip, MemoryChipFormatter and the compat banner already use.
+        // The warning survives with colour removed, which is the whole point of carrying it in the
+        // text as well as the brush.
+        MemorySettingsWarning.Text = "▲ " + message;
+        MemorySettingsWarning.Visibility = Visibility.Visible;
+    }
+
+    private void ClearMemoryWarning()
+    {
+        MemorySettingsWarning.Text = string.Empty;
+        MemorySettingsWarning.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Say why, then put the saved value back. Refusing rather than clamping is deliberate: a clamp
+    /// and a save look identical from the outside, which is F-023's own defect one level down
+    /// (spec §4.1). Putting the saved text back is the second half — a box left showing a refused
+    /// number reads as though the number took.
+    /// </summary>
+    private void Refuse(System.Windows.Controls.TextBox input, string savedText, string reason)
+    {
+        ShowMemoryWarning(reason);
+        input.Text = savedText;
+    }
+
+    /// <summary>
+    /// An optional whole number. Blank returns <see langword="null"/> — "Multi Manager Roblox picks it" — which is
+    /// what <c>SettingsBlob.MemoryReserveMb</c> and <c>SettingsBlob.MemoryCapMb</c> ship as, and
+    /// what the composition root derives from installed RAM. <paramref name="allowZero"/> lets a
+    /// setting whose zero is documented (the cap) through the range check that would otherwise
+    /// refuse it.
+    /// </summary>
+    private static bool TryReadOptionalWholeNumber(
+        string? text, int floor, int ceiling, bool allowZero, out int? value, out string refusal)
+    {
+        value = null;
+        refusal = string.Empty;
+
+        var trimmed = text?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0)
+        {
+            return true;
+        }
+
+        var blankHint = allowZero
+            ? Loc.Format("Shell_Pref_NumberHint_WithZero", floor, ceiling)
+            : Loc.Format("Shell_Pref_NumberHint", floor, ceiling);
+
+        if (!int.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            refusal = Loc.Format("Shell_Pref_NotWholeNumber", trimmed, blankHint);
+            return false;
+        }
+
+        if (allowZero && parsed == 0)
+        {
+            value = 0;
+            return true;
+        }
+
+        if (parsed < floor || parsed > ceiling)
+        {
+            refusal = Loc.Format("Shell_Pref_OutOfRange", parsed, floor, ceiling, blankHint);
+            return false;
+        }
+
+        value = parsed;
+        return true;
+    }
+
+    /// <summary>
+    /// A required whole number. <c>SettingsBlob.ProjectionWarnMinutes</c> is a plain <c>int</c> with a real
+    /// default, so blank is a refusal here rather than a null — there is no "unset" for it to mean.
+    /// </summary>
+    private static bool TryReadWholeNumber(
+        string? text, int floor, int ceiling, int fallback, out int value, out string refusal)
+    {
+        value = fallback;
+        refusal = string.Empty;
+
+        var trimmed = text?.Trim() ?? string.Empty;
+        var hint = Loc.Format("Shell_Pref_RequiredNumberHint", floor, ceiling, fallback);
+
+        if (trimmed.Length == 0)
+        {
+            refusal = Loc.Format("Shell_Pref_NeedsANumber", hint);
+            return false;
+        }
+
+        if (!int.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            refusal = Loc.Format("Shell_Pref_NotWholeNumber", trimmed, hint);
+            return false;
+        }
+
+        if (parsed < floor || parsed > ceiling)
+        {
+            refusal = Loc.Format("Shell_Pref_OutOfRange", parsed, floor, ceiling, hint);
+            return false;
+        }
+
+        value = parsed;
+        return true;
+    }
+
+    private async void OnMemoryWatchdogEnabledToggle(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers || PaintingToggles) return;
+        try
+        {
+            await _settings.SetMemoryWatchdogEnabledAsync(MemoryWatchdogEnabledToggle.IsChecked == true);
+            // NUDGE FROM THE CONTROL AS IT STANDS NOW, not from a value captured before the await —
+            // the reasoning OnMetricAlertsEnabledToggle records: two quick clicks put two of these
+            // in flight, the writes serialize behind the settings semaphore, but the continuations
+            // can resume in either order and a captured value would let the first one land last and
+            // leave the gate believing the opposite of the file.
+            _memoryWatchdogGate.Apply(MemoryWatchdogEnabledToggle.IsChecked == true);
+            ClearMemoryWarning();
+        }
+        catch (Exception ex)
+        {
+            // Reported on this section's own line rather than in a MessageBox, so a failure to save
+            // and a refusal to accept arrive in the same place and the same voice.
+            ShowMemoryWarning(Loc.Format("Shell_Pref_CouldntSaveThat", ex.Message));
+            SetToggle(MemoryWatchdogEnabledToggle, await _settings.GetMemoryWatchdogEnabledAsync());
+        }
+    }
+
+    /// <summary>
+    /// Commit on LostFocus, the same choice the webhook fields make and for the same reason: a
+    /// figure is typed whole, and validating every keystroke flashes a rejection at anyone who has
+    /// so far typed "2" of "2650".
+    /// </summary>
+    private async void OnMemoryReserveCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var saved = FormatOptional(await _settings.GetMemoryReserveMbAsync());
+        if (!TryReadOptionalWholeNumber(MemoryReserveMbInput.Text, ReserveFloorMb, ReserveCeilingMb,
+                allowZero: false, out var reserveMb, out var refusal))
+        {
+            Refuse(MemoryReserveMbInput, saved, refusal);
+            return;
+        }
+
+        try
+        {
+            await _settings.SetMemoryReserveMbAsync(reserveMb);
+            MemoryReserveMbInput.Text = FormatOptional(reserveMb);
+            ClearMemoryWarning();
+        }
+        catch (Exception ex)
+        {
+            Refuse(MemoryReserveMbInput, saved, Loc.Format("Shell_Pref_CouldntSaveThat", ex.Message));
+        }
+    }
+
+    private async void OnMemoryCapCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var saved = FormatOptional(await _settings.GetMemoryCapMbAsync());
+        // allowZero, and it is not a courtesy: 0 disables the cap trigger and is a documented user
+        // choice, which is why the setting is int? instead of sentinel-zero in the first place.
+        if (!TryReadOptionalWholeNumber(MemoryCapMbInput.Text, CapFloorMb, CapCeilingMb,
+                allowZero: true, out var capMb, out var refusal))
+        {
+            Refuse(MemoryCapMbInput, saved, refusal);
+            return;
+        }
+
+        try
+        {
+            await _settings.SetMemoryCapMbAsync(capMb);
+            MemoryCapMbInput.Text = FormatOptional(capMb);
+            ClearMemoryWarning();
+        }
+        catch (Exception ex)
+        {
+            Refuse(MemoryCapMbInput, saved, Loc.Format("Shell_Pref_CouldntSaveThat", ex.Message));
+        }
+    }
+
+    private async void OnProjectionWarnCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressClickHandlers) return;
+
+        var saved = (await _settings.GetProjectionWarnMinutesAsync()).ToString(CultureInfo.InvariantCulture);
+        // The fallback the refusal message quotes is the same constant the automatic line states,
+        // and that constant is pinned to Core/AppSettings.cs's real default by a test. A literal
+        // 120 here would be a third place saying it and the only one nothing watches.
+        if (!TryReadWholeNumber(ProjectionWarnMinutesInput.Text, ProjectionFloorMinutes,
+                ProjectionCeilingMinutes, fallback: AutomaticMemorySummary.ProjectionDefaultMinutes,
+                out var minutes, out var refusal))
+        {
+            Refuse(ProjectionWarnMinutesInput, saved, refusal);
+            return;
+        }
+
+        try
+        {
+            await _settings.SetProjectionWarnMinutesAsync(minutes);
+            ProjectionWarnMinutesInput.Text = minutes.ToString(CultureInfo.InvariantCulture);
+            ClearMemoryWarning();
+        }
+        catch (Exception ex)
+        {
+            Refuse(ProjectionWarnMinutesInput, saved, Loc.Format("Shell_Pref_CouldntSaveThat", ex.Message));
+        }
+    }
+
+    private bool SafeIsStartupEnabled()
+    {
+        try { return _startupRegistration.IsEnabled(); }
+        catch { return false; }
+    }
+
+    // ---------- v1.6.0 — account transport (export / import) entry points ----------
+
+    private void OnExportAccountsClick(object sender, RoutedEventArgs e)
+    {
+        // Snapshot the live account list from the ViewModel — gives the export checklist each row's
+        // RenderName + RobloxUserId (the latter decides exportable vs SkippedNoUserId).
+        var accounts = _mainViewModel.Accounts.ToList();
+        if (accounts.Count == 0)
+        {
+            MessageBox.Show(
+                Window.GetWindow(this),
+                Loc.Get("Shell_Pref_NothingToExport"),
+                Loc.Get("Shell_Pref_NothingToExportTitle"),
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        var window = new ExportAccountsWindow(_accountStore, _transport, accounts) { Owner = Window.GetWindow(this) };
+        window.ShowDialog();
+    }
+
+    private void OnImportAccountsClick(object sender, RoutedEventArgs e)
+    {
+        var window = new ImportAccountsWindow(_accountStore, _transport, _mainViewModel) { Owner = Window.GetWindow(this) };
+        window.ShowDialog();
+    }
+
+    /// <summary>
+    /// Nav rail → page. Five StackPanels live in one Grid and exactly one is visible; the rail's
+    /// SelectedIndex picks it.
+    /// <para>
+    /// Deliberately not a TabControl: a TabControl's headers are chrome we would then have to
+    /// re-template to get a shape-based selected state, and its content is rebuilt on tab change,
+    /// which would re-run the population every switch. These pages are populated once in OnLoaded
+    /// and stay live — the Discord status line subscribes for the window's lifetime, so a page
+    /// that gets torn down and rebuilt would drop that subscription silently.
+    /// </para>
+    /// </summary>
+    private void OnNavSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (PageStartup is null) return;   // fires once during InitializeComponent, before the pages exist
+
+        // A single-selection ListBox CAN reach SelectedIndex == -1: Ctrl+click on the already-
+        // selected item, or Ctrl+Space with the rail focused, both deselect. Without this the loop
+        // below collapses all five pages and the user is left staring at an empty window with no
+        // error and no obvious way back. The rail always has a page.
+        if (SettingsNav.SelectedIndex < 0)
+        {
+            SettingsNav.SelectedIndex = 0;   // re-enters this handler with a valid index
+            return;
+        }
+
+        var pages = new[] { PageStartup, PageAccounts, PageAlerts, PageDiscord, PageAppearance };
+        for (var i = 0; i < pages.Length; i++)
+        {
+            pages[i].Visibility = i == SettingsNav.SelectedIndex ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
+    /// <summary>
+    /// Alerts &amp; memory, scrolled to "Watch memory while accounts are running", with focus on it.
+    /// Found by the rail item's AutomationId, not its index, so reordering the rail cannot send it to
+    /// the wrong section.
+    /// </summary>
+    internal void RevealMemorySettings()
+    {
+        if (IsLoaded)
+        {
+            ShowMemorySwitch();
+            return;
+        }
+
+        _revealMemoryOnLoad = true;
+    }
+
+    private void ShowMemorySwitch()
+    {
+        SettingsNav.SelectedItem = SettingsNav.Items
+            .OfType<System.Windows.Controls.ListBoxItem>()
+            .First(item => System.Windows.Automation.AutomationProperties.GetAutomationId(item) == "NavAlerts");
+
+        // After the section becomes visible and lays out; BringIntoView on a collapsed element does nothing.
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+        {
+            MemoryWatchdogEnabledToggle.BringIntoView();
+            MemoryWatchdogEnabledToggle.Focus();
+        }));
+    }
+
+}

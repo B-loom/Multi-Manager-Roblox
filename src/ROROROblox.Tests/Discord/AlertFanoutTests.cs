@@ -1,0 +1,294 @@
+using ROROROblox.App.Discord;
+using ROROROblox.Core.Discord;
+
+namespace ROROROblox.Tests.Discord;
+
+/// <summary>
+/// Multi-destination routing (Este's smoke feedback, 2026-09-05): an alert kind fans out to a
+/// SET of destinations, the singular fields stay as the rollback mirror, and a pre-fanout blob
+/// migrates on read. These pin the fan-out, the migration, and the dedupe-on-fallback rule.
+/// </summary>
+public class AlertFanoutTests
+{
+    private static AlertTrigger Dropped(Guid id, string name) =>
+        new(AlertKind.AccountDroppedOut, id, name, name, null, null, DateTimeOffset.UnixEpoch);
+
+    private static readonly Dictionary<AlertCooldownKey, DateTimeOffset> NoHistory = [];
+
+    [Fact]
+    public void Route_MultipleDestinations_EmitsOneRoutedAlertPerDestination()
+    {
+        var config = new DiscordConfig
+        {
+            DroppedOutDestinations = [AlertDestination.Local, AlertDestination.Mine, AlertDestination.Phone],
+            MineWebhookUrl = "https://discord.com/api/webhooks/1/tok",
+        };
+
+        var routed = AlertRouter.Route([Dropped(Guid.NewGuid(), "A")], config, NoHistory,
+            DateTimeOffset.UnixEpoch, phoneConfigured: true);
+
+        Assert.Equal(
+            new[] { AlertDestination.Local, AlertDestination.Mine, AlertDestination.Phone },
+            routed.Select(r => r.Destination).ToArray());
+        Assert.All(routed, r => Assert.Single(r.Triggers));
+    }
+
+    [Fact]
+    public void Route_UnconfiguredFallbacks_DedupeIntoOneDesktopAlert()
+    {
+        // My-channel with no webhook AND phone with no provider both fall back to Local, and
+        // Local is also ticked — the desktop must be paged once, not three times.
+        var config = new DiscordConfig
+        {
+            DroppedOutDestinations = [AlertDestination.Local, AlertDestination.Mine, AlertDestination.Phone],
+        };
+
+        var routed = AlertRouter.Route([Dropped(Guid.NewGuid(), "A")], config, NoHistory,
+            DateTimeOffset.UnixEpoch, phoneConfigured: false);
+
+        Assert.Equal(AlertDestination.Local, Assert.Single(routed).Destination);
+    }
+
+    [Fact]
+    public void DestinationsFor_MigratesTheSingularFieldWhenTheListIsEmpty()
+    {
+        // A blob written before the fan-out shipped has only the singular field set.
+        var config = new DiscordConfig { DroppedOutDestination = AlertDestination.Mine };
+
+        Assert.Equal([AlertDestination.Mine], config.DestinationsFor(AlertKind.AccountDroppedOut));
+        Assert.Empty(config.DestinationsFor(AlertKind.MemoryWarning));
+    }
+
+    [Fact]
+    public void DestinationsFor_TheListWinsOverTheSingularMirror()
+    {
+        // Settings writes both; the singular is the rollback mirror (first entry), never the truth.
+        var config = new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Local,
+            DroppedOutDestinations = [AlertDestination.Phone, AlertDestination.Clan],
+        };
+
+        Assert.Equal(
+            [AlertDestination.Phone, AlertDestination.Clan],
+            config.DestinationsFor(AlertKind.AccountDroppedOut));
+    }
+
+    [Fact]
+    public void StatusLine_NamesEveryFannedOutDestination()
+    {
+        var line = AlertStatusLine.Compose(
+            new DiscordConfig
+            {
+                DroppedOutDestinations = [AlertDestination.Mine, AlertDestination.Phone],
+                MineWebhookUrl = "https://discord.com/api/webhooks/1/tok",
+            },
+            mineChannelName: "alerts",
+            phoneConfigured: true,
+            phoneProviderName: "ntfy");
+
+        Assert.False(line.IsFailure);
+        Assert.Contains("#alerts", line.Text, StringComparison.Ordinal);
+        Assert.Contains("your phone (ntfy)", line.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PushoverIconResource_IsEmbedded()
+    {
+        // Settings > Alerts hands this file out for the pushover.net application form; the
+        // csproj Link can silently break on a docs move, and the button would then throw at
+        // the first click on someone's machine instead of here.
+        using var stream = typeof(ROROROblox.App.Preferences.SettingsPage).Assembly
+            .GetManifestResourceStream("ROROROblox.App.Notify.pushover-icon-128.png");
+
+        Assert.NotNull(stream);
+        Assert.True(stream!.Length > 500, "embedded icon is suspiciously small");
+    }
+
+    [Fact]
+    public void DestinationsFor_NewKinds_ReadTheirListsWithNoLegacyMirror()
+    {
+        var config = new DiscordConfig
+        {
+            RecycledDestinations = [AlertDestination.Phone],
+            UptimeMarkDestinations = [AlertDestination.Phone, AlertDestination.Local],
+        };
+
+        Assert.Equal([AlertDestination.Phone], config.DestinationsFor(AlertKind.Recycled));
+        Assert.Equal(
+            [AlertDestination.Phone, AlertDestination.Local],
+            config.DestinationsFor(AlertKind.UptimeMark));
+        Assert.Empty(new DiscordConfig().DestinationsFor(AlertKind.Recycled));
+    }
+
+    [Fact]
+    public void Payload_Recycled_CarriesTheReclaimedRam()
+    {
+        var payload = WebhookPayload.ForAlert(AlertKind.Recycled,
+            [new AlertTrigger(AlertKind.Recycled, Guid.NewGuid(), "BaronBloxwell", "Real",
+                null, 4_402_341_478, DateTimeOffset.UnixEpoch)]);
+
+        Assert.Equal("BaronBloxwell — recycled", payload.Title);
+        Assert.Contains("4.1 GB", payload.Body, StringComparison.Ordinal);
+        Assert.Contains("back in its server", payload.Body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DestinationsFor_AutoRejoinPaused_DefaultsToTheDesktopToast()
+    {
+        // Corrected same-day (controller ruling, 2026-09-29): the spec says a pause "raises a toast
+        // and the Discord alert (when alerts are on)", and the temporary toast it replaces always
+        // showed — so this follows MetricBreachDestinations' shipped-on precedent, not
+        // AccountDroppedOut's empty one. Discord stays opt-in; the toast does not.
+        Assert.Equal(
+            [AlertDestination.Local],
+            new DiscordConfig().DestinationsFor(AlertKind.AutoRejoinPaused));
+
+        var config = new DiscordConfig { AutoRejoinPausedDestinations = [AlertDestination.Phone, AlertDestination.Local] };
+        Assert.Equal(
+            [AlertDestination.Phone, AlertDestination.Local],
+            config.DestinationsFor(AlertKind.AutoRejoinPaused));
+
+        // The trap the default's doc comment calls out: an explicit, deliberate "nothing" must not
+        // spring back to the shipped default. DestinationsFor cannot see WHY the list is empty
+        // (never touched vs. explicitly emptied) — that distinction lives one layer down, in
+        // whether the JSON key is present at all (DiscordConfigStoreTests pins the load side).
+        Assert.Empty(new DiscordConfig { AutoRejoinPausedDestinations = [] }.DestinationsFor(AlertKind.AutoRejoinPaused));
+    }
+
+    [Fact]
+    public void Payload_AutoRejoinPaused_RepeatedDrops_NamesTheAccountAndSaysDropped()
+    {
+        var payload = WebhookPayload.ForAlert(AlertKind.AutoRejoinPaused,
+            [new AlertTrigger(AlertKind.AutoRejoinPaused, Guid.NewGuid(), "BaronBloxwell", "Real",
+                null, null, DateTimeOffset.UnixEpoch, PauseReason: AutoRejoinPauseReason.RepeatedDrops)]);
+
+        Assert.Equal("Auto-rejoin paused", payload.Title);
+        Assert.Contains("BaronBloxwell dropped out 4 times in an hour", payload.Body, StringComparison.Ordinal);
+        Assert.Contains("until you turn it back on", payload.Body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Payload_AutoRejoinPaused_RelaunchFailed_SaysRoRoRoCouldntRestartIt()
+    {
+        var payload = WebhookPayload.ForAlert(AlertKind.AutoRejoinPaused,
+            [new AlertTrigger(AlertKind.AutoRejoinPaused, Guid.NewGuid(), "BaronBloxwell", "Real",
+                null, null, DateTimeOffset.UnixEpoch, PauseReason: AutoRejoinPauseReason.RelaunchFailed)]);
+
+        // Same title as the repeated-drops case: both are "auto-rejoin paused", the account's name
+        // and the reason live in the body instead.
+        Assert.Equal("Auto-rejoin paused", payload.Title);
+        Assert.Contains("couldn't restart BaronBloxwell after 3 tries", payload.Body, StringComparison.Ordinal);
+        Assert.Contains("until you turn it back on", payload.Body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DestinationsFor_AccountIdle_DefaultsToTheDesktopToast()
+    {
+        // Idle alerts have put a tray toast on screen since v1.8 (IdleAlertPresenter), so the
+        // default here is not a new interruption — it is the one that already exists, now routed
+        // like every other kind. Empty would have been an upgrade that silently removed a
+        // notification, which is why this follows MetricBreach/AutoRejoinPaused's Local default
+        // rather than AccountDroppedOut's empty one.
+        Assert.Equal(
+            [AlertDestination.Local],
+            new DiscordConfig().DestinationsFor(AlertKind.AccountIdle));
+
+        var config = new DiscordConfig { IdleDestinations = [AlertDestination.Phone, AlertDestination.Local] };
+        Assert.Equal(
+            [AlertDestination.Phone, AlertDestination.Local],
+            config.DestinationsFor(AlertKind.AccountIdle));
+
+        // An explicit, deliberate "nothing" must not spring back to the default — and for this
+        // kind that list is written by the MuteIdleAlerts migration, not only by a checkbox.
+        Assert.Empty(new DiscordConfig { IdleDestinations = [] }.DestinationsFor(AlertKind.AccountIdle));
+    }
+
+    [Fact]
+    public void AlertKind_IsAppendOnly_EveryShippedKindKeepsItsPosition()
+    {
+        // The rule the enum's own doc comment states, made executable. Reordering AlertKind
+        // compiles green and breaks nothing visible on this machine, so nothing but a pin catches
+        // it: the positions are the identity every destination list, cooldown key and per-kind
+        // cadence override is keyed on, and a new kind that lands anywhere but the end
+        // renumbers the ones after it.
+        Assert.Equal(0, (int)AlertKind.AccountDroppedOut);
+        Assert.Equal(1, (int)AlertKind.MemoryWarning);
+        Assert.Equal(2, (int)AlertKind.Recycled);
+        Assert.Equal(3, (int)AlertKind.UptimeMark);
+        Assert.Equal(4, (int)AlertKind.MetricBreach);
+        Assert.Equal(5, (int)AlertKind.MetricRecovered);
+        Assert.Equal(6, (int)AlertKind.AutoRejoinPaused);
+        Assert.Equal(7, (int)AlertKind.AccountIdle);
+
+        // The newest kind is last, so the next append cannot be slipped into the middle without
+        // this failing. Stated as the invariant rather than a count, so appending a kind moves
+        // one line above instead of two.
+        Assert.Equal(
+            AlertKind.AccountIdle,
+            Enum.GetValues<AlertKind>().OrderBy(k => (int)k).Last());
+    }
+
+    [Fact]
+    public void Payload_AccountIdle_SaysItWentIdleAndWhereItIsSitting()
+    {
+        var payload = WebhookPayload.ForAlert(AlertKind.AccountIdle,
+            [new AlertTrigger(AlertKind.AccountIdle, Guid.NewGuid(), "BaronBloxwell", "Real",
+                "Pet Simulator 99!", null, DateTimeOffset.UnixEpoch)]);
+
+        // A sentence, not a label: "BaronBloxwell — idle" says the same words and reads as a
+        // status chip. The consequence is the half the toast never carried — an idle client gets
+        // kicked by Roblox on its own (docs/decisions.md, 2026-09-29: "up to 20 minutes after its
+        // last real input"), which is the whole reason the 15-minute warn threshold exists.
+        Assert.Equal("BaronBloxwell went idle", payload.Title);
+        Assert.Equal(
+            "• BaronBloxwell — idle in Pet Simulator 99! · Roblox kicks an idle account",
+            payload.Body);
+    }
+
+    [Fact]
+    public void Payload_AccountIdle_WithNoGame_StillNamesTheAccountAndTheConsequence()
+    {
+        // The game is optional on the trigger — an account can go idle sitting at Roblox home, or
+        // with presence unknown — and a missing one must not leave a dangling "idle in ".
+        var payload = WebhookPayload.ForAlert(AlertKind.AccountIdle,
+            [new AlertTrigger(AlertKind.AccountIdle, Guid.NewGuid(), "BaronBloxwell", "Real",
+                null, null, DateTimeOffset.UnixEpoch)]);
+
+        Assert.Equal("BaronBloxwell went idle", payload.Title);
+        Assert.Equal("• BaronBloxwell — idle · Roblox kicks an idle account", payload.Body);
+    }
+
+    [Fact]
+    public void Payload_AccountIdle_Grouped_CountsThemInTheTitleAndNamesEachBelow()
+    {
+        // The crossing arrives coalesced from ActivityMonitor — one list, N accounts — so the
+        // grouped shape is the common case here, not the edge.
+        var payload = WebhookPayload.ForAlert(AlertKind.AccountIdle, [
+            Idle("A"), Idle("B"), Idle("C"),
+        ]);
+
+        Assert.Equal("3 accounts went idle", payload.Title);
+        Assert.Equal(3, payload.Body.Split('\n').Length);
+        Assert.Contains("• A — idle", payload.Body, StringComparison.Ordinal);
+        Assert.Contains("• C — idle", payload.Body, StringComparison.Ordinal);
+    }
+
+    private static AlertTrigger Idle(string name) =>
+        new(AlertKind.AccountIdle, Guid.NewGuid(), name, $"real_{name}", null, null,
+            DateTimeOffset.UnixEpoch);
+
+    [Fact]
+    public void Payload_UptimeMark_ReadsHoursAndCount()
+    {
+        // The tracker's caller composes the synthetic trigger: DisplayName carries the hours,
+        // GameName the count. No identity in either — streamer mode has nothing to mask.
+        var payload = WebhookPayload.ForAlert(AlertKind.UptimeMark,
+            [new AlertTrigger(AlertKind.UptimeMark, Guid.Empty, "4h up", "4h up",
+                "6 accounts in", null, DateTimeOffset.UnixEpoch)]);
+
+        Assert.Equal("4h up — 6 accounts in", payload.Title);
+        Assert.Contains("all-good mark", payload.Body, StringComparison.Ordinal);
+    }
+
+}

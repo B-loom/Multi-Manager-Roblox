@@ -1,0 +1,63 @@
+# Launch video narration — fr (Français)
+
+Translated from `launch-video-narration-en.md`. Keys and structure unchanged;
+every VO and OVERLAY value localized. These are speakable lines for the
+multilingual TTS, not listing copy.
+
+**Kept English on purpose:** RoRoRo, Squad Launch, 626 Labs, Microsoft Store,
+Roblox, RAM, Windows, Mac. The brand tagline speaks localized in this language
+(trailer ruling 2026-09-08): `Imaginez autre chose.` — vous-imperative, matching the Store listing's register; these are Store trailers, so the listing register wins, and register consistency beats brand-word letter-identity in a voiced line (same logic as the es adjudication).
+**Spoken digits:** `626` is voiced as `six-deux-six Labs` in the cta line, and
+stays as digits in any OVERLAY.
+
+## Lines
+
+### hook (slide 1)
+- OVERLAY: `8 clients. 1 PC.`
+- VO: `Voilà HUIT clients Roblox qui tournent en même temps, sur un seul PC. Et l'appli qui fait ça est gratuite.`
+
+### accounts (slide 2)
+- OVERLAY: `enregistrez une fois. lancez.`
+- VO: `Enregistrez tous vos alts, gérez vos comptes. Un clic par compte, statut en direct et le jeu où chacun se trouve.`
+
+### manager (slide 3)
+- OVERLAY: `chaque compte, d'un coup d'œil`
+- VO: `Chaque compte affiche maintenant ses Robux, son Plus et ses amis en ligne. Ouvrez-en un, et ses jeux sont là. Récents, favoris, serveurs privés.`
+
+### health (slide 4)
+- OVERLAY: `il vous dit ce qui cloche`
+- VO: `Et quand un compte a besoin de vous, il le dit. Session expirée, vérification requise, limité par Roblox. Un clic pour régler ça.`
+
+### library (slide 5)
+- OVERLAY: `bibliothèque. choisissez qui joue.`
+- VO: `Chaque jeu auquel vous avez joué arrive dans la Bibliothèque. Cherchez, filtrez, et choisissez le compte qui joue.`
+
+### squad (slide 6)
+- OVERLAY: `même serveur privé. tous.`
+- VO: `Squad Launch, c'est le meilleur. Un lien, et chaque compte atterrit dans le MÊME serveur privé, ensemble.`
+
+### history (slide 7)
+- OVERLAY: `il compte les points désormais`
+- VO: `Et il compte les points ! Pic d'alts simultanés, temps total, un classement de vos alts avec les séries de connexions. Tout calculé sur votre machine, rien n'en sort.`
+
+### themes (slide 8)
+- OVERLAY: `l'IA crée votre thème`
+- VO: `Quatre thèmes intégrés, plus un créateur où une IA conçoit le vôtre à partir d'une ambiance que vous décrivez.`
+
+### trust (slide 9)
+- OVERLAY: `votre mot de passe n'y passe pas`
+- VO: `Votre mot de passe ne touche jamais l'appli, jamais. En plus, plein d'améliorations de confort. Jetez un œil à la liste !`
+
+### cta (slide 10)
+- OVERLAY: `scannez, ouvrez sur ordi`
+- VO: `Gratuit sur le Microsoft Store, Windows ET Mac. Scannez le code, gardez la page, prenez-le sur votre ordi. RoRoRo, de six-deux-six Labs. Imaginez autre chose.`
+
+> **Render note (Este, 2026-09-08):** the `six-deux-six Labs` words are replaced at
+> render by the English master's "six-two-six Labs" — Este's own recording — so the
+> brand ident is his voice in every language. The localized text above is the fallback read.
+
+## Post caption (for localized social posts)
+
+`Huit clients Roblox sur un seul PC — gratuit. RoRoRo enregistre vos alts, les lance en un clic chacun, les réunit dans le même serveur privé, et garde maintenant vos stats. Windows + Mac. Cherchez RORORO. Non affilié à Roblox.`
+
+The not-affiliated sentence is mandatory and is present above.

@@ -1,0 +1,777 @@
+﻿using System.IO;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace ROROROblox.Core;
+
+/// <summary>
+/// JSON-file-backed implementation of <see cref="IAppSettings"/>. File lives at
+/// <c>%LOCALAPPDATA%\ROROROblox\settings.json</c>. Plaintext (no DPAPI) — these are
+/// preferences, not secrets. Atomic write via tmp-file + rename. Thread-safe via
+/// <see cref="SemaphoreSlim"/>.
+/// </summary>
+public sealed class AppSettings : IAppSettings, IDisposable
+{
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    private readonly string _filePath;
+    private readonly SemaphoreSlim _gate = new(initialCount: 1, maxCount: 1);
+    private bool _disposed;
+
+    public AppSettings() : this(DefaultPath()) { }
+
+    public AppSettings(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            throw new ArgumentException("File path must not be empty.", nameof(filePath));
+        }
+        _filePath = filePath;
+    }
+
+    public static string DefaultPath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return Path.Combine(localAppData, "ROROROblox", "settings.json");
+    }
+
+    // GetDefaultPlaceUrlAsync and the DefaultPlaceUrl blob property were DELETED by F-093,
+    // together with the legacy LaunchAsync overload that was their only reader. An old settings.json
+    // carrying the key still deserializes — System.Text.Json ignores unknown members — and the value
+    // is simply not carried forward, which is right: nothing could read it and no UI could set it.
+    public async Task<bool> GetLaunchMainOnStartupAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            return settings.LaunchMainOnStartup;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetLaunchMainOnStartupAsync(bool enabled)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            settings = settings with { LaunchMainOnStartup = enabled };
+            await SaveAsync(settings).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+    public async Task<bool> GetLaunchWindowedAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            return settings.LaunchWindowed;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetLaunchWindowedAsync(bool enabled)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            settings = settings with { LaunchWindowed = enabled };
+            await SaveAsync(settings).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<string?> GetActiveThemeIdAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            return settings.ActiveThemeId;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetActiveThemeIdAsync(string themeId)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            settings = settings with { ActiveThemeId = themeId };
+            await SaveAsync(settings).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool?> GetEdgeRemediationAnswerAsync(string themeId)
+    {
+        if (string.IsNullOrWhiteSpace(themeId)) return null;
+
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var answers = (await LoadAsync().ConfigureAwait(false)).EdgeRemediationAnswers;
+            // OrdinalIgnoreCase, not Ordinal: theme ids come from FILENAMES on a case-insensitive
+            // filesystem, and ThemeStore.GetByIdAsync matches them case-insensitively too. Matching
+            // Ordinal here meant renaming "Neon Dusk.json" to "neon dusk.json" silently lost a
+            // recorded decline and repainted the theme. Found by the wave-5 review gate.
+            return answers is not null && Lookup(answers).TryGetValue(themeId, out var answered) ? answered : null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetEdgeRemediationAnswerAsync(string themeId, bool accepted)
+    {
+        if (string.IsNullOrWhiteSpace(themeId))
+        {
+            throw new ArgumentException("Theme id must not be empty.", nameof(themeId));
+        }
+
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            // Copy rather than mutate: `with` shares the dictionary reference with the blob we
+            // just read, so mutating in place would edit a value another caller may still hold.
+            var answers = settings.EdgeRemediationAnswers is null
+                ? new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+                : Lookup(settings.EdgeRemediationAnswers);
+            answers[themeId] = accepted;
+            await SaveAsync(settings with { EdgeRemediationAnswers = answers }).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> GetBloxstrapWarningDismissedAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            return settings.BloxstrapWarningDismissed;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetBloxstrapWarningDismissedAsync(bool value)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var settings = await LoadAsync().ConfigureAwait(false);
+            settings = settings with { BloxstrapWarningDismissed = value };
+            await SaveAsync(settings).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<string?> GetDismissedFpsCapWarningSignatureAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).DismissedFpsCapWarningSignature; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetDismissedFpsCapWarningSignatureAsync(string? signature)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { DismissedFpsCapWarningSignature = signature }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetMuteIdleAlertsAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).MuteIdleAlerts; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMuteIdleAlertsAsync(bool muted)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { MuteIdleAlerts = muted }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<int> GetIdleWarnThresholdMinutesAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var mins = (await LoadAsync().ConfigureAwait(false)).IdleWarnThresholdMinutes;
+            return IdleWarnThresholdOptions.Normalise(mins);   // nearest offered value; never written back by a read
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetIdleWarnThresholdMinutesAsync(int minutes)
+    {
+        minutes = IdleWarnThresholdOptions.Normalise(minutes);
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { IdleWarnThresholdMinutes = minutes }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetCarefulSquadLaunchAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).CarefulSquadLaunch; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetCarefulSquadLaunchAsync(bool careful)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { CarefulSquadLaunch = careful }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetAlwaysShowRecycleAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).AlwaysShowRecycle; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetAlwaysShowRecycleAsync(bool always)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { AlwaysShowRecycle = always }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetAutoForceStopAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).AutoForceStop; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetAutoForceStopAsync(bool auto)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { AutoForceStop = auto }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetMetricAlertsEnabledAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).MetricAlertsEnabled; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMetricAlertsEnabledAsync(bool enabled)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { MetricAlertsEnabled = enabled }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<int> GetAlertCadenceMinutesAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).AlertCadenceMinutes; }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Stored as given, negatives and all. Clamping here would make the file and the behaviour
+    /// disagree, and the degrade already lives in one place —
+    /// <see cref="Discord.AlertCadence.FromSettings"/>, which every reader goes through. Two
+    /// guards for one rule is how they drift.
+    /// </summary>
+    public async Task SetAlertCadenceMinutesAsync(int minutes)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { AlertCadenceMinutes = minutes }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Never null to a caller: a blob written with an explicit <c>null</c> for this key decodes as
+    /// null despite the non-nullable record type (System.Text.Json does not enforce it), and
+    /// handing that out would push the same null check into every reader.
+    /// </summary>
+    public async Task<string> GetAlertCadenceOverridesJsonAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).AlertCadenceOverridesJson ?? string.Empty; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetAlertCadenceOverridesJsonAsync(string? overridesJson)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            // Normalise blank to "" ("no overrides"), the same way UiLanguage normalises blank to
+            // null: a whitespace blob is an accident on the way to a choice, not a choice.
+            var value = string.IsNullOrWhiteSpace(overridesJson) ? string.Empty : overridesJson.Trim();
+            await SaveAsync(s with { AlertCadenceOverridesJson = value }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Never null to a caller, for the reason <see cref="GetAlertCadenceOverridesJsonAsync"/>
+    /// documents: a blob written with an explicit <c>null</c> decodes as null despite the record's
+    /// non-nullable string, and handing that out would push the same check into every reader.
+    /// <para>
+    /// Hands back whatever is in the file, unvalidated.
+    /// <see cref="Discord.AlertSoundSetting.FromSetting"/> is the only thing that turns it into a
+    /// mode, and it is where a garbage value becomes a chime rather than silence.
+    /// </para>
+    /// </summary>
+    public async Task<string> GetAlertSoundAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).AlertSound ?? string.Empty; }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Stored as given. Blank normalises to <c>""</c> the way
+    /// <see cref="SetAlertCadenceOverridesJsonAsync"/> does — a whitespace value is an accident on
+    /// the way to a choice, not a choice — and <c>""</c> resolves to the default chime.
+    /// </summary>
+    public async Task SetAlertSoundAsync(string? sound)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            var value = string.IsNullOrWhiteSpace(sound) ? string.Empty : sound.Trim();
+            await SaveAsync(s with { AlertSound = value }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<string> GetLibraryViewAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).LibraryView ?? "grid"; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetLibraryViewAsync(string? view)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            var value = string.IsNullOrWhiteSpace(view) ? "grid" : view.Trim();
+            await SaveAsync(s with { LibraryView = value }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<string> GetLibraryFiltersAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).LibraryFilters ?? string.Empty; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetLibraryFiltersAsync(string? filters)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            var value = string.IsNullOrWhiteSpace(filters) ? string.Empty : filters.Trim();
+            await SaveAsync(s with { LibraryFilters = value }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetStreamerModeAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).StreamerMode; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetStreamerModeAsync(bool enabled)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { StreamerMode = enabled }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetMemoryWatchdogEnabledAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).MemoryWatchdogEnabled; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMemoryWatchdogEnabledAsync(bool enabled)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { MemoryWatchdogEnabled = enabled }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<int?> GetMemoryReserveMbAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).MemoryReserveMb; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMemoryReserveMbAsync(int? reserveMb)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { MemoryReserveMb = reserveMb }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<int?> GetMemoryCapMbAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).MemoryCapMb; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMemoryCapMbAsync(int? capMb)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { MemoryCapMb = capMb }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<int> GetProjectionWarnMinutesAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).ProjectionWarnMinutes; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetProjectionWarnMinutesAsync(int minutes)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { ProjectionWarnMinutes = minutes }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<WindowPlacement?> GetMainWindowPlacementAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            // All four or nothing: a half-written record is not a placement, and filling the gaps
+            // from defaults would put the window somewhere the user never left it.
+            if (s.MainWindowLeft is not double l || s.MainWindowTop is not double tp
+                || s.MainWindowWidth is not double w || s.MainWindowHeight is not double h)
+            {
+                return null;
+            }
+            return new WindowPlacement(l, tp, w, h, s.MainWindowMaximized);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMainWindowPlacementAsync(WindowPlacement? placement)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with
+            {
+                MainWindowLeft = placement?.Left,
+                MainWindowTop = placement?.Top,
+                MainWindowWidth = placement?.Width,
+                MainWindowHeight = placement?.Height,
+                MainWindowMaximized = placement?.Maximized ?? false,
+            }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<bool> GetCompactModeAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).CompactMode; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetCompactModeAsync(bool compact)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            await SaveAsync(s with { CompactMode = compact }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<string?> GetUiLanguageAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try { return (await LoadAsync().ConfigureAwait(false)).UiLanguage; }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetUiLanguageAsync(string? cultureName)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var s = await LoadAsync().ConfigureAwait(false);
+            // Normalise empty to null ("follow the OS") — a blank stored culture is an accident
+            // on the way to a choice, not a choice.
+            var value = string.IsNullOrWhiteSpace(cultureName) ? null : cultureName.Trim();
+            await SaveAsync(s with { UiLanguage = value }).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Read ONLY the saved UI language, synchronously, off the settings file — for the startup
+    /// culture bootstrap, which must run before the DI container and before any window, so it
+    /// cannot await the async accessor. Returns null (follow the OS) on any absence or error;
+    /// this is best-effort and must never throw into <c>Main</c>.
+    /// </summary>
+    public static string? ReadUiLanguageFast(string? filePath = null)
+    {
+        try
+        {
+            var path = filePath ?? DefaultPath();
+            if (!File.Exists(path)) return null;
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length == 0) return null;
+            var blob = JsonSerializer.Deserialize<SettingsBlob>(bytes, JsonOptions);
+            return string.IsNullOrWhiteSpace(blob?.UiLanguage) ? null : blob!.UiLanguage;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Re-keys the deserialized answers case-insensitively. System.Text.Json always hands back an
+    /// Ordinal dictionary regardless of what was written, so the comparer has to be re-applied on
+    /// every read rather than assumed to have survived the round trip.
+    /// </summary>
+    private static Dictionary<string, bool> Lookup(Dictionary<string, bool> answers) =>
+        new(answers, StringComparer.OrdinalIgnoreCase);
+
+    private async Task<SettingsBlob> LoadAsync()
+    {
+        if (!File.Exists(_filePath))
+        {
+            return new SettingsBlob(Version: 1, LaunchMainOnStartup: false, ActiveThemeId: null);
+        }
+
+        byte[] bytes;
+        try
+        {
+            bytes = await File.ReadAllBytesAsync(_filePath).ConfigureAwait(false);
+        }
+        catch (IOException)
+        {
+            return new SettingsBlob(Version: 1, LaunchMainOnStartup: false, ActiveThemeId: null);
+        }
+
+        if (bytes.Length == 0)
+        {
+            return new SettingsBlob(Version: 1, LaunchMainOnStartup: false, ActiveThemeId: null);
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<SettingsBlob>(bytes, JsonOptions)
+                ?? new SettingsBlob(Version: 1);
+        }
+        catch (JsonException)
+        {
+            // Corrupt settings file — return defaults rather than fail. The user can re-set in
+            // the settings UI; we log nothing because we have no logger surface in Core yet.
+            return new SettingsBlob(Version: 1, LaunchMainOnStartup: false, ActiveThemeId: null);
+        }
+    }
+
+    private async Task SaveAsync(SettingsBlob blob)
+    {
+        var directory = Path.GetDirectoryName(_filePath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(blob, JsonOptions);
+        var tempPath = _filePath + ".tmp";
+        await File.WriteAllBytesAsync(tempPath, bytes).ConfigureAwait(false);
+        File.Move(tempPath, _filePath, overwrite: true);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        _gate.Dispose();
+    }
+
+    // SettingsBlob: missing fields decode as defaults (System.Text.Json), so older v1 blobs
+    // without LaunchMainOnStartup, BloxstrapWarningDismissed, MuteIdleAlerts,
+    // IdleWarnThresholdMinutes, CarefulSquadLaunch, StreamerMode, MemoryWatchdogEnabled,
+    // MemoryReserveMb, MemoryCapMb, ProjectionWarnMinutes, CompactMode,
+    // DismissedFpsCapWarningSignature, or MetricAlertsEnabled
+    // load cleanly with those fields at their defaults — no migration step. MemoryReserveMb/
+    // MemoryCapMb default to null ("never set" — the composition root derives from installed
+    // RAM); they are NOT sentinel-zero because 0 is a real, distinct user choice for MemoryCapMb
+    // (disable the cap trigger). DismissedFpsCapWarningSignature defaults to null ("nothing
+    // dismissed yet") for the same reason — an empty string would be ambiguous with a real
+    // (if degenerate) signature. EdgeRemediationAnswers defaults to null ("nobody has been asked
+    // about any theme"), which is what every settings.json written before v1.16 looks like — the
+    // absent key is exactly the state the remediation prompt is designed to handle.
+    //
+    // AlertCadenceMinutes and AlertCadenceOverridesJson (v1.33) are the same no-migration deal:
+    // every settings.json written before this cycle has neither key, so both load at their
+    // defaults, and the default global is 5 — the exact number AlertRouter.Cooldown held as a
+    // static readonly from v1.0 to v1.32. An upgrade therefore changes nobody's alert pace. 0 is a
+    // REAL choice here ("every time", MemoryCapMb's idiom in this same record) rather than a
+    // sentinel, which is why neither is nullable: absent and zero never need telling apart, since
+    // absent resolves to 5 and zero resolves to zero. The overrides blob defaults to "" rather
+    // than null for the same reason an empty culture name does not — there is no third state to
+    // express, and AlertCadence.FromSettings treats null, blank and "{}" identically anyway.
+    //
+    // AlertSound (v1.33) is the same no-migration deal with one difference worth writing down: its
+    // default is the member NAME "Chime" rather than an empty string, even though "" resolves to
+    // Chime anyway. The reason is that this value is the one a human is most likely to hand-edit,
+    // and a file that says "alertSound": "" teaches nothing about what the legal values are, while
+    // one that says "Chime" is a working example of the format. The ordinal is never persisted —
+    // see AlertSoundSetting, which refuses a numeric value precisely so the enum's declaration
+    // order cannot become part of the file format.
+    private sealed record SettingsBlob(
+        int Version,
+        bool LaunchMainOnStartup = false,
+        string? ActiveThemeId = null,
+        bool BloxstrapWarningDismissed = false,
+        bool MuteIdleAlerts = false,
+        int IdleWarnThresholdMinutes = 15,
+        bool CarefulSquadLaunch = false,
+        bool StreamerMode = false,
+        bool MemoryWatchdogEnabled = true,
+        int? MemoryReserveMb = null,
+        int? MemoryCapMb = null,
+        int ProjectionWarnMinutes = 120,
+        string? DismissedFpsCapWarningSignature = null,
+        bool AlwaysShowRecycle = false,
+        bool CompactMode = false,
+        bool AutoForceStop = false,
+        bool LaunchWindowed = true,
+        string? UiLanguage = null,
+        double? MainWindowLeft = null,
+        double? MainWindowTop = null,
+        double? MainWindowWidth = null,
+        double? MainWindowHeight = null,
+        bool MainWindowMaximized = false,
+        Dictionary<string, bool>? EdgeRemediationAnswers = null,
+        bool MetricAlertsEnabled = false,
+        int AlertCadenceMinutes = 5,
+        string AlertCadenceOverridesJson = "",
+        string AlertSound = "Chime",
+        string LibraryView = "grid",
+        string LibraryFilters = "");
+}

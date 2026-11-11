@@ -1,0 +1,179 @@
+<Application x:Class="ROROROblox.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:ROROROblox.App"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ui:ThemesDictionary Theme="Dark" />
+                <ui:ControlsDictionary />
+                <!-- After ControlsDictionary, deliberately: these styles BasedOn WPF-UI's implicit
+                     Button style, and a StaticResource BasedOn resolves at parse time, so the
+                     library's dictionary has to be merged first or the lookup fails. -->
+                <ResourceDictionary Source="/ROROROblox.App;component/Controls/ControlStyles.xaml" />
+                <!-- The two drawn About-page marks as geometry (v1.33 item 10). App-wide rather
+                     than in AboutPage's own Resources because the render gates hand a subtree to
+                     XamlReader.Parse as a standalone string and attach dictionaries afterwards —
+                     the same reason ControlStyles' font tokens are reached by DynamicResource.
+                     Generated; see scripts/gen-about-marks-xaml.py. -->
+                <ResourceDictionary Source="/ROROROblox.App;component/About/Marks/Marks.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+
+
+            <local:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
+            <local:InverseBoolConverter x:Key="InverseBoolConverter" />
+            <local:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibilityConverter" />
+            <local:StringToVisibilityConverter x:Key="StringToVisibilityConverter" />
+            <local:ZeroToVisibilityConverter x:Key="ZeroToVisibilityConverter" />
+            <local:CaptionColorBrushConverter x:Key="CaptionColorBrushConverter" />
+            <local:EqualsToCollapseConverter x:Key="EqualsToCollapseConverter" />
+
+            <!-- Themed brushes — single source of truth at app level, and these hexes are only the
+                 pre-startup values. ThemeService.ApplySlot REPLACES each brush instance on startup
+                 and on every theme change (ThemeService.ApplySlot); it does not mutate the held
+                 brush's Color.
+
+                 So reference these with {DynamicResource}, never {StaticResource}. A StaticResource
+                 resolves once and keeps the instance it got, which is the instance replacement
+                 throws away — the reference would render correctly on first paint and then silently
+                 never repaint again. DynamicResource subscribers re-bind when the dictionary entry
+                 changes, which is the whole reason replacement is the chosen path. Every themed
+                 reference in App XAML is DynamicResource today; keep it that way. -->
+            <SolidColorBrush x:Key="BgBrush" Color="#0B0720" />
+            <SolidColorBrush x:Key="CyanBrush" Color="#B69CFF" />
+            <SolidColorBrush x:Key="MagentaBrush" Color="#FF5FD2" />
+            <SolidColorBrush x:Key="WhiteBrush" Color="#FFFFFF" />
+            <SolidColorBrush x:Key="MutedTextBrush" Color="#A59CC8" />
+            <SolidColorBrush x:Key="DividerBrush" Color="#2A1F55" />
+            <SolidColorBrush x:Key="RowBgBrush" Color="#150E36" />
+            <SolidColorBrush x:Key="RowExpiredBgBrush" Color="#3A2D14" />
+            <SolidColorBrush x:Key="RowExpiredAccentBrush" Color="#F1B232" />
+            <SolidColorBrush x:Key="NavyBrush" Color="#0B0720" />
+
+            <!-- DERIVED, not a theme slot. ThemeService recomputes this from Navy + Divider on
+                 every theme change so an interactive control's edge always clears WCAG 1.4.11's
+                 3:1. The value here is only the pre-startup fallback (brand's derived edge).
+
+                 ONLY interactive controls bind this. Cards, row separators and dividers keep
+                 DividerBrush — a separator is not a component boundary, 1.4.11 does not govern it,
+                 and the author's faint hairline is what they chose. Binding this to a card edge
+                 repaints every user's theme to fix a problem that surface does not have. -->
+            <SolidColorBrush x:Key="InteractiveEdgeBrush" Color="#707B8B" />
+
+            <!-- DERIVED like the edge above (F-050): the label on anything filled with MagentaBrush.
+                 Neither WhiteBrush nor NavyBrush is readable on magenta in every theme — white
+                 measures 3.79:1 on brand, navy 3.79:1 on midnight, and the better of the two still
+                 falls short of AA's 4.5:1 in brand and midnight. ThemeService picks per theme and
+                 nudges the winner. Value here is only the pre-startup fallback (brand's). -->
+            <SolidColorBrush x:Key="OnMagentaBrush" Color="#0E1C2D" />
+
+            <!-- DERIVED (v1.36): the "Needs verification" colour, the midpoint of RowExpiredAccent and
+                 Magenta, recomputed by ThemeService on every theme change. Value here is the brand
+                 midpoint, the pre-startup fallback only. -->
+            <SolidColorBrush x:Key="HealthVerifyBrush" Color="#F2705E" />
+
+            <!-- DERIVED (v1.36): the "Limited by Roblox" badge text, Magenta nudged toward White until
+                 it clears 4.5:1 on Bg and RowBg. Value here is the brand pre-startup fallback. -->
+            <SolidColorBrush x:Key="HealthLimitedBrush" Color="#F44897" />
+
+            <!-- WPF-UI'S CHECKBOX ACCENT, TAKEN OVER. These four keys are the library's, not ours,
+                 and they are declared here for the same reason the ten slots above are: an entry
+                 written directly into Application.Resources outranks every merged dictionary,
+                 ControlsDictionary included, and ThemeService.ApplySlot replaces the instance on
+                 every theme change.
+
+                 WPF-UI's CheckBox template resolves all four through {DynamicResource}. Its Dark
+                 dictionary answers with #0067C0 for the checked fill — a fixed Fluent blue no theme
+                 can reach, so a ticked box painted library blue under flatline, a theme whose whole
+                 premise is carrying no meaning in colour — and with Transparent for both checked
+                 hover fills, which erased the tick's fill the moment the pointer arrived.
+
+                 The values here are only the pre-startup fallbacks, brand's, exactly as above. See
+                 ThemeSlots for the full account, including why this is four keys rather than an
+                 owned template. -->
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#B69CFF" />
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPointerOver" Color="#4ADDFB" />
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPressed" Color="#6FE4FC" />
+            <SolidColorBrush x:Key="CheckBoxCheckGlyphForeground" Color="#0B0720" />
+
+            <!-- Small round toggle for "include this account in batch launches."
+                 Selected = filled cyan; deselected = hollow grey ring. ~14px, lives inline with
+                 the secondary status text on each row. -->
+            <Style x:Key="SelectionDotStyle" TargetType="ToggleButton">
+                <Setter Property="Width" Value="14" />
+                <Setter Property="Height" Value="14" />
+                <Setter Property="Cursor" Value="Hand" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="Focusable" Value="False" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ToggleButton">
+                            <Grid UseLayoutRounding="True">
+                                <!-- Outer ring (always visible). Rest and hover are two different
+                                     slots on purpose: the literals these replace were two different
+                                     greys, and collapsing both to one would delete the hover
+                                     affordance while looking like a faithful port. InteractiveEdge
+                                     is the semantically closer slot for a control boundary, and it
+                                     is deliberately NOT used — InteractiveEdgeBindingTests keeps the
+                                     derived brush off shape elements, and that fence is tuned tight
+                                     against exactly the "it looks cleaner" edit this would have
+                                     been. Ring contrast is carried by MutedText, which every theme
+                                     already holds legible against its own row. -->
+                                <Ellipse x:Name="Ring"
+                                         Stroke="{DynamicResource MutedTextBrush}" StrokeThickness="1.5"
+                                         Fill="Transparent" />
+                                <!-- Inner fill (visible when checked).
+                                     EXPLICIT SIZE AND CENTRE ALIGNMENT, not Margin. A stretched
+                                     ellipse inset by a margin is centred only if both insets round
+                                     the same way, and at 125% they do not: a 14 DIP slot is 17.5
+                                     device px and a 10 DIP fill is 12.5, so one side takes the odd
+                                     pixel and the dot sits visibly off-centre on a 14px control.
+                                     A fixed size centred in the slot has one rounding decision
+                                     instead of two, and UseLayoutRounding on the Grid keeps it on
+                                     whole device pixels.
+
+                                     6x6 rather than the old 10x10, and the size IS the fix for the
+                                     second half of this: the gap between the ring's inner edge and
+                                     the dot goes from 1.25px to 3.25px. Checked-vs-unchecked used
+                                     to be carried by the resting ring being DARK against a bright
+                                     accent fill — 3.87:1 in brand. Theming the ring to
+                                     MutedText dropped that to 1.37:1, because MutedText is light,
+                                     so a filled dot read as a slightly fatter ring. No shipped slot
+                                     recovers the old separation without going invisible against the
+                                     row (Divider and Navy both land at 1.05-1.33:1 there), so the
+                                     distinction moves to shape, which is what §6.4 credits this
+                                     control for in the first place. -->
+                                <Ellipse x:Name="Fill"
+                                         Width="6" Height="6"
+                                         HorizontalAlignment="Center"
+                                         VerticalAlignment="Center"
+                                         Fill="{DynamicResource CyanBrush}"
+                                         Visibility="Collapsed" />
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsChecked" Value="True">
+                                    <Setter TargetName="Ring" Property="Stroke" Value="{DynamicResource CyanBrush}" />
+                                    <Setter TargetName="Fill" Property="Visibility" Value="Visible" />
+                                </Trigger>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="Ring" Property="Stroke" Value="{DynamicResource WhiteBrush}" />
+                                </Trigger>
+                                <MultiTrigger>
+                                    <MultiTrigger.Conditions>
+                                        <Condition Property="IsChecked" Value="True" />
+                                        <Condition Property="IsMouseOver" Value="True" />
+                                    </MultiTrigger.Conditions>
+                                    <Setter TargetName="Fill" Property="Opacity" Value="0.85" />
+                                </MultiTrigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

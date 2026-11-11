@@ -1,0 +1,126 @@
+---
+title: RORORO
+description: Multi-launcher for Windows. Run multiple Roblox clients side by side, signed in as different saved accounts. A 626 Labs product.
+---
+
+<section class="hero">
+  <p class="hero__eyebrow">A 626 Labs product</p>
+  <h1 class="hero__wordmark">RORORO</h1>
+  <p class="hero__tagline">Multi-launcher for Windows.</p>
+  <p class="hero__lede">Run multiple Roblox clients side by side, signed in as different saved accounts. Free. Open source. Brand-spreads-for-free under 626 Labs.</p>
+  <div class="cta-row">
+    <a href="https://apps.microsoft.com/detail/9NMJCS390KWB" class="btn btn-primary">Install on Microsoft Store</a>
+    <a href="https://github.com/estevanhernandez-stack-ed/ROROROblox/releases/latest/download/rororo-win-Setup.exe" class="btn btn-secondary">Download Setup.exe</a>
+  </div>
+  <p class="hero__meta">Windows 11 · Windows 10 22H2 · .NET 10 LTS · WPF</p>
+  <figure class="hero__shot">
+    <img src="{{ '/screenshots/main.png' | relative_url }}" alt="RORORO main window — saved accounts list with Launch As buttons" />
+  </figure>
+</section>
+
+## What it does
+
+Holds the Roblox singleton mutex so additional clients open instead of stealing focus. Uses Roblox's documented authentication-ticket flow for per-account launches. Encrypts saved cookies with the Windows Data Protection API tied to your Windows user — `accounts.dat` copied to another PC won't decrypt.
+
+Watches memory on long sessions. The Roblox client uses more RAM the longer it runs, and enough clients will eventually fill your PC — that's what closes alt windows overnight. RORORO shows what each client is using, warns before your machine runs out, and gives you one click to close and reopen a heavy account right back into the same game.
+
+No DevTools. No registry edits. No telemetry. The Roblox client launches unmodified.
+
+<!-- Feature list refreshed 2026-09-05 (v1.25.0.0). Keep in step with listing-copy.md's
+     features block — the release playbook's Phase 2 listing audit covers this page too. -->
+
+## What you get
+
+- **One-click multi-instance** — extra clients open instead of focusing the first one.
+- **Encrypted account vault** — cookies DPAPI-encrypted to your Windows user; moving accounts between your own PCs is a deliberate, passphrase-protected export.
+- **Live status per account** — which game it's in, idle for how long, and per-account frame-rate caps that stick.
+- **Memory watchdog + Recycle** — learns what a client really costs in RAM on your machine, warns before you run out, and one click puts a heavy account right back in its server.
+- **Squad Launch + Friend Follow** — same private server, or one public server together.
+- **Join by link** — paste any roblox.com URL; saved games and private servers per account.
+- **Alerts wherever you want them** — desktop, a Discord webhook you create, or your phone through Pushover or ntfy, in any mix per alert: drops, memory warnings, idle accounts, recycle completions, and an every-two-hours all-good mark while your accounts run. You set how often each may repeat, and what it sounds like.
+- **History that keeps score** — most alts at once, total hours, longest session, and per-alt login streaks that only count days the account actually landed in a game.
+- **Themes** — four built in, plus a builder to make your own and share it as a file.
+- **Speaks your language** — the whole app, screens and messages alike, in French, German, Russian, Portuguese (Brazil), Polish, or Spanish. Follows your Windows language, or pick one in Settings and it switches instantly.
+- **Plugin system** — optional plugins run as separate processes and hold no permissions until you grant each one by name.
+- **Start with Windows + Discord Join** — one toggle Windows stays in control of, and Join links that start RoRoRo even when it's closed.
+- **Auto-update that survives Roblox renames** — a signed remote feed tracks the current known-good Roblox version and mutex name.
+
+## See it run
+
+<figure class="video-frame" markdown="0">
+  <video controls preload="metadata" playsinline
+         poster="{{ '/videos/rororo-launch-poster.jpg' | relative_url }}">
+    <source src="{{ '/videos/rororo-launch-16x9.mp4' | relative_url }}" type="video/mp4" />
+  </video>
+  <figcaption>The launch cut — 57 seconds, sound on.</figcaption>
+</figure>
+
+## Install it
+
+**Easiest:** [**install RoRoRo on the Microsoft Store**](https://apps.microsoft.com/detail/9NMJCS390KWB). Signed by Microsoft, no SmartScreen, auto-updates through the Store.
+
+**Clan-direct fallback** (no Microsoft account needed): [download `rororo-win-Setup.exe`](https://github.com/estevanhernandez-stack-ed/ROROROblox/releases/latest/download/rororo-win-Setup.exe). SmartScreen will warn — click **More info** → **Run anyway**. One-time per machine. Future updates roll out automatically.
+
+## Surfaces
+
+<div class="surfaces" markdown="0">
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/welcome.png' | relative_url }}" alt="Welcome to RORORO — three-step onboarding overlay shown on first launch" />
+    <figcaption class="surface-card__caption">
+      <strong>Welcome</strong>
+      <span>Three steps and you're set. Shown on first launch.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/squad-launch.png' | relative_url }}" alt="Squad Launch — pick accounts, fire them at one game" />
+    <figcaption class="surface-card__caption">
+      <strong>Squad launch</strong>
+      <span>Pick a roster, fire them at one game.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/add-game.png' | relative_url }}" alt="Add Game — paste a roblox.com URL, name it, save it" />
+    <figcaption class="surface-card__caption">
+      <strong>Saved games</strong>
+      <span>Paste a Roblox URL, name it, route Launch As at it.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/theme.png' | relative_url }}" alt="Theme builder — palette controls for cyan, magenta, navy, accents" />
+    <figcaption class="surface-card__caption">
+      <strong>Theme builder</strong>
+      <span>Cyan + magenta out of the box. Tune to taste.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/settings.png' | relative_url }}" alt="Settings — startup, tray, multi-instance default" />
+    <figcaption class="surface-card__caption">
+      <strong>Settings</strong>
+      <span>Run on login, default-on multi-instance, tray behavior.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/diagnostics.png' | relative_url }}" alt="Diagnostics — bundle for bug reports" />
+    <figcaption class="surface-card__caption">
+      <strong>Diagnostics</strong>
+      <span>One-click bundle if something goes sideways.</span>
+    </figcaption>
+  </figure>
+  <figure class="surface-card">
+    <img src="{{ '/screenshots/about.png' | relative_url }}" alt="About box — version, build, 626 Labs attribution" />
+    <figcaption class="surface-card__caption">
+      <strong>About</strong>
+      <span>Version, build, attribution. Imagine Something Else.</span>
+    </figcaption>
+  </figure>
+</div>
+
+## Links
+
+- **Source:** [github.com/estevanhernandez-stack-ed/ROROROblox](https://github.com/estevanhernandez-stack-ed/ROROROblox)
+- **Privacy policy:** [PRIVACY](./PRIVACY/)
+- **Report an issue:** [GitHub Issues](https://github.com/estevanhernandez-stack-ed/ROROROblox/issues/new)
+
+<aside class="trademark" markdown="1">
+**Trademark notice.** "Roblox" and the Roblox logo are trademarks of Roblox Corporation. RORORO is an independent third-party tool, **not affiliated with, endorsed by, or sponsored by Roblox Corporation**. The trademarked term is used solely to describe compatibility with the Roblox platform. RORORO launches the official Roblox client unmodified.
+</aside>

@@ -1,0 +1,66 @@
+# Launch video narration — es (Español)
+
+Translated from `launch-video-narration-en.md`. Keys and structure unchanged;
+every VO and OVERLAY value localized. These are speakable lines for the
+multilingual TTS, not listing copy.
+
+**Kept English on purpose:** RoRoRo, Squad Launch, 626 Labs, Microsoft Store,
+Roblox, RAM, Windows, Mac. The brand tagline speaks localized in this language
+(decision 2026-09-08): `Imagina algo diferente.` — Register-consistent with the file's tú voice (escanea, bájalo). The usted alternate « Imagine algo diferente. » was adjudicated 2026-09-08 and rejected: letter-identity is a print argument, and spoken, the register switch is the audible one.
+**Spoken digits:** `626` is voiced as `seis-dos-seis Labs` in the cta line, and
+stays as digits in any OVERLAY.
+
+## Lines
+
+### hook (slide 1)
+- OVERLAY: `8 clientes. 1 PC.`
+- VO: `Son OCHO clientes de Roblox a la vez, en un solo PC. Y la app es gratis.`
+
+### accounts (slide 2)
+- OVERLAY: `guarda una vez. lanza como.`
+- VO: `Guarda todos tus alts y gestiona tus cuentas. Un clic por cuenta, estado en vivo y el juego en el que está cada una.`
+
+### manager (slide 3)
+- OVERLAY: `cada cuenta, de un vistazo`
+- VO: `Ahora cada cuenta muestra sus Robux, su Plus y sus amigos en línea. Abre una, y sus juegos están ahí mismo. Recientes, favoritos, servidores privados.`
+
+### health (slide 4)
+- OVERLAY: `te dice qué está mal`
+- VO: `Y cuando una cuenta te necesita, te lo dice. Sesión caducada, requiere verificación, limitado por Roblox. Un clic para arreglarlo.`
+
+### library (slide 5)
+- OVERLAY: `una biblioteca. elige quién juega`
+- VO: `Cada juego que has jugado llega a la Biblioteca. Búscalo, fíltralo y elige qué cuenta juega.`
+
+### squad (slide 6)
+- OVERLAY: `mismo servidor privado. todas.`
+- VO: `Squad Launch es lo mejor. Un enlace, y cada cuenta aterriza en el MISMO servidor privado, juntas.`
+
+### history (slide 7)
+- OVERLAY: `ahora lleva la cuenta`
+- VO: `¡Y lleva la cuenta! Pico de alts, tiempo total, un ranking con rachas de acceso. Todo se calcula en tu máquina, nada sale.`
+
+### themes (slide 8)
+- OVERLAY: `la IA crea tu tema`
+- VO: `Cuatro temas integrados, y un creador donde una IA diseña el tuyo con la vibra que describas.`
+
+### trust (slide 9)
+- OVERLAY: `tu contraseña nunca la toca`
+- VO: `Tu contraseña nunca toca la app, nunca. Y además, un montón de mejoras. ¡Échale un vistazo a la lista!`
+
+> **Over budget: 115% of the English syllable count (53 vs 46).** This is the densest line in the script — it carries four
+> separate claims (password never touches the app, vault encrypted, memory watchdog,
+> keyboard shortcuts) and this language needs more syllables to say them. It will not
+> come down further without dropping one of the four, which is an editorial call rather
+> than a translation one. Either accept a slightly quicker read on this slide, or say
+> which claim to cut and it comes back inside budget.
+
+### cta (slide 10)
+- OVERLAY: `escanea, abre en tu compu`
+- VO: `Gratis en Microsoft Store, Windows Y Mac. Escanea el código, guarda la página, bájalo en tu compu. RoRoRo, de seis-dos-seis Labs. Imagina algo diferente.`
+
+## Post caption (for localized social posts)
+
+`Ocho clientes de Roblox en un solo PC — gratis. RoRoRo guarda tus alts, los lanza con un clic cada uno, los reúne en el mismo servidor privado y ahora lleva tus estadísticas. Windows + Mac. Busca RORORO. No afiliado a Roblox.`
+
+The not-affiliated sentence is mandatory and is present above.

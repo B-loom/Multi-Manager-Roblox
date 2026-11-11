@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" IgnorableNamespaces="uap rescap desktop uap10">
+    <!-- Identity: production values from the Partner Center reservation for ROROROblox under
+         626 Labs LLC (Store ID 9NMJCS390KWB). Update via scripts/finalize-store-build.ps1 on
+         every release; it patches Name / Publisher / Version / PublisherDisplayName in one
+         shot and validates the inputs before touching the file.
+         Sideload builds (scripts/build-msix.ps1 -Sideload) use this same Publisher: since
+         commit 995e79f (2026-05-14) scripts/generate-dev-cert.ps1 defaults the dev cert's
+         subject to CN=177BCE59-0966-4975-9962-10E36652141F, identical to the Partner Center
+         CN, so sideload and Store packages share an identity (different keys, same subject).
+         Do not repatch Publisher to another CN before a sideload build; against the current
+         dev cert that is exactly what produces signtool 0x8007000b (see the Phase 4
+         correction dated 2026-08-22 in docs/store/release-playbook.md).
+         Version increments on every release submission; align with Velopack release tags. -->
+    <Identity Name="626LabsLLC.RoRoRoBlox" Publisher="CN=177BCE59-0966-4975-9962-10E36652141F" Version="1.36.0.0" ProcessorArchitecture="x64" />
+    <Properties>
+        <DisplayName>RoRoRo</DisplayName>
+        <PublisherDisplayName>626Labs LLC</PublisherDisplayName>
+        <Logo>Package\Logos\StoreLogo.png</Logo>
+        <!-- Description: surfaces in package metadata + Store listing fallback. Trademark
+             disclaimer is required for nominative-use of "Roblox" per Sanduhr Store playbook
+             (10.1.4.4.a). Long-form disclaimer lives in docs/store/listing-copy.md and the
+             privacy policy; this is the abbreviated form that fits the manifest field. -->
+        <Description>Multi-launcher for Windows. Run multiple Roblox clients side by side, signed in as different saved accounts. "Roblox" is a trademark of Roblox Corporation; RoRoRo is an independent third-party tool, not affiliated with Roblox Corporation. A 626 Labs product.</Description>
+    </Properties>
+    <Dependencies>
+        <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19045.0" MaxVersionTested="10.0.26100.0" />
+    </Dependencies>
+    <!-- Declared package languages. The never-lie rule (docs/store/localization-plan.md): a
+         language appears here ONLY when its UI catalog actually ships. en-us is the default
+         (first entry wins). Wave 1 completed 2026-09-07 — each entry has a full
+         Strings.<culture>.resx satellite (483 strings): pt-BR, then fr/de/ru/pl/es. Each further
+         language earns its <Resource> only as its catalog lands. -->
+    <Resources>
+        <Resource Language="en-us" />
+        <Resource Language="pt-BR" />
+        <Resource Language="fr" />
+        <Resource Language="de" />
+        <Resource Language="ru" />
+        <Resource Language="pl" />
+        <Resource Language="es" />
+    </Resources>
+    <Applications>
+        <Application Id="ROROROblox" Executable="ROROROblox.App.exe" EntryPoint="Windows.FullTrustApplication">
+            <uap:VisualElements DisplayName="RoRoRo" Description="Multi-launcher for Windows. Run multiple Roblox clients side by side." BackgroundColor="#0F1F31" Square150x150Logo="Package\Logos\Square150x150Logo.png" Square44x44Logo="Package\Logos\Square44x44Logo.png">
+                <uap:DefaultTile Wide310x150Logo="Package\Logos\Wide310x150Logo.png" Square71x71Logo="Package\Logos\Square71x71Logo.png" Square310x310Logo="Package\Logos\Square310x310Logo.png">
+                    <uap:ShowNameOnTiles>
+                        <uap:ShowOn Tile="square150x150Logo" />
+                        <uap:ShowOn Tile="wide310x150Logo" />
+                        <uap:ShowOn Tile="square310x310Logo" />
+                    </uap:ShowNameOnTiles>
+                </uap:DefaultTile>
+                <uap:SplashScreen Image="Package\Logos\SplashScreen.png" BackgroundColor="#0F1F31" />
+            </uap:VisualElements>
+            <!-- Packaged activation (v1.24.0.0, spec 2026-08-30-packaged-activation-design.md).
+                 A packaged process's registry writes land in the package's virtual hive
+                 (verified live 2026-08-30), so the HKCU Run value and URI-scheme registrations
+                 the unpackaged builds write are invisible to winlogon and Explorer here. These
+                 extensions are the packaged equivalents. StartupTask backs the Settings
+                 run-on-login toggle via Windows.ApplicationModel.StartupTask; Enabled="false"
+                 keeps it opt-in, matching the unpackaged default. The protocols route
+                 cold-start URI activation; Parameters="%1" delivers the URI as a plain argv
+                 token, the exact shape the unpackaged registry command produces, so
+                 JoinUriParser stays the single inbound-URI code path. The discord protocol
+                 mirrors the scheme Lachee's RegisterUriScheme owns on unpackaged installs; its
+                 name must stay in lockstep with Discord:ApplicationId in appsettings.json
+                 (PackagedActivationManifestTests pins both protocols and the task id). -->
+            <Extensions>
+                <desktop:Extension Category="windows.startupTask" Executable="ROROROblox.App.exe" EntryPoint="Windows.FullTrustApplication">
+                    <desktop:StartupTask TaskId="RoRoRo" Enabled="false" DisplayName="RoRoRo" />
+                </desktop:Extension>
+                <uap10:Extension Category="windows.protocol">
+                    <uap10:Protocol Name="roblox-rororo" Parameters="%1" />
+                </uap10:Extension>
+                <uap10:Extension Category="windows.protocol">
+                    <uap10:Protocol Name="discord-1501748116985221272" Parameters="%1" />
+                </uap10:Extension>
+            </Extensions>
+        </Application>
+    </Applications>
+    <Capabilities>
+        <!-- runFullTrust is required for a WPF desktop app that calls Process.Start of the
+             roblox-player: protocol handler. We deliberately omit broadFileSystemAccess;
+             accounts.dat lives in our own LocalAppData folder; no other user-content access. -->
+        <rescap:Capability Name="runFullTrust" />
+    </Capabilities>
+</Package>

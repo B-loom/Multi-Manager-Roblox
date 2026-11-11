@@ -1,0 +1,166 @@
+namespace ROROROblox.Core.Discord;
+
+/// <summary>Where an alert goes. <see cref="None"/> means the trigger is off entirely.</summary>
+public enum AlertDestination
+{
+    None,
+    Local,
+    Mine,
+    Clan,
+
+    /// <summary>The user's phone via a push provider (Pushover/ntfy — see
+    /// <c>ROROROblox.Core.Notify.PhoneNotifyConfig</c>). Appended after Clan: this enum is
+    /// serialized numerically inside discord.dat, so member order is a wire format.</summary>
+    Phone,
+}
+
+/// <summary>
+/// Discord integration settings. Everything defaults off — nothing leaves the machine until the
+/// user turns it on. Webhook URLs are bearer credentials; the store encrypts this whole record
+/// with DPAPI (see <see cref="DiscordConfigStore"/>).
+/// </summary>
+public sealed record DiscordConfig
+{
+    public bool PresenceEnabled { get; init; }
+    public bool JoinEnabled { get; init; }
+    public string? MineWebhookUrl { get; init; }
+    public string? ClanWebhookUrl { get; init; }
+    public AlertDestination DroppedOutDestination { get; init; } = AlertDestination.None;
+    public AlertDestination MemoryWarningDestination { get; init; } = AlertDestination.None;
+
+    /// <summary>
+    /// Multi-destination routing (Este's smoke feedback, 2026-09-05): each alert kind fans out
+    /// to a SET of destinations — desktop AND phone AND a channel is a legitimate answer. The
+    /// singular fields above stay as the rollback mirror: Settings writes them as the set's
+    /// first entry, so an older binary reading only the singular field still routes SOMEWHERE
+    /// instead of silently dropping (the destination-4 hazard the phone spec records).
+    /// Empty list + singular set = a pre-fanout blob; <see cref="DestinationsFor"/> migrates on
+    /// read, so no store rewrite is needed.
+    /// </summary>
+    public IReadOnlyList<AlertDestination> DroppedOutDestinations { get; init; } = [];
+
+    public IReadOnlyList<AlertDestination> MemoryWarningDestinations { get; init; } = [];
+
+    /// <summary>Fan-out sets for the 2026-09-05 kinds. List-only — these kinds postdate the
+    /// singular fields, so there is no legacy value to mirror and nothing for an older binary
+    /// to misroute (it ignores unknown JSON fields and unknown kinds alike).</summary>
+    public IReadOnlyList<AlertDestination> RecycledDestinations { get; init; } = [];
+
+    public IReadOnlyList<AlertDestination> UptimeMarkDestinations { get; init; } = [];
+
+    /// <summary>
+    /// Where an <see cref="AlertKind.AutoRejoinPaused"/> goes (task 10, 2026-09-29; corrected the
+    /// same day — the first pass defaulted this empty, matching <see cref="DroppedOutDestinations"/>,
+    /// which was wrong against spec: a pause "raises a toast and the Discord alert (when alerts are
+    /// on)", and the temporary toast it replaces always showed. Silence until the user finds and
+    /// ticks a checkbox they don't know exists is not that.
+    /// <para>
+    /// Defaults to <c><see cref="AlertDestination.Local"/></c> — <see cref="MetricBreachDestinations"/>'s
+    /// precedent, not <see cref="DroppedOutDestinations"/>'s. Discord stays opt-in (the list starts
+    /// with exactly one entry, the desktop toast); the toast itself is not.
+    /// </para>
+    /// <para>
+    /// THE UPGRADE CASE, pinned the same way <see cref="MetricBreachDestinations"/>'s is: every
+    /// <c>discord.dat</c> written before this field existed has no <c>AutoRejoinPausedDestinations</c>
+    /// key at all, and System.Text.Json constructs through the parameterless constructor and leaves
+    /// an ABSENT property at its initializer — so the default survives that round trip
+    /// (<c>DiscordConfigStoreTests.LoadAsync_AFileWrittenBeforeAutoRejoinPaused_StillGetsTheDesktopDefault</c>
+    /// proves it against a hand-rolled pre-field envelope, the same way the metric one does).
+    /// </para>
+    /// <para>
+    /// THE OTHER HALF OF THAT SAME MECHANISM is what keeps an explicit user choice honest: once
+    /// Settings has saved a config at all, <c>SaveAsync</c> writes EVERY property, so a user who
+    /// unticks all four boxes writes a PRESENT, empty list — not an absent one. System.Text.Json then
+    /// overwrites the initializer with that empty list on the next load, same as it would for any
+    /// other explicit value, and <see cref="DestinationsFor"/> reads it as the real "route nowhere"
+    /// the user asked for rather than silently re-defaulting to <see cref="AlertDestination.Local"/>
+    /// (<c>DiscordConfigStoreTests.SaveThenLoad_ExplicitEmptyAutoRejoinPausedDestinations_...</c>
+    /// pins this half, which the metric kind's own test does not need — nothing ever writes an
+    /// explicit empty list for a kind with no routing checkbox).
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<AlertDestination> AutoRejoinPausedDestinations { get; init; } = [AlertDestination.Local];
+
+    /// <summary>
+    /// Where a <see cref="AlertKind.MetricBreach"/> goes. The one kind that does NOT start empty,
+    /// because it is the one kind with no routing checkbox: Settings paints the fan-out sets for
+    /// the four older kinds only, so nothing in production ever wrote this list. Empty meant the
+    /// host raised a breach, <see cref="AlertRouter"/> resolved it to no destination, and the
+    /// dispatcher logged "routed nowhere" — on every install, forever (whole-branch review R-10,
+    /// 2026-09-11).
+    /// <para>
+    /// Defaulting it to <see cref="AlertDestination.Local"/> cannot surprise anyone, because three
+    /// gates stand in front of it already: <c>MetricAlertsEnabled</c> is false by default, a rules
+    /// file must exist, and a plugin must hold <c>host.metrics.report</c> by the user's own grant.
+    /// Local is also where the router falls back when a chosen destination is unconfigured, so this
+    /// adds no delivery leg that was not already reachable. Discord and phone routing for this kind
+    /// ship through the same metric-alerts routing row in Settings › Alerts as every other
+    /// destination checkbox — no signed manifest was ever needed for that UI, and none is coming
+    /// (dropped 2026-09-11).
+    /// </para>
+    /// The upgrade case is the one worth pinning rather than assuming: every <c>discord.dat</c> on
+    /// disk predates this field, and a defaulted property and a deserialized-absent property are
+    /// not automatically the same thing. System.Text.Json constructs through the parameterless
+    /// constructor and leaves an absent property at its initializer, so the default survives the
+    /// round trip — <c>DiscordConfigStoreTests</c> proves it against a real envelope.
+    /// </summary>
+    public IReadOnlyList<AlertDestination> MetricBreachDestinations { get; init; } = [AlertDestination.Local];
+
+    /// <summary>
+    /// Where an <see cref="AlertKind.AccountIdle"/> goes (v1.33 item 1). Same migration shape as
+    /// <see cref="AutoRejoinPausedDestinations"/>, and the third kind to need it, but the first
+    /// where getting it wrong would TAKE SOMETHING AWAY rather than fail to add it: idle alerts
+    /// have put a tray toast on screen since v1.8, through <c>IdleAlertPresenter</c>, which read
+    /// one mute flag and no destinations at all. Routing them through the dispatcher must not be
+    /// the upgrade that silences them.
+    /// <para>
+    /// So the default is <c><see cref="AlertDestination.Local"/></c> — the notification that
+    /// already exists, now routed like every other kind. Discord and phone stay opt-in (the list
+    /// starts with exactly one entry, the desktop toast).
+    /// </para>
+    /// <para>
+    /// THE UPGRADE CASE: every <c>discord.dat</c> on disk was written before this field existed, so
+    /// it has no <c>IdleDestinations</c> key at all. System.Text.Json constructs through the
+    /// parameterless constructor and leaves an ABSENT property at its initializer, so the default
+    /// survives that round trip
+    /// (<c>DiscordConfigStoreTests.LoadAsync_AFileWrittenBeforeIdleDestinations_StillGetsTheDesktopDefault</c>
+    /// proves it against a hand-rolled pre-field envelope, the same way the pause and metric ones do).
+    /// </para>
+    /// <para>
+    /// THE OTHER HALF matters more for this kind than for either of the other two, because
+    /// something besides a checkbox writes it: the one-time <c>MuteIdleAlerts</c> migration turns an
+    /// existing <c>true</c> into an explicitly empty list here. <c>SaveAsync</c> writes EVERY
+    /// property, so that empty list is PRESENT rather than absent, System.Text.Json overwrites the
+    /// initializer with it, and <see cref="DestinationsFor"/> reads it as the real "route nowhere"
+    /// the user already asked for. Were it to spring back to <see cref="AlertDestination.Local"/>,
+    /// everyone who had muted idle alerts would get them back once per restart, forever
+    /// (<c>DiscordConfigStoreTests.SaveThenLoad_ExplicitEmptyIdleDestinations_RoundTripsAsEmpty</c>).
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<AlertDestination> IdleDestinations { get; init; } = [AlertDestination.Local];
+
+    public IReadOnlyList<Guid> MutedAccountIds { get; init; } = [];
+
+    /// <summary>The effective destination set for a kind — the list when present, else the
+    /// migrated singular field. A method, not a property, so the JSON serializer never sees it.</summary>
+    public IReadOnlyList<AlertDestination> DestinationsFor(AlertKind kind)
+    {
+        var (list, single) = kind switch
+        {
+            AlertKind.AccountDroppedOut => (DroppedOutDestinations, DroppedOutDestination),
+            AlertKind.MemoryWarning => (MemoryWarningDestinations, MemoryWarningDestination),
+            AlertKind.Recycled => (RecycledDestinations, AlertDestination.None),
+            AlertKind.UptimeMark => (UptimeMarkDestinations, AlertDestination.None),
+            AlertKind.MetricBreach => (MetricBreachDestinations, AlertDestination.None),
+            // A recovery follows its breach: anyone who wanted the bad news in a place wants the
+            // good news there too, and a second settings row would be a worse question to ask.
+            AlertKind.MetricRecovered => (MetricBreachDestinations, AlertDestination.None),
+            AlertKind.AutoRejoinPaused => (AutoRejoinPausedDestinations, AlertDestination.None),
+            AlertKind.AccountIdle => (IdleDestinations, AlertDestination.None),
+            _ => ((IReadOnlyList<AlertDestination>)[], AlertDestination.None),
+        };
+
+        if (list.Count > 0) return list;
+        return single == AlertDestination.None ? [] : [single];
+    }
+}

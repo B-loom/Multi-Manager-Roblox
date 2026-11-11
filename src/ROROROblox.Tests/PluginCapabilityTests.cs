@@ -1,0 +1,89 @@
+using ROROROblox.App.Plugins;
+
+namespace ROROROblox.Tests;
+
+public class PluginCapabilityTests
+{
+    [Fact]
+    public void IsKnown_ReturnsTrue_ForDefinedCapability()
+    {
+        Assert.True(PluginCapability.IsKnown("host.events.account-launched"));
+        Assert.True(PluginCapability.IsKnown("host.ui.tray-menu"));
+        Assert.True(PluginCapability.IsKnown("system.synthesize-keyboard-input"));
+        Assert.True(PluginCapability.IsKnown("system.read-screen"));
+    }
+
+    [Fact]
+    public void IsKnown_ReturnsFalse_ForUnknown()
+    {
+        Assert.False(PluginCapability.IsKnown("host.events.bogus"));
+        Assert.False(PluginCapability.IsKnown(""));
+        Assert.False(PluginCapability.IsKnown("not.a.real.capability"));
+    }
+
+    [Fact]
+    public void IsHostEnforced_ReturnsTrue_ForHostNamespace()
+    {
+        Assert.True(PluginCapability.IsHostEnforced("host.events.account-launched"));
+        Assert.True(PluginCapability.IsHostEnforced("host.commands.request-launch"));
+    }
+
+    [Fact]
+    public void IsHostEnforced_ReturnsFalse_ForSystemNamespace()
+    {
+        Assert.False(PluginCapability.IsHostEnforced("system.synthesize-keyboard-input"));
+    }
+
+    [Fact]
+    public void Display_ReturnsHumanReadableExplanation()
+    {
+        var explanation = PluginCapability.Display("host.events.account-launched");
+        Assert.Contains("when an account launches", explanation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Display_ReturnsHumanReadableExplanation_ForReadScreen()
+    {
+        var explanation = PluginCapability.Display("system.read-screen");
+        Assert.Contains("read pixels", explanation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Unknown capability", explanation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void IsKnown_ReturnsTrue_ForNewClanCapabilities()
+    {
+        Assert.True(PluginCapability.IsKnown("host.commands.launch-target"));
+        Assert.True(PluginCapability.IsKnown("host.queries.current-server"));
+    }
+
+    [Fact]
+    public void Display_LaunchTarget_DisclosesTheRisk()
+    {
+        var explanation = PluginCapability.Display("host.commands.launch-target");
+        Assert.Contains("server", explanation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Unknown capability", explanation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AccountActivity_HasCapabilityConstAndDescription()
+    {
+        Assert.Equal("host.queries.account-activity", PluginCapability.HostQueriesAccountActivity);
+        var desc = PluginCapability.Display(PluginCapability.HostQueriesAccountActivity);
+        Assert.False(string.IsNullOrWhiteSpace(desc));
+        Assert.Contains("idle", desc, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Unknown capability", desc, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Accounts_HasCapabilityConstAndDescription()
+    {
+        Assert.Equal("host.queries.accounts", PluginCapability.HostQueriesAccounts);
+        Assert.True(PluginCapability.IsKnown(PluginCapability.HostQueriesAccounts));
+        Assert.True(PluginCapability.IsHostEnforced(PluginCapability.HostQueriesAccounts));
+        var desc = PluginCapability.Display(PluginCapability.HostQueriesAccounts);
+        Assert.False(string.IsNullOrWhiteSpace(desc));
+        // The consent-sheet sentence has to carry the boundary a user cares about.
+        Assert.Contains("cookies", desc, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Unknown capability", desc, StringComparison.OrdinalIgnoreCase);
+    }
+}

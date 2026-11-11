@@ -1,0 +1,573 @@
+# RoRoRo Plugin Author Guide
+
+> **Audience:** developers who want to write a plugin that runs alongside RoRoRo on Windows. **Status:** wire contract `1.0` (introduced with v1.4), `ROROROblox.PluginContract` v0.9.0 on nuget.org. This line read v0.1.0 until 2026-08-30, eight additive minors after that stopped being true. The contract will receive a major bump if it changes incompatibly; minor bumps for additive changes. Every RPC added since 0.1.0 is additive and gated by your manifest's `minHostVersion`, so declare the RoRoRo version that first shipped the newest RPC you call and the installer refuses older hosts for you.
+
+## What a plugin is
+
+A plugin is **a separately distributed Windows EXE** that connects to RoRoRo over a per-user named pipe (`\\.\pipe\rororo-plugin-host`) on RoRoRo's gRPC server, exchanges typed messages, and contributes UI surfaces back to RoRoRo. It is its own product — not bundled into RoRoRo's installer, not auto-fetched, never loaded into RoRoRo's process.
+
+Why this shape: Microsoft Store policy 10.2.2 forbids dynamic inclusion of code that changes the described functionality of a Store-listed app. RoRoRo ships through the Store; plugins ship through GitHub releases. The wall is intentional and load-bearing for RoRoRo's Store eligibility.
+
+## What you need
+
+- **Visual Studio 2022 17.13+ or `dotnet` SDK 10.0+** (any C# IDE works).
+- **Windows 11.** Plugins are .NET on Windows; the Mac sibling (`rororo-mac`) has its own track.
+- **`ROROROblox.PluginContract` NuGet** (v0.1.0+) — pulled into your project. The package ships the `.proto` definitions + generated C# bindings for both the host-side and plugin-side service.
+
+## Project setup
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ROROROblox.PluginContract" Version="0.9.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.70.0" />
+  </ItemGroup>
+</Project>
+```
+
+Reference the contract NuGet, take a dependency on `Grpc.Net.Client` for the wire transport, and you're set.
+
+## Run one copy — the single-instance guard
+
+**Do this before anything else in `Main`.** It is not a nicety, and RoRoRo's own first-party plugin
+shipped without it and produced a bug nobody could diagnose from the symptom.
+
+What happened: a manual launch raced the host's own autostart, so two copies of the plugin started.
+The first took the global hotkeys. The second could not, showed its **full window**, and reported
+*"Not connected to RoRoRo"* with 0 macros and *"Startup failed: Failed to register hotkeys"*. That
+window is indistinguishable from a genuine connection failure — so the user sees a broken plugin and
+a working plugin side by side, and nothing on screen says which is which or why.
+
+Global resources are the trap: hotkeys, ports, named pipes, single-file logs, a lock on a settings
+file. All of them are first-come-first-served, and the loser has no vocabulary for "I lost a race
+with myself".
+
+```csharp
+// VERBATIM ($@), not $. In an ordinary interpolated string `\r` is a carriage return, so
+// "Local\rororo-..." silently becomes a mutex name with a control character in it — which still
+// "works" in the sense that it compiles and never collides, and therefore never guards anything.
+using var single = new Mutex(initiallyOwned: true, $@"Local\rororo-plugin-{PluginId}", out var isFirst);
+if (!isFirst)
+{
+    // Focus the copy that is already running if you can, or exit quietly. Do NOT open a window and
+    // report an error: the host is fine, and saying otherwise sends the user to debug the wrong end.
+    return 0;
+}
+```
+
+The `Local\` prefix scopes the mutex to the user's session, which is what you want — two different
+Windows users each get their own copy. Key it on the plugin id so two DIFFERENT plugins never
+collide.
+
+## Connect — minimal handshake
+
+```csharp
+using System.IO.Pipes;
+using Grpc.Core;
+using Grpc.Net.Client;
+using ROROROblox.PluginContract;
+
+const string PluginId = "yourcompany.your-plugin";
+const string PipeName = "rororo-plugin-host";
+
+using var channel = GrpcChannel.ForAddress("http://pipe", new GrpcChannelOptions
+{
+    HttpHandler = new SocketsHttpHandler
+    {
+        ConnectCallback = async (ctx, ct) =>
+        {
+            var pipe = new NamedPipeClientStream(".", PipeName,
+                PipeDirection.InOut, PipeOptions.Asynchronous);
+            await pipe.ConnectAsync(ct);
+            return pipe;
+        },
+    },
+});
+
+var client = new RoRoRoHost.RoRoRoHostClient(channel);
+
+// REQUIRED on every call: the x-plugin-id header. RoRoRo's CapabilityInterceptor
+// reads this header to identify which plugin is calling and looks up its consent.
+// Calls without this header throw FailedPrecondition on every gated RPC
+// (Subscribe*, RequestLaunch, AddTrayMenuItem/RowBadge/StatusPanel).
+var headers = new Metadata { { "x-plugin-id", PluginId } };
+var callOptions = new CallOptions(headers: headers);
+
+var handshake = await client.HandshakeAsync(new HandshakeRequest
+{
+    PluginId = PluginId,
+    ContractVersion = "1.0",
+}, callOptions);
+
+if (!handshake.Accepted)
+{
+    Console.Error.WriteLine($"Rejected: {handshake.RejectReason}");
+    return;
+}
+
+Console.WriteLine($"Connected to RoRoRo {handshake.HostVersion}.");
+```
+
+The handshake is the FIRST call after the pipe connects. If RoRoRo doesn't recognize your plugin id (you haven't been installed) or rejects your contract version, every subsequent RPC fails. Surface the reject reason — your dev cycle is faster.
+
+**The `x-plugin-id` header is non-negotiable** — every call needs it (handshake included for consistency, gated calls require it). Pass `callOptions` (unary) or `headers` (streaming) on each invocation, or wrap the client in a custom `CallInvoker` that injects it automatically.
+
+## Capability vocabulary
+
+Plugins declare capabilities in their manifest. Each capability falls into one of two namespaces:
+
+### `host.*` — what you ask RoRoRo for
+
+Gated by the gRPC interceptor. If you call a method whose required capability isn't granted, you get `RpcException(StatusCode.PermissionDenied)`.
+
+| Capability | Lets you call |
+|---|---|
+| `host.events.account-launched` | `SubscribeAccountLaunched` (server-streaming) |
+| `host.events.account-exited` | `SubscribeAccountExited` |
+| `host.events.mutex-state-changed` | `SubscribeMutexStateChanged` |
+| `host.commands.request-launch` | `RequestLaunch(accountId)` — ask RoRoRo to launch an alt |
+| `host.commands.launch-target` | `RequestLaunchTarget(accountId, share_url \| follow_user_id)` — launch an account into a *specific* server: a private-server link, a public place, or by following a friend (NuGet 0.2.0+) |
+| `host.queries.current-server` | `GetCurrentServer()` — read the user's most-recently-launched private-server share link (NuGet 0.2.0+) |
+| `host.queries.account-activity` | `GetAccountActivity()` — pull per-account idle time (NuGet 0.3.0+) |
+| `host.queries.accounts` | `GetAccounts()` — all saved accounts: id, Roblox user id, display name, which is main. Never cookies. (NuGet 0.9.0+) |
+| `host.commands.mark-account-active` | `MarkAccountActive(accountId)` — tell RoRoRo an account is still active after you act on its window, so idle warnings don't misfire (NuGet 0.5.0+) |
+| `host.commands.stop-accounts` | `StopAccounts(accountIds)` — close Roblox clients RoRoRo launched. Graceful close, hard kill as fallback. Destructive: unsaved in-game progress is lost (NuGet 0.6.0+). Returns when the stop is *issued*; set `wait_for_exit` (0.13.0+) to return once the clients are gone, with `exited_account_ids` / `still_running_account_ids` saying which |
+| `host.events.memory-pressure` | `SubscribeMemoryPressure` (server-streaming) — memory-watchdog crossings, per tracked account (NuGet 0.7.0+) |
+| `host.metrics.report` | `ReportMetric(subjectId, metricId, value, observedAtUnixMs)` — hand RoRoRo one number you gathered; RoRoRo owns the history, the rules, and the decision to alert (NuGet 0.10.0+) |
+| `host.ui.tray-menu` | `AddTrayMenuItem` — contribute a tray-menu entry |
+| `host.ui.row-badge` | `AddRowBadge` — paint a per-account badge in RoRoRo's main window |
+| `host.ui.status-panel` | `AddStatusPanel` — contribute a status panel pane |
+
+The following need **no capability** — every plugin can call them after handshake:
+`Handshake`, `GetHostInfo`, `GetRunningAccounts`, `UpdateUI`, `RemoveUI`.
+
+`GetHostInfo` returns `version`, `multi_instance_enabled`, `multi_instance_state` and, from NuGet 0.12.0, `install_flavour` (`store`, `sideload` or `dev`), `process_path` and `informational_version` (the version plus a `+commit` suffix). Older hosts leave the three new fields empty.
+
+From NuGet 0.13.0 it also returns `accounts_loaded`: false while RoRoRo is still reading saved accounts at startup. **Do not act on account calls before it is true.** Until then, `GetAccounts` waits up to 10 s and then fails with gRPC `Unavailable` and a message starting `accounts-loading`, and `RequestLaunch` / `RequestLaunchTarget` wait the same and then refuse with `reason_code = "accounts-loading"`. Both are retryable. Neither answers with an empty roster, which is what a 0.12 host did in this window and why an agent once concluded the user had no accounts. A host older than 0.13 leaves the field false; treat a host whose `version` predates 1.35 as loaded.
+
+From NuGet 0.14.0 it also returns `last_exit_reason`, `last_exit_detail` and `last_exit_at_unix_ms`: how the *previous* RoRoRo session ended. Reason is `none` (first run), `clean`, `session-ending` (Windows logoff or shutdown; the detail says which), `crash` (the detail is the exception type, HResult and message, nothing else) or `unknown` (the host was killed, lost power, or was updated without notice). The timestamp is when that record was written, 0 for `none`. Older hosts leave all three empty.
+
+`UpdateUI` and `RemoveUI` are ungated by *capability*, but they are **not unguarded**: they
+only accept a `UIHandle` your plugin created. Passing a handle you don't own — or one that was
+never issued — throws `PermissionDenied`. Both cases return the identical error, so you cannot
+probe which handle ids exist. Handles you removed stop working immediately.
+
+**Absence from this list is not permission.** Any rpc missing from the capability map is
+rejected with `PermissionDenied`, and RoRoRo refuses to start if the map doesn't cover every
+method on the service. There is no "forgot to gate it" path.
+
+### `system.*` — what you do locally on the user's machine
+
+Disclosure-only. RoRoRo can't sandbox your process — you're a separate EXE. `system.*` capabilities are how you tell users honestly what they're consenting to.
+
+| Capability | What it discloses |
+|---|---|
+| `system.synthesize-keyboard-input` | You synthesize keyboard input system-wide |
+| `system.synthesize-mouse-input` | You synthesize mouse input system-wide |
+| `system.watch-global-input` | You read keyboard / mouse globally |
+| `system.prevent-sleep` | You keep the user's PC from sleeping while you run |
+| `system.focus-foreign-windows` | You activate / focus other applications' windows |
+| `system.read-screen` | You capture and read pixels from the user's screen |
+
+Declare every `system.*` capability that matches your behavior. Honest disclosure is the contract — users are reading it on the consent sheet to decide whether to trust you.
+
+## Manifest format
+
+Sit `manifest.json` next to your EXE in the install root (`%LOCALAPPDATA%\ROROROblox\plugins\<plugin-id>\`):
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "yourcompany.your-plugin",
+  "name": "Your Plugin",
+  "version": "0.1.0",
+  "contractVersion": "1.0",
+  "publisher": "Your Company LLC",
+  "description": "One-sentence pitch — shown on the consent sheet.",
+  "capabilities": [
+    "host.events.account-launched",
+    "host.ui.tray-menu",
+    "system.synthesize-keyboard-input"
+  ],
+  "icon": "icon.png",
+  "updateFeed": "https://github.com/yourcompany/your-plugin/releases.atom"
+}
+```
+
+**`id` rules:** reverse-DNS form, lowercase letters / digits / hyphens, at least one dot. Regex: `^[a-z0-9]+(\.[a-z0-9-]+)+$`. RoRoRo rejects anything else at install time.
+
+**`schemaVersion`** is currently `1`. Future versions will bump if the manifest shape changes.
+
+**`contractVersion`** is the gRPC contract version (currently `"1.0"`). RoRoRo's handshake rejects mismatched contract versions cleanly with a clear error.
+
+**`updateFeed`** is optional — point at your GitHub Releases atom feed if you want to wire your own update flow (Velopack on the plugin side is fine).
+
+## Distribution — GitHub release shape
+
+Your release tag is whatever; the three artifacts are fixed:
+
+```
+manifest.json          — your manifest, exactly as above
+manifest.sha256        — single-line lowercase SHA-256 of plugin.zip
+plugin.zip             — your build output (EXE + manifest.json + icon + any deps)
+```
+
+The SHA pin is non-negotiable. RoRoRo's installer fetches `manifest.json` first, then `manifest.sha256`, then `plugin.zip` — and refuses to extract if the actual SHA-256 doesn't match.
+
+The user pastes the **directory URL** (the parent path that contains those three artifacts) into RoRoRo → Plugins → Install. RoRoRo appends `/manifest.json`, `/manifest.sha256`, `/plugin.zip` to the URL. If your release lives at `https://github.com/yourcompany/your-plugin/releases/download/v0.1.0/`, that's the URL.
+
+## Trust + signing recommendation
+
+RoRoRo doesn't enforce Authenticode signing on plugins in v1.4. **You should still sign your EXE.** Reasoning:
+
+- Windows SmartScreen treats unsigned EXEs as suspicious. Even with sideload-via-RoRoRo, a Defender alert on first run hurts your install rate.
+- Any plugin that declares `system.synthesize-keyboard-input` or `system.watch-global-input` will trigger Windows Security heuristics. A signed binary survives the heuristic; an unsigned one gets quarantined.
+- Future RoRoRo versions may allowlist signed publishers. Better to be signed from day one than retrofit later.
+
+626 Labs plugins (auto-keys when it lands) sign with a 626 Labs LLC code-signing cert that's separate from the RoRoRo Store cert. You'll want your own cert (or a 626 Labs LLC cert if you're a 626 Labs plugin author) — don't share keys.
+
+## What you can NOT do (yet)
+
+- **Mutate RoRoRo state** — write to favorites / accounts / session-history stores. Plugins observe + add UI + trigger launches; they cannot edit. Future v2 conversation if the demand surfaces.
+- **Mid-stream consent revocation** — when a user revokes a capability you've already used to subscribe to events, v1.4 doesn't kill the open stream. Your plugin keeps receiving events until you reconnect or RoRoRo restarts. v1.5+ will close the stream within a 5s grace window. Don't depend on stream-cancel-on-revoke for v1.4.
+- **In-process load** — there's no AssemblyLoadContext path. Out-of-process is the only architecture. This is permanent — Store policy 10.2.2 makes the alternative ineligible for the Store.
+- **Bidirectional UI events** — the v1.4 contract has `Plugin.OnUIInteraction` defined in the proto, but RoRoRo doesn't currently push interactions back to plugins. Click handling on plugin-contributed tray items is a stub. v1.5+ work.
+
+## Recipes
+
+### Subscribe to account launches + react
+
+```csharp
+using var stream = client.SubscribeAccountLaunched(new SubscriptionRequest(), headers);
+await foreach (var evt in stream.ResponseStream.ReadAllAsync())
+{
+    Console.WriteLine($"{evt.DisplayName} (uid {evt.RobloxUserId}) launched, pid {evt.ProcessId}");
+    // your react logic here
+}
+```
+
+Streaming RPCs take `Metadata` directly (not `CallOptions`). Pass the same `headers` from the connect example.
+
+The stream stays open as long as the connection is alive. RoRoRo uses bounded channels with `DropOldest` on the host side — if your plugin is too slow to read, you'll silently miss old events while the freshest ones still arrive. Don't sleep inside the consumer loop.
+
+### Add a tray menu item
+
+```csharp
+var handle = await client.AddTrayMenuItemAsync(new MenuItemSpec
+{
+    Label = "Toggle automation",
+    Tooltip = "Pauses or resumes the cycler.",
+    Enabled = true,
+}, callOptions);
+// stash handle.Id if you want to later UpdateUI or RemoveUI it
+```
+
+The handle id is RoRoRo's — opaque to you. Pass it back when you call `UpdateUI` or `RemoveUI`. RoRoRo enforces that only the plugin that added a UI element can update or remove it.
+
+### Ask RoRoRo to launch an account
+
+```csharp
+var result = await client.RequestLaunchAsync(new LaunchRequest
+{
+    AccountId = "00000000-0000-0000-0000-000000000001", // RoRoRo's internal Guid
+}, callOptions);
+if (!result.Ok)
+{
+    Console.Error.WriteLine($"Launch failed: {result.FailureReason}");
+}
+```
+
+Account ids come from `GetRunningAccounts()` (already-running) or via `SubscribeAccountLaunched` events. There's no "list all saved accounts" RPC in v1.4 — by design, plugins shouldn't enumerate the user's full account inventory.
+
+### Squad up — share the server you're in, join the server a clanmate shared
+
+`RequestLaunch` only fires an account's *default* launch. To launch into a **specific** server (NuGet 0.2.0+, capability `host.commands.launch-target`), use `RequestLaunchTarget` — the host resolves any Roblox link form (private-server share URL, `roblox.com/share` token, PlaceLauncher `accessCode` URL, public game URL, bare place id) or follows a friend.
+
+```csharp
+// Inbound — join the exact server a clanmate shared (the share_url came from Discord):
+var result = await client.RequestLaunchTargetAsync(new LaunchTargetRequest
+{
+    AccountId = accountId,
+    ShareUrl = "https://www.roblox.com/games/920587237?privateServerLinkCode=ABC-LINK",
+}, callOptions);
+
+// Or join by following a friend into whatever server they're in:
+var followed = await client.RequestLaunchTargetAsync(new LaunchTargetRequest
+{
+    AccountId = accountId,
+    FollowUserId = 4242, // a Roblox userId; Roblox permission-checks the follow
+}, callOptions);
+```
+
+```csharp
+// Outbound — read the private server YOU most recently launched, to share it
+// (NuGet 0.2.0+, capability host.queries.current-server):
+var current = await client.GetCurrentServerAsync(new Empty(), callOptions);
+if (current.Present)
+{
+    // post current.ShareUrl to your clan's Discord channel, etc.
+}
+```
+
+The host owns all link parsing, cookie handling, and the authenticated launch — your plugin only passes links and account ids around. The plaintext account cookie never leaves RoRoRo. These additions are wire-compatible: `contractVersion` stays `"1.0"`; you only need NuGet `0.2.0`.
+
+### Join one named server (host 0.14.0+)
+
+`RequestLaunchTarget` can also name a single public server. Listing servers is your plugin's job: query Roblox's public `https://games.roblox.com/v1/games/{placeId}/servers/Public` (`sortOrder=Asc` puts the fewest players first; page with `limit` and `cursor`), then pass the place id you queried plus the chosen entry's `id` as `game_instance`.
+
+```csharp
+var joined = await client.RequestLaunchTargetAsync(new LaunchTargetRequest
+{
+    AccountId = accountId,
+    GameInstance = new GameInstance { PlaceId = placeId, GameInstanceId = entry.Id },
+}, callOptions);
+```
+
+- Both halves must come from the same list entry. A half pair or a malformed id is refused with `reason_code = "invalid-target"`; a host older than 0.14.0 refuses the request as having no target.
+- A full server queues, and the launch can take minutes. The host never falls back to matchmaking.
+- Read `GetRunningAccounts` afterwards to see where the account landed. Its `place_id` can be another place in the same universe when a game teleports players.
+
+### Read idle time — drive a keep-active policy without touching the client
+
+`GetAccountActivity()` (NuGet 0.3.0+, capability `host.queries.account-activity`) returns how long each running account has gone without activity. Timestamps only — RoRoRo never reports what a user typed or clicked, only *when* it last saw them do something.
+
+```csharp
+// (NuGet 0.3.0+, capability host.queries.account-activity):
+var activity = await client.GetAccountActivityAsync(new Empty(), callOptions);
+foreach (var item in activity.Items)
+{
+    if (item.SecondsSinceActivity > 900)
+    {
+        // e.g. surface a "been idle 15+ min" badge, or decide whether to nudge the user —
+        // your plugin decides the policy, RoRoRo only reports the clock.
+    }
+}
+```
+
+This capability is consent-gated like every other `host.*` capability — it shows up on the install-time consent sheet with the honest framing above. It is deliberately **read-only telemetry**: RoRoRo doesn't act on your behalf (no auto-relaunch, no auto-input) — that's still your plugin's call, and if it involves synthesizing input, declare the matching `system.*` capability too.
+
+### React to memory pressure — recycle a fat client, then macro back to where it was
+
+Roblox clients leak memory over time — RoRoRo's watchdog samples every tracked account and, when one crosses a threshold (over an absolute cap, or projected to exhaust the machine's RAM), fires a stream item for **every** account it's tracking, not just the one that tripped the crossing (NuGet 0.7.0+, capability `host.events.memory-pressure`).
+
+```csharp
+using var stream = client.SubscribeMemoryPressure(new SubscriptionRequest(), headers);
+await foreach (var snap in stream.ResponseStream.ReadAllAsync())
+{
+    if (!snap.OverCap && !snap.IsTarget) continue; // not the account to act on
+
+    // snap.ReadOk == false means private_bytes is a STALE last-known-good figure, not a
+    // fresh sample — over_cap and is_target are always false in that case too, so the
+    // guard above already filters it out. Never branch on private_bytes alone.
+    Console.WriteLine($"{snap.AccountId} is at {snap.PrivateBytes / 1024 / 1024} MB " +
+        $"({snap.GrowthMbPerHr:F0} MB/hr growth), {snap.MinsToCeiling} min to ceiling.");
+
+    // 1. Recycle: close the fat client (graceful close, hard kill as fallback), and WAIT for it
+    //    to be gone. Without wait_for_exit the call returns as soon as the stop is issued, and a
+    //    relaunch straight after it meets "Account is already running" (or, worse, races a client
+    //    that is still closing). Before NuGet 0.13.0 this example skipped the wait and had that bug.
+    var stopped = await client.StopAccountsAsync(new StopAccountsRequest
+    {
+        AccountIds = { snap.AccountId },
+        WaitForExit = true,   // 0.13.0+; TimeoutMs 0 = 30 s, which covers the 10 s close grace
+    }, callOptions);
+    if (!stopped.ExitedAccountIds.Contains(snap.AccountId)) continue; // failed, or still closing
+
+    // 2. Relaunch — plain default launch, or back into the specific server it was in via
+    //    RequestLaunchTarget if you captured the share URL from GetCurrentServer earlier.
+    var launch = await client.RequestLaunchAsync(new LaunchRequest
+    {
+        AccountId = snap.AccountId,
+    }, callOptions);
+
+    // 3. Macro back to the event spot — your plugin's own automation, not RoRoRo's. This
+    //    is where a portable macro (e.g. RoRoRo Ur Task) drives the freshly-launched
+    //    client from spawn back to wherever the player was standing before the recycle.
+}
+```
+
+`mins_to_ceiling` is `0` when there's no valid projection (not enough observation time yet, flat growth, or a failed system-memory read this tick) — **never** read `0` as "zero minutes left, act now." Gate your reaction on `over_cap` / `is_target`, and treat `mins_to_ceiling` as informational context once you're already acting.
+
+### Report a metric — you gather, RoRoRo decides
+
+`ReportMetric` (NuGet 0.10.0+, declare `host.metrics.report` in your manifest's `capabilities`
+array) lets a plugin hand RoRoRo one number it gathered, for the host to judge against rules the
+user configured. It is consent-gated like every other `host.*` capability — a user can decline it
+on the install sheet — and gated the same way an undeclared capability always is here: absence
+from your manifest is treated exactly like a decline, not like a "probably meant yes."
+
+```csharp
+await client.ReportMetricAsync(new MetricReport
+{
+    SubjectId = accountId,          // a RoRoRo account id — see "Which account?" below
+    MetricId = "run.points",        // yours; RoRoRo never looks inside it
+    Value = 1450,                   // raw, exactly as your source reports it
+    ObservedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+}, callOptions);
+```
+
+The call is fire-and-forget: it always returns `Empty`, whether or not the number you sent produced
+an alert. You cannot ask, and you should not try to guess from your own polling — see "Report on
+your own clock, not the user's" below.
+
+**Which account?** `subject_id` is a RoRoRo account id — the stringified Guid `GetAccounts` and
+`GetRunningAccounts` hand you — not whatever identity your own polling target uses. If you're
+tracking something keyed by an external id, resolve it yourself: call `GetAccounts()` (capability
+`host.queries.accounts`) once, keep a lookup from its `roblox_user_id` to `account_id`, and map
+before you report. RoRoRo doesn't know your external identity and can't do this mapping for you.
+Get it wrong, or don't have a mapping yet, and the report isn't rejected — an id RoRoRo doesn't
+recognise is simply treated as belonging to no account, and the alert still reaches the user
+globally rather than vanishing because a plugin guessed wrong. Leave `subject_id` empty for a
+metric that was never about one account to begin with.
+
+**Send the raw, cumulative number — never a rate.** RoRoRo keeps your last several observations
+per (account, metric id) and derives a rate itself, from the gap between two of them. If you
+compute a rate on your side and send that instead, RoRoRo has no running total to measure a rate
+against, and a Rate rule watching that metric id never sees anything consistent. Report the total
+exactly as your source hands it to you, every time.
+
+This is also where a resetting counter catches authors out. Say `run.points` is cumulative within
+a run and resets to zero when a new run starts:
+
+| Time | You report | What happened |
+| --- | --- | --- |
+| 09:00 | 1200 | cumulative points, this run |
+| 09:05 | 1450 | same run, still climbing |
+| 09:07 | 40 | a new run started; the counter reset |
+
+Don't special-case the reset. Don't report a delta, don't skip the low sample, don't zero your own
+baseline first — just send 40, exactly as observed. RoRoRo sees the value go down and treats that
+window as unmeasurable rather than computing "−1410 points/min," which would read as a
+catastrophic drop that never happened. A Rate rule on this metric goes quiet for one cycle — it
+needs two fresh samples from the new run before it has anything to measure again — while Level and
+Event rules, which only ever look at the latest value, don't notice the reset at all.
+
+**`observed_at_unix_ms` is when you observed the number, in UTC — not when you call
+`ReportMetric`, and not your machine's local wall clock treated as if it were already UTC.** Get
+this wrong and it does not look like a failure. RoRoRo compares your timestamp against its own
+clock and drops anything stamped meaningfully in its future, with a log line naming the metric —
+so a plugin whose local-time mistake runs it *ahead* of UTC sees every report silently refused and
+logged, which at least leaves a trail. A plugin whose local-time mistake runs it *behind* UTC is
+worse, because nothing is dropped and nothing is logged: every report lands, but each one is
+stamped well before RoRoRo's own "now," so it never falls inside the few-minute window a Rate rule
+looks at. The toggle is on, the rules file is fine, reports are visibly arriving — and Rate rules
+on that metric simply never breach, forever, while Level and Event rules on the same metric id
+keep working. From the outside that reads as "this never worked," not "half of this broke,"
+because nothing about it looks broken. Use `DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()`, or
+whatever UTC timestamp your source already gives you — never `DateTime.Now`.
+
+**Report on your own clock, not the user's.** Whether an observation is worth an alert is RoRoRo's
+call, not yours — the cooldown, the coalescing across accounts, and the mute list all live in the
+same router every other alert kind already rides, and a metric breach gets them for free. (A
+metric breach's cooldown is keyed by account and metric id, corrected 2026-09-15; every other
+alert kind's cooldown is per account and kind.) Report at whatever cadence is natural for what you're polling, and call `ReportMetric`
+every time you have a fresh number. Don't throttle, debounce, or skip reports on the theory that
+you're sparing the user's phone — that's RoRoRo's job, and it already does it for four other alert
+kinds. Rate-limiting on the user's behalf only starves the host of samples: fewer reports means
+fewer chances for a Rate rule to ever see two points close enough together to compute anything.
+
+If what you're polling is itself a third-party service, save your restraint for that: respect its
+cache headers and its terms of use, poll it no faster than it actually updates, and let
+`ReportMetric` reflect that cadence rather than inventing a faster one of your own.
+
+## Match the host's theme (contract 0.8.0+)
+
+**Do not read RoRoRo's `settings.json` or its `themes` folder.** That is not a supported
+integration, it will break, and it has already broken once — this section exists because of it.
+
+RoRoRo hands you its active palette over the same channel as everything else. Two calls, because a
+theme is *state* rather than an event: ask for it once when you connect, then subscribe so you
+follow along.
+
+```csharp
+// Paint immediately on connect. Do not wait for a change -- most sessions never
+// touch the theme picker, so a subscribe-only plugin sits on its default forever.
+var palette = await client.GetThemeAsync(new Empty(), headers: headers);
+Apply(palette);
+
+// Then follow. The first item you receive is the current palette again (harmless,
+// and it means a plugin that only subscribes still paints correctly).
+using var call = client.SubscribeThemeChanged(new SubscriptionRequest(), headers: headers);
+while (await call.ResponseStream.MoveNext(ct))
+{
+    Apply(call.ResponseStream.Current);
+}
+```
+
+Neither call needs a capability. A colour cannot hurt anyone, and a user who could decline this
+would be declining your ability to look correct.
+
+### The slots
+
+Every field is `#RRGGBB`. Ten come from the theme's author; the eleventh is derived by the host.
+
+| Field | What it is for |
+| --- | --- |
+| `bg` | Window background, the field everything sits on |
+| `cyan` | Primary accent — selection, focus, the affirmative action |
+| `magenta` | Secondary accent — paired with cyan, never used alone as the only signal |
+| `white` | Primary text |
+| `muted_text` | Secondary text, labels, anything deliberately quieter |
+| `divider` | Hairlines and separators |
+| `row_bg` | List-row and card surfaces, one step up from `bg` |
+| `row_expired_bg` | Row surface for something stale or expired |
+| `row_expired_accent` | The warning accent that goes with it |
+| `navy` | The deep surface. Equal to `bg` in every built-in theme, and free to differ in a user's |
+| `interactive_edge` | Border for interactive controls. **Derived, see below** |
+
+`interactive_edge` is the one you cannot compute yourself. An interactive control's border has to
+clear WCAG 1.4.11's 3:1 against the surface behind it, and an authored `divider` frequently does
+not — every built-in theme included, since `navy` equals `bg` in all of them and a secondary
+button's fill therefore contributes nothing. RoRoRo substitutes a derived value when that happens,
+and whether it substitutes depends on whether the theme is built in and on an answer the theme's
+author may have given. Use what arrives; do not try to re-derive it.
+
+Nothing else travels. No fonts, no metrics, no layout, and no theme name or id — deliberately. An
+id would need looking up, and the only place to look it up is inside RoRoRo, which is the whole
+problem this replaced.
+
+### Applying it in WPF
+
+Replace the brush instance, do not mutate its `Color`. `{DynamicResource}` consumers re-bind when a
+dictionary entry changes and ignore mutations to a held brush, and a BAML-loaded brush can come
+back frozen:
+
+```csharp
+var brush = new SolidColorBrush(color);
+brush.Freeze();
+Application.Current.Resources["BgBrush"] = brush;   // replacement, not mutation
+```
+
+### If RoRoRo is old, or not running
+
+Declare `minHostVersion` in your manifest as the RoRoRo version that ships the feed. The installer
+refuses to install you onto an older host and tells the user to update, so you never have to probe
+for support at runtime.
+
+Handle the calls failing anyway — RoRoRo not running is a normal state, and a plugin should stay
+usable when it is. Log it, keep your own default palette, and carry on. **A theming failure must
+never take a plugin down.**
+
+## Versioning policy (provisional)
+
+- `ROROROblox.PluginContract` follows semver. Breaking changes to method signatures or message shapes bump the major.
+- New capabilities (additive) bump the minor.
+- RoRoRo's host-side handshake check rejects `contractVersion` mismatches strictly — there is no auto-negotiation in v1.4.
+- **The NuGet package version and the wire `contractVersion` are different numbers.** Package 0.8.0 added the theme feed while the wire version stayed `"1.0"` — that is exactly why it broke no existing plugin. Bump your package reference freely; the handshake string only moves on a genuinely breaking change.
+- The contract version is independent from RoRoRo's app version. RoRoRo 1.4 ships contract 1.0; RoRoRo 1.5 might still ship contract 1.0, or might bump to 1.1 — track the NuGet version, not the app version.
+
+## Where to ask
+
+- **Issues / feature asks:** open an issue at [github.com/estevanhernandez-stack-ed/ROROROblox](https://github.com/estevanhernandez-stack-ed/ROROROblox).
+- **Reference implementation:** the auto-keys plugin (lands in `rororo-autokeys-plugin` in a follow-up sprint) is the canonical first example. Check there once it ships.
+- **Security disclosures:** see RoRoRo's main repo's security policy. Plugin-side bugs that affect host-process security are taken seriously even though plugins are sideload-only.
+
+---
+
+**A 626 Labs product · *Imagine Something Else*.**

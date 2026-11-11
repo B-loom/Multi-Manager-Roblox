@@ -1,0 +1,3686 @@
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Linq;
+using System.Windows.Threading;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using ROROROblox.App.AppLifecycle;
+using ROROROblox.App.CookieCapture;
+using ROROROblox.App.Discord;
+using ROROROblox.App.Discord.Internal;
+using ROROROblox.App.Localization;
+using ROROROblox.App.Logging;
+using ROROROblox.App.Startup;
+using ROROROblox.App.Theming;
+using ROROROblox.App.Tray;
+using ROROROblox.App.Updates;
+using ROROROblox.App.ViewModels;
+using ROROROblox.Core;
+using ROROROblox.Core.Diagnostics;
+using ROROROblox.Core.Discord;
+using ROROROblox.Core.Theming;
+
+namespace ROROROblox.App;
+
+public partial class App : Application
+{
+    private SingleInstanceGuard? _singleInstance;
+    private ServiceProvider? _services;
+    private ILoggerFactory? _loggerFactory;
+    private ROROROblox.Core.Diagnostics.LastExitRecorder? _lastExit; // #246, begun in OnStartup
+    private ILogger<App>? _log;
+
+    /// <summary>
+    /// Owns the guarded parse-and-raise for both inbound-join paths (cold start + relay). See
+    /// <see cref="InboundJoinRelay"/>'s remarks for why the guard lives there and not inline here.
+    /// </summary>
+    private InboundJoinRelay? _joinRelay;
+    /// <summary>F-103. Adopts clients Roblox restarts for itself; see OrphanedClientSweeper.</summary>
+    private Tray.OrphanedClientSweeper? _orphanSweeper;
+
+    /// <summary>#222. Ends idle tray clients that outlive a launch; its own 30 s timer, see IdleTrayClientSweeper.</summary>
+    private Tray.IdleTrayClientSweeper? _idleTraySweeper;
+
+    /// <summary>
+    /// The plugin-host listener's bind task, set by <see cref="StartPluginHostListener"/> and
+    /// awaited by <see cref="StartPluginAutostart"/>. Null when the host failed to start, in
+    /// which case autostart is skipped: a plugin process that can't reach the pipe would fail
+    /// its first handshake anyway.
+    /// </summary>
+    private Task? _pluginHostListening;
+
+    /// <summary>
+    /// The metric-alert opt-in, cached. The authority is
+    /// <see cref="IAppSettings.GetMetricAlertsEnabledAsync"/>; this is a copy of its last read.
+    ///
+    /// <para><b>Why a cached field rather than the setting itself.</b> The reader is
+    /// <c>MetricReportSinkAdapter</c>'s gate, which runs synchronously on a gRPC handler thread
+    /// once per reported number. The accessor waits on a semaphore and then reads and parses a
+    /// file; blocking a handler thread on that — <c>.Result</c>, <c>GetAwaiter().GetResult()</c> —
+    /// is a deadlock waiting for a busy disk, and it would pay a file read per report besides.</para>
+    ///
+    /// <para><c>volatile</c> because the writers (a startup continuation, the view model's 30s
+    /// tick, and since 2026-09-11 the Settings toggle's nudge) and the reader (a gRPC handler
+    /// thread) never share one. A bool write is already atomic; what <c>volatile</c> buys is that
+    /// the reader sees it promptly rather than out of a register.</para>
+    ///
+    /// <para>Static because <see cref="ConfigureServices"/> is, and the gate closure is built
+    /// there. Seeded by <see cref="WireAlertsAsync"/>; false until then, which drops reports that
+    /// arrive during startup — the safe direction, and cheap: a false gate returns before the
+    /// rules are read, so nothing consumes a cooldown that a real alert would have wanted.</para>
+    ///
+    /// <para><b>Written only through the three methods below</b>, never assigned directly, because
+    /// two of its writers can be in flight at once — see <see cref="MetricAlertsGateLock"/>.</para>
+    /// </summary>
+    private static volatile bool MetricAlertsEnabled;
+
+    /// <summary>
+    /// The resolved alert cadence (v1.33), cached for the same reason
+    /// <see cref="MetricAlertsEnabled"/> is: the dispatcher reads it on every dispatch, and some of
+    /// those dispatches arrive on a thread-pool timer thread that must not wait on a settings file.
+    ///
+    /// <para><c>volatile</c> on a reference, and <see cref="Discord.AlertCadence"/> is immutable, so
+    /// a reader sees either the old cadence or the new one and never a half-built map.</para>
+    ///
+    /// <para><b>TWO WRITERS AS OF ITEM 6, and so a generation counter like the metric gate's.</b>
+    /// Items 2 wrote "ONE writer (the refresh below), no nudge path... The page that will nudge it
+    /// lands with the Settings section (item 6)", and it has: the cadence pickers call
+    /// <see cref="SetAlertCadence"/> the moment they save. That is exactly the interleaving
+    /// <see cref="MetricAlertsGateLock"/> describes — a tick that read before the user's change
+    /// committing its stale value after it — so this is now written only through
+    /// <see cref="SetAlertCadence"/> and <see cref="TryCommitAlertCadence"/>, never assigned
+    /// directly. The losing direction matters less here than for the gate (a stale pace is 30
+    /// seconds of the wrong pace, not 30 seconds of unwanted alerts), but the fix costs the same
+    /// and the failure is just as invisible.</para>
+    ///
+    /// <para>Defaults to the shipped five minutes rather than to nothing, so an alert raised during
+    /// startup — before the first read completes — is paced exactly as it was through v1.32.</para>
+    /// </summary>
+    private static volatile ROROROblox.Core.Discord.AlertCadence AlertCadenceSetting =
+        ROROROblox.Core.Discord.AlertCadence.Default;
+
+    /// <summary>
+    /// What a desktop alert sounds like (v1.33 item 5), cached for the same reason
+    /// <see cref="AlertCadenceSetting"/> is: it is read on the balloon's show path, which is
+    /// reached from a thread-pool timer thread and must not wait on a settings file.
+    ///
+    /// <para><c>volatile</c>, and an enum is a single word, so a reader sees either the old mode or
+    /// the new one.</para>
+    ///
+    /// <para><b>TWO WRITERS AS OF ITEM 6, with a generation counter of its own.</b> Item 5 wrote
+    /// "if it nudges this as well as the cadence then BOTH want the counter that item 6's checklist
+    /// already owes the cadence." The page nudges both, so both have one. The counter is SEPARATE
+    /// from the cadence's rather than shared: a cadence save says nothing about the sound, and one
+    /// shared bump would make every save drop an in-flight read of the other setting — a fix that
+    /// manufactures the staleness it exists to prevent (<c>AlertCadenceSoundGateTests</c> pins
+    /// that). The direction of the loss is the sharp part here: a stale commit puts a noise back
+    /// after an explicit request for quiet.</para>
+    ///
+    /// <para>Defaults to the shipped chime rather than to silence. An alert raised during startup —
+    /// before the first read completes — makes the noise the user expects, and more to the point a
+    /// refresh that never runs leaves alerts audible rather than mute. Silence is how this feature
+    /// fails invisibly, so no default and no fallback anywhere in it points that way.</para>
+    /// </summary>
+    private static volatile ROROROblox.Core.Discord.AlertSound AlertSoundSetting =
+        ROROROblox.Core.Discord.AlertSoundSetting.Default;
+
+    /// <summary>
+    /// Serialises the two writers of <see cref="MetricAlertsEnabled"/> against each other, and
+    /// nothing else.
+    ///
+    /// <para><b>What it prevents.</b> The 30s tick reads the setting asynchronously; the Settings
+    /// toggle writes the setting and then nudges the gate. Interleaved, the tick could read
+    /// <c>true</c>, release the settings semaphore, be overtaken by a user unticking the box — the
+    /// write persisting <c>false</c> and nudging the gate to <c>false</c> — and then resume and
+    /// assign its stale <c>true</c>. Metric breaches would keep reaching Discord and the phone for
+    /// up to 30 seconds after an explicit opt-out (final whole-branch review, 2026-09-11). Before
+    /// the toggle existed the tick was the only writer and the interleaving had nobody to lose to.
+    /// </para>
+    ///
+    /// <para><b>What it is not.</b> It is never taken on the report path — the gate closure reads
+    /// the volatile bool with no lock at all — and it is never held across an <c>await</c>. The
+    /// settings read happens outside it, which is the whole reason the generation below exists
+    /// rather than a lock spanning the read: that path must not block.</para>
+    /// </summary>
+    private static readonly object MetricAlertsGateLock = new();
+
+    /// <summary>
+    /// Bumped by every <see cref="SetMetricAlertsGate"/> call.
+    /// <see cref="RefreshMetricAlertsGateAsync"/> captures it before its read begins and hands it
+    /// back to <see cref="TryCommitMetricAlertsGate"/>, which refuses a value whose read started
+    /// before a nudge landed. Guarded by <see cref="MetricAlertsGateLock"/>, so the compare and the
+    /// assignment are one step rather than two a nudge can slip between.
+    /// </summary>
+    private static int MetricAlertsGateGeneration;
+
+    /// <summary>
+    /// Tells the running gate the opt-in changed, for callers that have just written it.
+    /// <see cref="Preferences.SettingsPage"/>'s metric-alerts toggle is the only one.
+    ///
+    /// <para><b>Why this exists at all.</b> <see cref="RefreshMetricAlertsGateAsync"/> picks the
+    /// setting up on the view model's 30s tick, and only while a rules file exists. So a user who
+    /// ticks the box and reports a number straight away waits up to 30 seconds — and if they have
+    /// not written <c>metric-rules.json</c> yet, the tick returns before the read and the gate
+    /// never moves at all. That second case is the one that matters: writing the rules file and
+    /// ticking the box in either order would leave the feature off until the next tick after both
+    /// exist, which reads as "I turned it on and nothing happened."</para>
+    ///
+    /// <para>A method rather than an <c>internal</c> field so the write stays in one place and the
+    /// reasoning above has somewhere to live. It sets the CACHE, never the setting — the caller has
+    /// already written <c>settings.json</c> through <see cref="IAppSettings"/>, and calling this
+    /// without that write would give the gate an opinion the file does not share, which the next
+    /// tick would silently overturn.</para>
+    ///
+    /// <para><b>The nudge outranks the tick, and the generation bump is what says so.</b> Bumping
+    /// and assigning under the same lock means a tick whose read began before this call can no
+    /// longer commit — see <see cref="MetricAlertsGateLock"/> for the interleaving that made this
+    /// necessary. The bump happens whatever the value, including a nudge that writes what the gate
+    /// already held: an in-flight read is stale either way.</para>
+    /// </summary>
+    internal static void SetMetricAlertsGate(bool enabled)
+    {
+        lock (MetricAlertsGateLock)
+        {
+            MetricAlertsGateGeneration++;
+            MetricAlertsEnabled = enabled;
+        }
+    }
+
+    /// <summary>
+    /// The generation as of now, to be handed back to <see cref="TryCommitMetricAlertsGate"/>.
+    /// Captured immediately before a read of the setting starts: everything between this call and
+    /// the commit is the window a nudge is allowed to win.
+    /// </summary>
+    internal static int BeginMetricAlertsGateRead()
+    {
+        lock (MetricAlertsGateLock) return MetricAlertsGateGeneration;
+    }
+
+    /// <summary>
+    /// Assigns the gate only if no <see cref="SetMetricAlertsGate"/> landed since
+    /// <paramref name="generation"/> was taken. Returns <c>false</c> when one did, in which case
+    /// this value is stale by definition and the nudge's stands — an opt-out the user just made
+    /// must not be undone by a read that started before they made it.
+    /// </summary>
+    internal static bool TryCommitMetricAlertsGate(int generation, bool enabled)
+    {
+        lock (MetricAlertsGateLock)
+        {
+            if (MetricAlertsGateGeneration != generation) return false;
+            MetricAlertsEnabled = enabled;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The gate as <c>MetricReportSinkAdapter</c>'s closure sees it. Exists so the ordering above
+    /// is assertable — production reads it through the closure <see cref="ConfigureServices"/>
+    /// builds, never through this.
+    /// </summary>
+    internal static bool MetricAlertsGateForTests => MetricAlertsEnabled;
+
+    /// <summary>
+    /// Serialises the two writers of <see cref="AlertCadenceSetting"/>, and nothing else. Same
+    /// shape, same reasoning and same limits as <see cref="MetricAlertsGateLock"/>: never taken on
+    /// the dispatch path (the dispatcher's provider reads the volatile reference with no lock), and
+    /// never held across an <c>await</c>.
+    /// <para>
+    /// A SECOND lock rather than reusing the gate's. The two settings are unrelated, and sharing
+    /// one lock would also tempt sharing one generation — which would make a cadence save drop an
+    /// in-flight sound read.
+    /// </para>
+    /// </summary>
+    private static readonly object AlertCadenceLock = new();
+
+    /// <summary>Bumped by every <see cref="SetAlertCadence"/> call. See
+    /// <see cref="MetricAlertsGateGeneration"/> for the mechanism.</summary>
+    private static int AlertCadenceGeneration;
+
+    /// <summary>
+    /// Serialises the two writers of <see cref="AlertSoundSetting"/>. Separate from
+    /// <see cref="AlertCadenceLock"/> for the reason that field's doc comment gives.
+    /// </summary>
+    private static readonly object AlertSoundLock = new();
+
+    /// <summary>Bumped by every <see cref="SetAlertSound"/> call.</summary>
+    private static int AlertSoundGeneration;
+
+    /// <summary>
+    /// Tells the running dispatcher the cadence changed, for callers that have just written it.
+    /// <see cref="Preferences.SettingsPage"/>'s cadence pickers are the only ones.
+    ///
+    /// <para><b>Why this exists at all.</b> <see cref="RefreshAlertCadenceAsync"/> picks the
+    /// setting up on the view model's 30s tick, so a user who sets "every time" and then forces a
+    /// crossing waits up to 30 seconds to see it take — and "I changed it and nothing happened" is
+    /// the exact complaint this cycle exists to answer. Unlike the metric gate there is no
+    /// file-existence shortcut to fall foul of, so the nudge buys promptness rather than rescuing
+    /// a path that never ran.</para>
+    ///
+    /// <para>It sets the CACHE, never the setting — the caller has already written
+    /// <c>settings.json</c> through <see cref="IAppSettings"/>. Calling this without that write
+    /// would give the dispatcher an opinion the file does not share, which the next tick would
+    /// silently overturn.</para>
+    ///
+    /// <para><b>The nudge outranks the tick, and the bump is what says so</b>, unconditionally —
+    /// including a nudge that writes what the cache already held, because an in-flight read is
+    /// stale either way.</para>
+    /// </summary>
+    internal static void SetAlertCadence(ROROROblox.Core.Discord.AlertCadence cadence)
+    {
+        lock (AlertCadenceLock)
+        {
+            AlertCadenceGeneration++;
+            AlertCadenceSetting = cadence;
+        }
+    }
+
+    /// <summary>
+    /// The generation as of now, to be handed back to <see cref="TryCommitAlertCadence"/>.
+    /// Captured immediately before a read of the settings starts.
+    /// </summary>
+    internal static int BeginAlertCadenceRead()
+    {
+        lock (AlertCadenceLock) return AlertCadenceGeneration;
+    }
+
+    /// <summary>
+    /// Assigns the cadence only if no <see cref="SetAlertCadence"/> landed since
+    /// <paramref name="generation"/> was taken. Returns <c>false</c> when one did, in which case
+    /// this value is stale by definition and the nudge's stands.
+    /// </summary>
+    internal static bool TryCommitAlertCadence(int generation, ROROROblox.Core.Discord.AlertCadence cadence)
+    {
+        lock (AlertCadenceLock)
+        {
+            if (AlertCadenceGeneration != generation) return false;
+            AlertCadenceSetting = cadence;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The cadence as <c>AlertDispatcher</c>'s provider sees it. Exists so the ordering above is
+    /// assertable — production reads it through the closure <see cref="ConfigureServices"/> builds.
+    /// </summary>
+    internal static ROROROblox.Core.Discord.AlertCadence AlertCadenceForTests => AlertCadenceSetting;
+
+    /// <summary>
+    /// Tells the running sound player the mode changed. <see cref="Preferences.SettingsPage"/>'s
+    /// sound picker is the only caller, and the reasoning is <see cref="SetAlertCadence"/>'s —
+    /// with one difference worth naming: the stale direction here can be a noise after an explicit
+    /// request for silence, which is a worse thirty seconds than the wrong pace.
+    /// </summary>
+    internal static void SetAlertSound(ROROROblox.Core.Discord.AlertSound sound)
+    {
+        lock (AlertSoundLock)
+        {
+            AlertSoundGeneration++;
+            AlertSoundSetting = sound;
+        }
+    }
+
+    /// <summary>The generation as of now, for <see cref="TryCommitAlertSound"/>.</summary>
+    internal static int BeginAlertSoundRead()
+    {
+        lock (AlertSoundLock) return AlertSoundGeneration;
+    }
+
+    /// <summary>
+    /// Assigns the sound only if no <see cref="SetAlertSound"/> landed since
+    /// <paramref name="generation"/> was taken.
+    /// </summary>
+    internal static bool TryCommitAlertSound(int generation, ROROROblox.Core.Discord.AlertSound sound)
+    {
+        lock (AlertSoundLock)
+        {
+            if (AlertSoundGeneration != generation) return false;
+            AlertSoundSetting = sound;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The mode as <c>AlertSoundPlayer</c>'s provider sees it. Exists so the ordering above is
+    /// assertable — production reads it through the closure <see cref="ConfigureServices"/> builds.
+    /// </summary>
+    internal static ROROROblox.Core.Discord.AlertSound AlertSoundForTests => AlertSoundSetting;
+
+    /// <summary>
+    /// Where <c>LocalFileMetricRuleSource</c> reads its rules —
+    /// <c>%LOCALAPPDATA%\ROROROblox\metric-rules.json</c>, derived from the settings file rather
+    /// than rebuilt from a literal folder name so it follows <c>settings.json</c> if the app's
+    /// data location moves again.
+    /// <para>
+    /// A property rather than a string inside the registration because
+    /// <see cref="RefreshMetricAlertsGateAsync"/> needs the same path, and two expressions for one
+    /// file is how they drift apart. Recomputed per call and never cached: it is two string
+    /// operations over an environment folder, and nothing on either caller's path is hot.
+    /// </para>
+    /// </summary>
+    private static string MetricRulesPath => System.IO.Path.Combine(
+        System.IO.Path.GetDirectoryName(ROROROblox.Core.AppSettings.DefaultPath())!,
+        "metric-rules.json");
+
+    /// <summary>
+    /// True after the user explicitly Quits via the tray menu. MainWindow's Closing handler
+    /// (item 9) checks this to decide between "minimize to tray" and "actually exit."
+    /// </summary>
+    public static bool IsShuttingDown { get; private set; }
+
+    /// <summary>
+    /// Raised when a Discord Join lands via the <c>roblox-rororo:</c> URI scheme — either this
+    /// process was cold-started with the URI as an argument (Discord launched us fresh), or a
+    /// second instance relayed one through <see cref="SingleInstanceGuard.JoinUriReceived"/>
+    /// (we were already running). Distinct from <see cref="Discord.DiscordPresenceService.JoinRequested"/>,
+    /// which covers Discord's in-client IPC Join button while connected; this event is the OS
+    /// protocol-handler path Discord falls back to. Always raised on the UI thread. Task 8 owns
+    /// what happens next (server-instance targeting + the private-server warning) — this task's
+    /// job ends at handing over a decoded <see cref="LaunchTarget"/>.
+    /// <para>
+    /// Forwarded from <see cref="InboundJoinRelay.JoinRequested"/> — every raise of this event,
+    /// including whatever a subscriber does with it, runs inside that relay's try/catch. A
+    /// subscriber throwing here cannot escape and cannot wedge the single-instance pipe listener.
+    /// </para>
+    /// <para>
+    /// FIX 9 (final whole-branch review, 2026-08-03): <c>internal</c>, not <c>public</c> — the one
+    /// raise site is the forwarding subscription in <see cref="OnStartup"/>
+    /// (<c>_joinRelay.JoinRequested += (_, target) =&gt; JoinRequested?.Invoke(this, target);</c>).
+    /// Keeping it internal makes "every raise funnels through <see cref="InboundJoinRelay"/>'s
+    /// exception boundary" a compiler-checked property rather than a convention a future direct
+    /// raise from outside this assembly could quietly bypass.
+    /// </para>
+    /// </summary>
+    internal event EventHandler<LaunchTarget>? JoinRequested;
+
+    /// <summary>
+    /// Set by the render harness before it constructs this class, so <see cref="OnStartup"/> does
+    /// nothing (F-105).
+    /// <para>
+    /// <b>THIS IS THE ROOT CAUSE OF F-105, and it is not what anyone thought.</b>
+    /// <c>WindowRenderHost</c> builds the REAL <c>App</c> to get App.xaml's converters and styles,
+    /// and its comment said "`new App()` does not start anything — only Run() raises OnStartup".
+    /// That is false: with a dispatcher pumping on that thread, startup runs. Proven from the app's
+    /// own log file, written by the TEST HOST during a render run — "ROROROblox starting", then
+    /// "Another instance is running; signaling and exiting", then "ROROROblox exiting (code 0)".
+    /// </para>
+    /// <para>
+    /// So every render run executed real startup. With a RoRoRo instance up, the single-instance
+    /// guard found the mutex held and called <c>Shutdown(0)</c> — tearing the Application down
+    /// underneath the renders in flight. The famous
+    /// <c>NotSupportedException: The URI prefix is not recognized</c> is what pack-URI resolution
+    /// does against a disposed Application. It is a symptom, and four probes chased it as a cause.
+    /// </para>
+    /// <para>
+    /// A field rather than an environment variable: this must be impossible to switch on by
+    /// accident on a user's machine, and a static that only the harness can set cannot leak.
+    /// </para>
+    /// </summary>
+    internal static bool SuppressStartupForRenderHarness { get; set; }
+
+    protected override async void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+
+        // The render harness wants App.xaml's resources and none of the app's behaviour. Returning
+        // here is what makes "construct the real App" mean only that — no logging to the user's real
+        // log file, no plugin processes started, no update check, and no single-instance decision.
+        if (SuppressStartupForRenderHarness)
+        {
+            return;
+        }
+
+        // Configure logging FIRST — every other failure mode below benefits from a written record.
+        var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+        _loggerFactory = AppLogging.Configure(version);
+        _log = _loggerFactory.CreateLogger<App>();
+        WireGlobalExceptionHandlers();
+
+        // Force dark Win11 immersive title bar chrome on every plain Window created in this
+        // process (Diagnostics, Settings, About, modals, etc.). MainWindow uses FluentWindow
+        // and is unaffected. One-time class handler — covers windows opened later too.
+        WindowTheming.RegisterGlobalDarkTitleBar();
+
+        _log.LogInformation("ROROROblox starting (v{Version}, OS {Os})", version, Environment.OSVersion);
+
+        // Guarded parse-and-raise for inbound joins (see InboundJoinRelay's remarks). Wire the
+        // forwarding subscription now, before either call site below can fire: it runs INSIDE
+        // the relay's try/catch, so a throwing App.JoinRequested subscriber is caught here too,
+        // not just a bad parse.
+        _joinRelay = new InboundJoinRelay(_log);
+        _joinRelay.JoinRequested += (_, target) => JoinRequested?.Invoke(this, target);
+
+        // Discord Join, inbound half: if this process was launched with a roblox-rororo://join/
+        // URI (Discord handed it to us via the registered protocol handler), pull the raw arg out
+        // now so it can be relayed to an already-running instance below, or turned into a
+        // LaunchTarget once we know we're the primary instance.
+        var joinArg = e.Args.FirstOrDefault(a =>
+            a is not null && a.StartsWith($"{JoinUriScheme.SchemeName}://join/", StringComparison.OrdinalIgnoreCase));
+
+        _singleInstance = new SingleInstanceGuard("ROROROblox-app-singleton", _log);
+        if (!_singleInstance.AcquireOrSignalExisting(joinArg))
+        {
+            _log.LogInformation("Another instance is running; signaling and exiting.");
+            Shutdown(0);
+            return;
+        }
+
+        // FIX 6 (final whole-branch review, 2026-08-03): read the application id BEFORE deciding
+        // whether to register the URI scheme, not after — a dark build (no Discord:ApplicationId
+        // configured, the default) has no way to ever accept a join, so registering a live
+        // roblox-rororo: entry point in HKCU for it is a needless local attack surface for a
+        // feature that cannot run. WireDiscordPresenceAsync reuses this same value below rather
+        // than re-reading the file a second time.
+        var discordApplicationId = ReadDiscordApplicationId();
+
+        // Register the roblox-rororo: URI scheme (HKCU, no elevation) before anything Discord-
+        // related can run. Two things that look optional and are not: the registry command value
+        // must end in "%1" or Windows launches us with no argument at all and every inbound join
+        // silently does nothing (a May-branch regression); and Discord refuses to accept a
+        // presence carrying join secrets unless the scheme is registered first, so this has to
+        // land before Task 9's SetPresence — which is why it runs this early, before any other
+        // startup work. A registration failure must not block a normal Roblox-launching session.
+        if (string.IsNullOrWhiteSpace(discordApplicationId))
+        {
+            _log.LogDebug("Discord:ApplicationId is empty; skipping join URI scheme registration — the feature can't run in this build.");
+        }
+        else if (new Distribution.Win32DistributionMode().IsPackaged)
+        {
+            // Packaged installs (Store + sideload): the manifest's uap10:Protocol entries own
+            // roblox-rororo and Discord's launch scheme, delivering the URI as argv via
+            // Parameters="%1". A registry write here would only land in the package's virtual
+            // hive, which Explorer never reads (verified live 2026-08-30; spec
+            // docs/superpowers/specs/2026-08-30-packaged-activation-design.md).
+            _log.LogDebug("Packaged install: join URI schemes are declared in the manifest; skipping registry registration.");
+        }
+        else
+        {
+            try
+            {
+                var exePath = Environment.ProcessPath;
+                if (exePath is not null)
+                {
+                    JoinUriScheme.Register(exePath);
+                }
+                else
+                {
+                    _log.LogDebug("Environment.ProcessPath was null; skipped Discord join URI scheme registration.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Discord join URI scheme registration failed; inbound Join clicks won't reach Multi Manager Roblox until this succeeds.");
+            }
+        }
+
+        var services = new ServiceCollection();
+        ConfigureServices(services, _loggerFactory);
+        _services = services.BuildServiceProvider();
+
+        // #246: say how the last session ended, and mark this one running. After the single-instance
+        // guard (a second instance must not touch the record) and before the mutex name resolve /
+        // StartPluginHostListener, so GetHostInfo can answer from the first call. Resolving the
+        // recorder pulls in nothing else, so IMutexHolder stays unresolved until its own spot.
+        try
+        {
+            var lastExit = _services.GetRequiredService<ROROROblox.Core.Diagnostics.LastExitRecorder>();
+            lastExit.Begin();
+            _lastExit = lastExit;
+            var prev = lastExit.Previous;
+            // Local, like every other timestamp in the log, so a field report reads in one zone. For
+            // "unknown" nothing recorded the end, so the time is when that session started.
+            _log.LogInformation("Previous session ended: {Reason}{Detail} ({When} {At}).",
+                prev.Reason,
+                string.IsNullOrEmpty(prev.Detail) ? string.Empty : $" ({prev.Detail})",
+                prev.Reason == ROROROblox.Core.Diagnostics.LastExitRecorder.Unknown ? "started" : "at",
+                prev.At?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff zzz") ?? "n/a");
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Last-exit recorder failed to begin; continuing without it.");
+        }
+
+        // #246: ask Windows to restart us after a crash, hang or Store update. Past the single-instance
+        // guard so an early-exiting second instance never registers. Resolves nothing from DI.
+        ApplicationRestart.Register(_log);
+
+        // Apply the saved theme synchronously so the first paint is already on the chosen
+        // palette. The async path was deadlocking — IAppSettings.GetActiveThemeIdAsync
+        // continues on the UI thread (ConfigureAwait(true)), and we were blocking the UI
+        // thread with GetResult(). Sync file-read avoids the cycle entirely; the JSON parse
+        // is small enough that startup latency stays imperceptible.
+        try
+        {
+            _services.GetRequiredService<ThemeService>().ApplyAtStartup();
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Theme apply at startup threw; continuing with default brushes.");
+        }
+
+        // Acquire-first: resolve the singleton mutex NAME first (unchanged chain), THEN acquire,
+        // THEN gate on the result. The gate's verdict is guaranteed true (mutex held) at the
+        // moment we proceed — no check-then-lose-the-lock race.
+        // Placement note: must run AFTER ApplyAtStartup so BgBrush resolves before either modal
+        // below paints.
+        //
+        // Resolve the singleton mutex NAME from remote config (data-only) BEFORE IMutexHolder is
+        // first materialized below — write it into the holder the factory reads. 2s-bounded,
+        // degrade-safe (valid remote -> last-known-good -> hardcoded default), never throws.
+        // No ConfigureAwait(false): this continuation must stay on the UI thread for the
+        // Dispatcher-affined modals/tray/window shows below. async void + await yields the UI
+        // thread (never blocks), so the ApplyAtStartup GetResult() deadlock noted above cannot recur.
+        var nameSource = MutexNameSource.Default;
+        try
+        {
+            var compat = _services.GetRequiredService<IRobloxCompatChecker>();
+            var resolved = await compat.ResolveMutexNameAsync();
+            _services.GetRequiredService<ResolvedMutexName>().Value = resolved.Name;
+            nameSource = resolved.Source;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Mutex-name resolve threw; binding the hardcoded default.");
+        }
+
+        var mutex = _services.GetRequiredService<IMutexHolder>();
+        var gate = _services.GetRequiredService<StartupGate>();
+
+        // TryAcquire, not Acquire: the gate needs to know WHY we lost the name. Roblox holding it
+        // (as an Event) means multi-instance is genuinely off; a compatible tool holding it (as a
+        // Mutex) means Roblox already lost its singleton and everything works. Same bool, opposite
+        // user experience. See MutexAcquireOutcome.
+        var acquireOutcome = mutex.TryAcquire();
+        var acquired = acquireOutcome == MutexAcquireOutcome.Acquired;
+        var verdict = gate.Evaluate(acquireOutcome);
+
+        // Bind the plugin-host pipe BEFORE the gate's modals. Both modals below block OnStartup
+        // in a nested message loop, and the leftover modal fires whenever stale Roblox clients
+        // exist — the exact condition an agent is trying to recover from. Binding here means the
+        // pipe is reachable while the dialog waits for a human. Multi-instance state is already
+        // resolved (mutex.Acquire above), so a plugin reading GetHostInfo sees the truth.
+        // Autostart is deliberately deferred until after the gate — see StartPluginAutostart.
+        StartPluginHostListener();
+
+        // Task 9 fix round 1: the pipe is reachable the moment StartPluginHostListener returns
+        // (same reasoning as the comment above it), so the OnStopping hook has to be live by
+        // then too — not after the gate's modals, which can block for as long as it takes a
+        // human to notice a dialog. Placed right here rather than down with the other Wire*
+        // calls near mainWindow. See WirePluginAccountStopper's own doc comment for why this is
+        // safe: MainViewModel is already constructed by this point as an unavoidable side effect
+        // of StartPluginHostListener's own resolution chain, so this isn't forcing anything new.
+        WirePluginAccountStopper();
+
+        var startedWithoutMutex = false;
+        if (verdict is StartupGateResult.SharedLock)
+        {
+            // Another RoRoRo or a compatible tool squats the name as a Mutex. Roblox therefore lost
+            // its own singleton and multi-instance works — there is nothing to recover from, so no
+            // modal. Proceed exactly as "Start anyway" would; the contested watcher banners the fact
+            // that we don't hold the handle.
+            startedWithoutMutex = true;
+            _log.LogInformation("Singleton name held by a compatible tool; starting without the handle (multi-instance still works).");
+        }
+        else if (verdict is StartupGateResult.Blocked)
+        {
+            // Roblox holds the name (as its Event). If the ONLY thing holding it is a windowless
+            // tray client — the Windows-startup --launch-to-tray process — take it over silently:
+            // it has no game window, so nothing is lost. Only a windowed (in-game) client, which
+            // may have unsaved progress, falls through to the confirming modal.
+            if (await TrySeamlessTakeoverAsync())
+            {
+                acquired = true; // we now own the Event; a tray client was put back alongside us
+            }
+            else
+            {
+                // In-game client present, or takeover couldn't reclaim — offer in-place recovery
+                // (Retry / Close Roblox, which re-attempt the name) plus Start anyway and Quit.
+                var modal = new Modals.RobloxAlreadyRunningWindow(
+                    onCloseForMe: () => TryRecoverMultiInstanceAsync(closeRobloxFirst: true),
+                    onRetry: () => TryRecoverMultiInstanceAsync(closeRobloxFirst: false));
+
+                // F-108. Say that startup is STOPPING here and why. ShowDialog blocks OnStartup in
+                // a nested message loop, so from the log's point of view the app simply goes quiet
+                // — for as long as it takes a human to notice a window. Six such pauses in seven
+                // minutes were read as six failures to start, by someone holding the source, because
+                // a pause and a death looked identical: no completion lines and no exit line.
+                _log.LogInformation(
+                    "Startup paused: Roblox already holds the singleton name — showing the "
+                    + "already-running dialog and waiting for the user.");
+                modal.ShowDialog();
+                var (proceed, holdsMutex) = AppLifecycle.BlockedStartupDecision.Resolve(modal.Outcome);
+                _log.LogInformation(
+                    "Startup resumed: already-running dialog answered {Outcome} — proceed={Proceed}, "
+                    + "holdsMutex={HoldsMutex}.",
+                    modal.Outcome, proceed, holdsMutex);
+                if (!proceed)
+                {
+                    // The one deliberate stop in the whole gate, and it was invisible.
+                    _log.LogInformation("Startup abandoned at the gate: the user chose not to continue.");
+                    Shutdown(0);
+                    return;
+                }
+                acquired = holdsMutex;              // Recovered holds it; Start anyway does not
+                startedWithoutMutex = !holdsMutex;  // borrowed start — the contested watcher will banner it
+            }
+        }
+        else if (verdict is StartupGateResult.Leftover leftover)
+        {
+            // F-110. A windowless-only leftover is not an event, it is the aftermath of a normal
+            // session. Measured 2026-08-20: stopping a client CLEANLY spawns a fresh headless
+            // RobloxPlayerBeta about two seconds later — hwnd 0, no title, ~120-180 MB, still there
+            // minutes later. Every time. Raising a dialog about that put an interruption on the
+            // ordinary path and taught the user to dismiss dialogs unread, which is a debt the
+            // BLOCKED modal beside it then pays. Clear it and say so; do not ask.
+            var disposition = AppLifecycle.LeftoverStartupDecision.Decide(
+                leftover.Windowless, leftover.Windowed, ApplicationRestart.IsWindowsRestart(e.Args));
+            if (disposition == AppLifecycle.LeftoverDisposition.ContinueUnattended)
+            {
+                // #255: Windows restarted us (crash or Store update) and nobody is here to answer a
+                // dialog. Keep every live game, clear only the headless strays, and carry on; the
+                // startup scan re-attaches tagged clients by title.
+                _log.LogInformation(
+                    "Startup: restarted by Windows with {Windowed} windowed client(s) open — continuing "
+                    + "without asking; tagged clients re-attach.",
+                    leftover.Windowed);
+                if (leftover.Windowless > 0)
+                {
+                    ClearLeftoverStrays();
+                }
+            }
+            else if (disposition == AppLifecycle.LeftoverDisposition.ClearSilently)
+            {
+                _log.LogInformation(
+                    "Startup: {Windowless} headless Roblox stray(s) left over from a previous "
+                    + "session — clearing without asking (nothing is at stake and it happens every time).",
+                    leftover.Windowless);
+                ClearLeftoverStrays();
+            }
+            else if (disposition == AppLifecycle.LeftoverDisposition.Ask)
+            {
+                var info = new Modals.LeftoverProcessesWindow(leftover.Windowless, leftover.Windowed);
+
+                // F-108, same reason as the branch above — and this is the one that actually bit. The
+                // singleton name IS held here, so multi-instance works and this dialog is purely
+                // informational, which makes the silence behind it even more misleading: nothing is
+                // wrong, and the log says nothing at all.
+                _log.LogInformation(
+                    "Startup paused: {Windowless} windowless + {Windowed} windowed leftover Roblox "
+                    + "process(es) — showing the leftover-process dialog and waiting for the user.",
+                    leftover.Windowless, leftover.Windowed);
+                info.ShowDialog();
+                _log.LogInformation("Startup resumed: leftover dialog answered {Action}.", info.Action);
+                switch (info.Action)
+                {
+                    case Modals.LeftoverCleanupAction.StopAll:
+                        CleanUpLeftoverRoblox(leftover.Windowed > 0);
+                        break;
+                    case Modals.LeftoverCleanupAction.ClearStrays:
+                        ClearLeftoverStrays();
+                        break;
+                }
+            }
+            // mutex already held — proceed regardless
+        }
+
+        var tray = _services.GetRequiredService<ITrayService>();
+        var mainWindow = _services.GetRequiredService<MainWindow>();
+
+        WireTrayEvents(tray, mutex, mainWindow);
+        WireMainViewModelEvents(mainWindow);
+        WireMutexLost(mutex, tray);
+        WireMainAvatarTrayPainter();
+        WireRobloxWindowDecorator();
+        WireIdleTrayClientSweeper();
+        WirePluginEventBus();
+        WireActivityMonitor();
+        await WireMemoryWatchdogAsync();
+        WireMemoryWarningTray(); // Task 8 — closes the loop WireMemoryWatchdogAsync doesn't own
+        WireContestedWatcher(mainWindow); // Task 8
+        // The gate has been answered by now (both modal branches above are blocking), so it is
+        // safe to let plugin processes launch. The pipe they handshake against bound earlier.
+        StartPluginAutostart();
+        StartKnownIssuesFeed();
+        await InitializeIdleSettingsAsync();
+        await InitializeStreamerModeAsync();
+
+        // Discord presence + Join (Task 9). MUST run before mainWindow.Show() below: the
+        // cold-start join dispatch (_joinRelay.Handle(joinArg, "cold start")) fires right after
+        // Show(), and a join that launched this very process needs JoinRequested already wired
+        // by then, or it's silently dropped. mainWindow and the DI graph are both available by
+        // this point (mainWindow resolved above at var mainWindow = ...), so there's no ordering
+        // reason to push this any later.
+        // The shell opener must never depend on an optional feature wiring up. Its predecessor
+        // (PreferencesWindowFactory) lived inside WireAlertsAsync for one build, and when a DI
+        // resolve failed in there (a non-generic ILogger parameter), the factory was never set and
+        // the whole Settings window stopped opening — an alerts problem taking out a core surface.
+        // Alerts are a passenger; this is not. Set it first, unconditionally, before anything that
+        // can fail.
+        _services.GetRequiredService<MainViewModel>().ShellPageOpener = OpenShellPage;
+        _services.GetRequiredService<MainViewModel>().KnownIssuesNotice =
+            _services.GetRequiredService<KnownIssues.KnownIssuesNoticeModel>();
+
+        await WireDiscordPresenceAsync(mainWindow, discordApplicationId);
+
+        // Alerts, wired separately and unconditionally — see the AlertDispatcher registration for
+        // why they must not ride on the Discord app id. Presence needs a Discord pipe; a desktop
+        // notification needs nothing at all.
+        //
+        // The migration goes first: WireAlertsAsync is where DiscordConfigService.InitializeAsync
+        // runs and where the dispatcher starts reading destinations, and this carries a v1.8
+        // MuteIdleAlerts=true across the upgrade as an explicitly empty IdleDestinations, exactly
+        // once (v1.33 item 3).
+        await MigrateIdleMuteAsync();
+        await WireAlertsAsync();
+
+        _log.LogInformation(
+            "Startup mutex: name={Name}, source={Source}, acquired={Acquired}.",
+            mutex.MutexName, nameSource, acquired);
+        // Borrowed start (Start anyway): we don't hold the lock, but it's not an error — Off is the
+        // honest tray state; the contested watcher's banner carries the nuance.
+        tray.UpdateStatus(
+            startedWithoutMutex ? MultiInstanceState.Off
+            : acquired ? MultiInstanceState.On
+            : MultiInstanceState.Error);
+
+        // Discord Join relay: a second instance launched with a join URI forwards it here over
+        // the existing single-instance pipe (see SingleInstanceGuard.JoinUriReceived). The guard
+        // already marshals this onto the UI thread before invoking; _joinRelay.Handle owns the
+        // exception boundary (see InboundJoinRelay's remarks) — a throw here must not kill the
+        // pipe-listener thread this callback runs on.
+        _singleInstance.JoinUriReceived += relayedUri => _joinRelay!.Handle(relayedUri, "relay");
+
+        tray.Show();
+        _singleInstance.StartListening(mainWindow);
+        mainWindow.Show();
+
+        // One-time notice that the UI now follows the system language (localization completeness).
+        // After Show() and best-effort so it never touches the startup path; the toast reads in the
+        // culture Program.Main already applied, so a returning non-English user sees it in their
+        // language and knows where to change it. Sentinel-gated: shown once per install, never again.
+        try
+        {
+            if (LanguageNoticeSentinel.ShouldShow(LanguageNoticeSentinel.IsPending(), UiCulture.Available().Count > 1))
+            {
+                tray.ShowToast(Loc.Get("LanguageNotice_Title"), Loc.Get("LanguageNotice_Body"));
+                LanguageNoticeSentinel.MarkShown();
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Language-notice toast skipped.");
+        }
+
+        // Seed session stats from whatever history survives, once (spec §4). After Show() and
+        // fire-and-forget: it reads up to a hundred rows, nobody is looking at the stats page in
+        // the first second of a cold start, and stats are the least important thing this app does
+        // — a failure here must never be visible on the startup path.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ROROROblox.Core.SessionStatsBackfill.RunOnceAsync(
+                    _services.GetRequiredService<ISessionHistoryStore>(),
+                    _services.GetRequiredService<ISessionStatsStore>()).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "Session-stats backfill failed; stats will accrue from here.");
+            }
+        });
+
+        // Cold-start Discord Join: this process itself was launched with the join URI (Discord
+        // handed it straight to us rather than to an already-running instance). Raised after
+        // mainWindow.Show() so anything Task 8 wires up earlier in OnStartup is already
+        // subscribed by the time this fires.
+        if (joinArg is not null)
+        {
+            _joinRelay.Handle(joinArg, "cold start");
+        }
+
+        // Wave 5 raised the outline on clickable controls to clear WCAG's 3:1. On a built-in theme
+        // that already happened silently, upstream in ApplyAtStartup. If the active theme is one
+        // the user wrote themselves, ApplyAtStartup left a question here instead — asked once, with
+        // the change visible behind it, and never again for that theme. Deliberately AFTER
+        // mainWindow.Show(): the dialog needs an owner to centre on, and the user needs to see what
+        // it is talking about. Nothing to ask in the overwhelming majority of launches.
+        try
+        {
+            await Modals.EdgeRemediationWindow.AskIfPendingAsync(
+                _services.GetRequiredService<ThemeService>(), mainWindow);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "The theme-edge question threw; the derived edge stays applied for this session.");
+        }
+
+        // Fire-and-forget startup checks. Failures are silent; banner stays null on no-drift / no-network.
+        _ = RunStartupChecksAsync();
+    }
+
+    private async Task RunStartupChecksAsync()
+    {
+        if (_services is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // Crash-orphan cleanup: a capture interrupted by a crash leaves a fully logged-in
+            // Roblox profile under webview2-data\. The post-capture sweep (CookieCapture)
+            // handles the normal path; this catches whatever a dying msedgewebview2 pinned.
+            // Safe here because no capture can be in flight this early in startup.
+            var webViewData = _services.GetRequiredService<WebView2UserDataDirectory>();
+            await Task.Run(() => webViewData.SweepStale(exclude: null));
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WebView2 user-data startup sweep threw; ignoring.");
+        }
+
+        try
+        {
+            var updateChecker = _services.GetRequiredService<IUpdateChecker>();
+            await updateChecker.CheckForUpdatesAsync();
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Update check threw; ignoring.");
+        }
+
+        try
+        {
+            var vm = _services.GetRequiredService<MainViewModel>();
+            await vm.LoadCompatBannerAsync();
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Compat banner threw; ignoring.");
+        }
+
+        // Startup session validation REMOVED in v1.1.2.0.
+        //
+        // Previously called vm.ValidateSessionsAsync() here to proactively mark expired
+        // sessions yellow on launch. In practice, hitting users.roblox.com/v1/users/authenticated
+        // for every saved account at startup -- right after the cookie comes off disk and right
+        // before any other authenticated endpoint has been touched -- pattern-matches Roblox's
+        // anti-fraud heuristics. They flag the session for re-verification, our 401 handler maps
+        // that to CookieExpiredException, the badge flips to "expired", and the user gets
+        // surprise 2FA prompts on the next Launch As even though the cookie is minutes old.
+        //
+        // Pivoted to lazy validation: the actual GetAuthTicketAsync call inside Launch As
+        // surfaces a real expiry (or a real reverification prompt) at the moment the user
+        // chose to interact, where the friction is justified. Saves one fresh-context API
+        // call per saved account on every startup -- exactly the surface Roblox flags as
+        // suspicious. Track follow-up §4 in docs/store/next-revision-followups.md proposes a
+        // proper NeedsReverification state distinct from SessionExpired for v1.2.0.0+.
+
+        // FIRST: scan for already-running RobloxPlayerBeta windows + re-attach the ones whose
+        // titles match saved accounts. After this, vm.Accounts[i].IsRunning correctly reflects
+        // the world for any tagged session that survived our restart.
+        ScanResult scan = new(0, 0);
+        try
+        {
+            var scanner = _services.GetRequiredService<RunningRobloxScanner>();
+            var tracker = _services.GetRequiredService<IRobloxProcessTracker>();
+            var vm = _services.GetRequiredService<MainViewModel>();
+            scan = scanner.Scan(vm.Accounts.ToList(), tracker);
+            if (scan.MatchedAndAttached > 0)
+            {
+                _log?.LogInformation("Re-attached to {Count} existing Roblox window(s) by title.", scan.MatchedAndAttached);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Pre-existing Roblox scan threw; continuing without re-attach.");
+        }
+
+        try
+        {
+            // Cycle 5: eager one-time backfill of RobloxUserId for any saved account where
+            // it's still null. Runs ~5s after MainWindow.Show to give the UI a chance to
+            // paint and Multi-Instance to settle before any background HTTP traffic. Sequential
+            // with 2.5s ± 500ms stagger between accounts (anti-fraud discipline per spec §5).
+            // Idempotent: returning users with all accounts backfilled make zero API calls.
+            var backfill = _services.GetRequiredService<AccountUserIdBackfillService>();
+            await Task.Delay(5_000).ConfigureAwait(false);
+            await backfill.RunAsync().ConfigureAwait(false);
+
+            // Account facts: the slow timer is armed only now, after the backfill has finished, and
+            // its first tick is a full TimerTick (60 s) from here. Nothing about facts runs before
+            // this line except a user's own panel expand.
+            _services.GetRequiredService<AccountFactsService>().StartTimer();
+            // Panels that resolved open at load asked for no icon then (it is a network lane); now is the time.
+            _services.GetRequiredService<MainViewModel>().RequestIconsForOpenPanels();
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "RobloxUserId backfill threw; ignoring.");
+        }
+
+        try
+        {
+            // Auto-launch main on startup, but with strong guardrails so we never duplicate a
+            // running session. Roblox enforces one-session-per-account server-side: if we
+            // launch a second client for an already-signed-in account, the first gets kicked.
+            // Skip when:
+            //   — opt-in is off
+            //   — no main is set
+            //   — main's session expired
+            //   — main is already running (scanner just attached, OR launching)
+            //   — ANY Roblox window is running, even untagged (defensive — if the user manually
+            //     opened Roblox before us, we don't know which account it is, and launching the
+            //     main might kick them out if it happens to be them)
+            var settings = _services.GetRequiredService<IAppSettings>();
+            if (await settings.GetLaunchMainOnStartupAsync())
+            {
+                var vm = _services.GetRequiredService<MainViewModel>();
+                var main = vm.MainAccount;
+                if (main is null)
+                {
+                    _log?.LogDebug("LaunchMainOnStartup enabled but no main account picked.");
+                }
+                else if (main.IsRunning)
+                {
+                    _log?.LogInformation("Main {AccountId} ({Name}) already running — skipping auto-launch.", main.Id, main.DisplayName);
+                    Dispatcher.Invoke(() =>
+                        vm.StatusBanner = $"{main.RenderName} is already running — skipped auto-launch.");
+                }
+                else if (scan.AnyRobloxRunning)
+                {
+                    _log?.LogInformation("Untagged Roblox window detected — skipping auto-launch to avoid kicking the user out.");
+                    Dispatcher.Invoke(() =>
+                        vm.StatusBanner = "Roblox is already open — skipped auto-launch so you don't get kicked out. Click Launch As when you're ready.");
+                }
+                else if (main.SessionExpired || main.IsLaunching || !vm.StartMainCommand.CanExecute(null))
+                {
+                    _log?.LogDebug("Main not eligible for auto-launch (expired={Expired}, launching={Launching}).", main.SessionExpired, main.IsLaunching);
+                }
+                else
+                {
+                    _log?.LogInformation("Auto-launching main account {AccountId} per LaunchMainOnStartup", main.Id);
+                    Dispatcher.Invoke(() => vm.StartMainCommand.Execute(null));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Auto-launch main threw; ignoring.");
+        }
+    }
+
+    // internal (not private), fix round 1 finding 3: RobloxLauncherTests.cs's
+    // ProductionDiRegistration_ThreadsTheLiveRunningProbeIntoTheLauncher calls this directly —
+    // via the pre-existing InternalsVisibleTo("ROROROblox.Tests") in ROROROblox.App.csproj — so it
+    // exercises the REAL composition root instead of a hand-mirrored copy of one registration line.
+    // Every registration in this method is lazy (parameterless AddSingleton<T,U>, or a factory
+    // lambda evaluated at resolve time, never at registration time) except the two path-string
+    // computations below (DefaultPluginsRoot, consentPath, dataDir) — none of which touch disk;
+    // verified by inspection before making this change.
+    internal static void ConfigureServices(IServiceCollection services, ILoggerFactory loggerFactory)
+    {
+        services.AddSingleton(loggerFactory);
+        services.AddLogging();
+
+        // Singletons — long-lived state we want exactly one of.
+        // The singleton mutex NAME is resolved from roblox-compat.json at startup (before this
+        // singleton is first materialized) and written into ResolvedMutexName; the factory reads it.
+        // Falls back to MutexHolder.DefaultMutexName when resolution hasn't run or yielded the default.
+        services.AddSingleton<ResolvedMutexName>();
+        services.AddSingleton<IMutexHolder>(sp => new MutexHolder(sp.GetRequiredService<ResolvedMutexName>().Value));
+        // NOT a plain AddSingleton<ITrayService, TrayService>: the ctor builds TaskbarIcon /
+        // ContextMenu / MenuItem, and a plain singleton constructs on whichever thread resolves it
+        // first. On 2026-08-20 that was a threadpool continuation (StartPluginHostListener →
+        // AlertDispatcher → ITrayService) and startup died cross-thread on a Freezable (F-122).
+        // The alert sound (v1.33 item 5). Registered separately from the tray so the mode provider
+        // is written down once: it reads AlertSoundSetting on EVERY play, which is what makes a
+        // change on the Settings page take effect on the next alert instead of the next launch.
+        services.AddSingleton<Tray.IAlertSoundPlayer>(sp => new Tray.AlertSoundPlayer(
+            () => AlertSoundSetting,
+            sp.GetService<ILogger<Tray.AlertSoundPlayer>>()));
+        services.AddSingleton<ITrayService>(sp => UiBoundFactory.Create(
+            System.Windows.Application.Current?.Dispatcher,
+            () => new TrayService(
+                sp.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerIdentityProvider>(),
+                sp.GetService<ILogger<TrayService>>(),
+                sp.GetRequiredService<Tray.IAlertSoundPlayer>())));
+        services.AddSingleton<IAppSettings>(_ => new AppSettings());
+        services.AddSingleton<IFavoriteGameStore>(_ => new FavoriteGameStore());
+        services.AddSingleton<IPrivateServerStore>(_ => new PrivateServerStore());
+        services.AddSingleton<ISessionStatsStore>(_ => new SessionStatsStore());
+        // The history store is WRAPPED rather than called alongside a stats service. Two call
+        // sites that must agree forever is F-121's shape; one call path cannot drift from itself.
+        services.AddSingleton<ISessionHistoryStore>(sp => new StatsRecordingSessionHistoryStore(
+            new SessionHistoryStore(),
+            sp.GetRequiredService<ISessionStatsStore>(),
+            sp.GetService<ILogger<StatsRecordingSessionHistoryStore>>()));
+        services.AddSingleton<IThemeStore>(_ => new ThemeStore());
+        services.AddSingleton<ThemeService>();
+        services.AddSingleton<IAccountStore>(_ => new AccountStore());
+
+        // Streamer mode (v1.9) — fake-name/avatar substitution for on-stream safety. Pools are
+        // stateless generators; the friend-identity store persists lazily-assigned friend
+        // identities to disk (accounts persist through IAccountStore instead, via persistAccount
+        // below). persistAccount is wrapped so a disk failure from the provider's fire-and-forget
+        // lazy-assignment persist (see StreamerIdentityProvider.Resolve) logs instead of becoming
+        // an unobserved Task exception.
+        services.AddSingleton<ROROROblox.Core.StreamerMode.IStreamerNamePool>(_ => new ROROROblox.Core.StreamerMode.StreamerNamePool());
+        services.AddSingleton<ROROROblox.Core.StreamerMode.IStreamerAvatarPool>(_ => new ROROROblox.Core.StreamerMode.StreamerAvatarPool());
+        services.AddSingleton<ROROROblox.Core.StreamerMode.IStreamerIdentityStore>(_ => new ROROROblox.Core.StreamerMode.FileStreamerIdentityStore());
+        services.AddSingleton<ROROROblox.Core.StreamerMode.IStreamerIdentityProvider>(sp =>
+        {
+            var store = sp.GetRequiredService<IAccountStore>();
+            var logger = sp.GetRequiredService<ILogger<App>>();
+            return new ROROROblox.Core.StreamerMode.StreamerIdentityProvider(
+                sp.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerNamePool>(),
+                sp.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerAvatarPool>(),
+                sp.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerIdentityStore>(),
+                sp.GetRequiredService<IAppSettings>(),
+                persistAccount: async (id, identity) =>
+                {
+                    try
+                    {
+                        await store.UpdateStreamerIdentityAsync(id, identity.FakeName, identity.FakeAvatarId);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Failed to persist streamer identity for {AccountId}", id);
+                    }
+                });
+        });
+
+        // v1.6.0 account transport (item 5). Pure-crypto bundle service (PBKDF2 + AES-256-GCM);
+        // stateless, so a singleton is fine. The export/import dialogs consume this + IAccountStore.
+        services.AddSingleton<ROROROblox.Core.Transport.IAccountTransport,
+            ROROROblox.Core.Transport.AccountTransportService>();
+        // Distribution mode gates three things now: the plugin marketplace (policy 10.2.2),
+        // which startup-registration implementation backs the run-on-login toggle, and whether
+        // the join URI schemes live in HKCU or in the manifest. Registered once so every
+        // consumer answers the question the same way.
+        services.AddSingleton<Distribution.IDistributionMode, Distribution.Win32DistributionMode>();
+
+        // Packaged installs write HKCU into the package's virtual hive where winlogon never
+        // looks (verified live 2026-08-30), so the Run-key implementation silently does nothing
+        // there — and worse, reads its own virtual value back, so the toggle lies. The manifest
+        // StartupTask is the packaged equivalent. Spec:
+        // docs/superpowers/specs/2026-08-30-packaged-activation-design.md.
+        services.AddSingleton<IStartupRegistration>(sp =>
+            sp.GetRequiredService<Distribution.IDistributionMode>().IsPackaged
+                ? new PackagedStartupRegistration()
+                : new StartupRegistration());
+        services.AddSingleton<IProcessStarter, ProcessStarter>();
+
+        // RobloxApi and AccountFactsApi, each over its own managed HttpClient with UseCookies=false
+        // (load-bearing; see RobloxHttpClients for why, and for the test that reads both handlers).
+        services.AddRobloxHttpClients();
+
+        // Compat checker uses its own HttpClient — different UA + different host pattern.
+        services.AddHttpClient<IRobloxCompatChecker, RobloxCompatChecker>(client =>
+        {
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+
+        // Known Roblox issues (spec 2026-09-23). The dismissals file and the worded model are
+        // singletons; the feed and its state are registered with the startup wiring (Task 10).
+        services.AddSingleton(_ => new ROROROblox.Core.KnownIssues.KnownIssuesDismissals(
+            ROROROblox.Core.KnownIssues.KnownIssuesDismissals.DefaultPath));
+        services.AddSingleton(sp => new KnownIssues.KnownIssuesNoticeModel(
+            sp.GetRequiredService<ROROROblox.Core.KnownIssues.KnownIssuesDismissals>(),
+            ROROROblox.Core.KnownIssues.RunningRobloxVersion.Read,
+            new Threading.WpfUiDispatcher()));
+
+        // Its own typed HttpClient with the RORORO UA, like the compat checker. Transient and
+        // stateless; KnownIssuesState is the singleton that holds the list.
+        services.AddHttpClient<ROROROblox.Core.KnownIssues.IKnownIssuesFeed, ROROROblox.Core.KnownIssues.KnownIssuesFeed>(client =>
+        {
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+        services.AddSingleton(sp => new ROROROblox.Core.KnownIssues.KnownIssuesState(
+            TimeProvider.System,
+            sp.GetRequiredService<ILogger<ROROROblox.Core.KnownIssues.KnownIssuesState>>()));
+
+        services.AddSingleton<IBloxstrapDetector, BloxstrapDetector>();
+
+        // v1.7.0 install-deferral probe (item 1). Its own typed HttpClient — the CDN GET against
+        // clientsettingscdn.roblox.com carries the ROROROblox UA (never a browser spoof). The probe
+        // resolves its other two seams itself (live installer process scan + GetInstalledRobloxVersion).
+        // Same IHttpClientFactory pattern as RobloxApi; both members degrade-safe to "no update".
+        services.AddHttpClient<IRobloxUpdateProbe, RobloxUpdateProbe>(client =>
+        {
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+
+        services.AddSingleton<IClientAppSettingsWriter, ClientAppSettingsWriter>();
+        // Factory, not open registration: the writer's optional windowed enforcement reads the
+        // "Keep Roblox windowed" setting per write (Este, 2026-09-05).
+        services.AddSingleton<IGlobalBasicSettingsWriter>(sp => new GlobalBasicSettingsWriter(
+            forceWindowed: () => sp.GetRequiredService<IAppSettings>().GetLaunchWindowedAsync()));
+        services.AddSingleton<IGlobalBasicSettingsProbe, GlobalBasicSettingsProbe>();
+
+        // Explicit factory (2026-08-02, settings-quiet-window fix, Task 3) rather than bare
+        // AddSingleton<IRobloxLauncher, RobloxLauncher>(): the bare form DOES still auto-resolve
+        // IGlobalBasicSettingsProbe from DI today (verified empirically — the built-in container
+        // fills a registered optional ctor parameter before falling back to its default), but
+        // that's an implicit property of constructor-selection, not a guarantee anyone reading this
+        // line would see. Spelling it out means removing the probe registration above fails loudly
+        // here (GetRequiredService throws at resolve time) instead of silently reverting to a
+        // write-and-hope launch with no settle — which is exactly how the 2026-08-01 wrong-FPS-cap
+        // bug shipped once before (the mechanism existed; nothing wired it to a live dependency).
+        // Same for a future edit that adds a second RobloxLauncher constructor — the compiler
+        // forces this call site to disambiguate. It does NOT protect against every drift: a new
+        // *optional* constructor parameter added to the existing constructor takes its default here
+        // silently, with nothing failing (fix wave, 2026-08-02 review finding 4 — narrowed this
+        // comment's claim to what it actually covers).
+        //
+        // IRobloxRunningProbe is NOT threaded in here anymore (Task 3): the previous pid-based
+        // post-launch gate is retired — it was aimed at the wrong writer (see FpsCapSettler's
+        // remarks). IRobloxRunningProbe itself stays registered below for its other consumers
+        // (memory watchdog, stray-client cleanup, StartupGate).
+        services.AddSingleton<IRobloxLauncher>(sp => new RobloxLauncher(
+            sp.GetRequiredService<IRobloxApi>(),
+            sp.GetRequiredService<IAppSettings>(),
+            sp.GetRequiredService<IProcessStarter>(),
+            favorites: sp.GetService<IFavoriteGameStore>(),
+            clientAppSettings: sp.GetService<IClientAppSettingsWriter>(),
+            globalBasicSettings: sp.GetService<IGlobalBasicSettingsWriter>(),
+            settingsProbe: sp.GetRequiredService<IGlobalBasicSettingsProbe>(),
+            logger: sp.GetRequiredService<ILogger<RobloxLauncher>>()));
+
+        // Per-capture WebView2 user-data dir manager. Each Add Account gets a fresh GUID dir
+        // under %LOCALAPPDATA%\ROROROblox\webview2-data\<guid>\; siblings are best-effort swept
+        // on each capture. Replaces the pre-1.3.4 single-shared-dir + pre-wipe pattern, which
+        // failed silently when the previous capture's msedgewebview2.exe children still pinned
+        // files — causing every subsequent Add Account to re-capture the first account.
+        services.AddSingleton(sp => new WebView2UserDataDirectory(
+            System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ROROROblox",
+                "webview2-data"),
+            sp.GetRequiredService<ILogger<WebView2UserDataDirectory>>()));
+        services.AddSingleton<ICookieCapture, CookieCapture.CookieCapture>();
+        services.AddSingleton<IUpdateChecker, UpdateChecker>();
+        services.AddSingleton<IRobloxProcessTracker, RobloxProcessTracker>();
+        services.AddSingleton<RobloxWindowDecorator>();
+        services.AddSingleton<RunningRobloxScanner>();
+
+        // Activity Monitor (v1.8) — per-account idle detection. Foreground-window + system-input
+        // Win32 probes are read-only (GetForegroundWindow / GetWindowThreadProcessId /
+        // GetLastInputInfo); no focus-stealing, no injection. IForegroundAccountResolver points at
+        // the same IRobloxProcessTracker singleton, so pid->account lookups stay consistent with
+        // the tracker's claimed-pid map.
+        services.AddSingleton<IForegroundWindowProbe, Win32ForegroundWindowProbe>();
+        services.AddSingleton<ISystemInputClock, Win32SystemInputClock>();
+        services.AddSingleton<IClock, SystemClock>();
+        services.AddSingleton<IForegroundAccountResolver>(sp =>
+            (IForegroundAccountResolver)sp.GetRequiredService<IRobloxProcessTracker>());
+        services.AddSingleton<IActivityMonitor>(sp => new ActivityMonitor(
+            sp.GetRequiredService<IForegroundWindowProbe>(),
+            sp.GetRequiredService<ISystemInputClock>(),
+            sp.GetRequiredService<IForegroundAccountResolver>(),
+            sp.GetRequiredService<IClock>(),
+            sp.GetService<ILogger<ActivityMonitor>>()));
+
+        // v1.8's IdleAlertPresenter was registered here until 2026-10-06. v1.33 item 3 deleted it:
+        // an idle crossing now raises an AlertKind.AccountIdle trigger from MainViewModel and
+        // routes through AlertDispatcher like every other kind, so there is nothing left for a
+        // presenter that knew one mute flag and no destinations to do.
+
+        // v1.5.0 presence poller (the ghost fix). Singleton — one poll loop for the process.
+        // The snapshot-provider delegate reads live accounts from MainViewModel at POLL time,
+        // never at construction: MainViewModel also depends on IPresenceService, so resolving it
+        // eagerly here would form a construction cycle. The lazy capture below resolves
+        // MainViewModel only when the delegate fires (first tick / fast-confirm), well after the
+        // graph is built. It snapshots non-expired, userId-resolved accounts as PresenceTargets.
+        services.AddSingleton<IPresenceService>(sp => new PresenceService(
+            sp.GetRequiredService<IRobloxApi>(),
+            sp.GetRequiredService<IAccountStore>(),
+            // AccountsSnapshot, not Accounts: this delegate fires on the poll loop's threadpool
+            // thread, and enumerating the UI-owned ObservableCollection there races a concurrent
+            // Add/Remove into "Collection was modified" — the fault that silently killed the
+            // presence loop (2026-06-12 review).
+            () => sp.GetRequiredService<MainViewModel>().AccountsSnapshot
+                    .Where(a => !a.SessionExpired && a.RobloxUserId is > 0)
+                    .Select(a => new PresenceTarget(a.Id, a.RobloxUserId!.Value))
+                    .ToList(),
+            sp.GetRequiredService<ILogger<PresenceService>>()));
+
+        // Cycle 4 startup gate — detects RobloxPlayerBeta.exe running BEFORE RoRoRo so we
+        // can hard-block instead of silently entering the broken state where every Launch As
+        // routes through the existing process. Lives next to other Diagnostics-namespace
+        // services in Core; consumed by App.OnStartup before mutex.Acquire.
+        services.AddSingleton<IRobloxRunningProbe, RobloxRunningProbe>();
+        services.AddSingleton<IRobloxInstanceStopper, RobloxInstanceStopper>();
+        services.AddSingleton<IShellOpener, ShellOpener>();
+        services.AddSingleton<StartupGate>();
+
+        // Memory watchdog (v1.11, Task 7) — samples per-account private bytes + projects time
+        // to machine RAM exhaustion. IClock is already registered above (Activity Monitor).
+        // Singleton so WireRobloxWindowDecorator's launch/exit bookkeeping and MainViewModel's
+        // chip painting share the SAME instance. Started conditionally by WireMemoryWatchdogAsync
+        // once the enabled flag + derived defaults are read from IAppSettings.
+        services.AddSingleton<IProcessMemoryProbe, ProcessMemoryProbe>();
+        services.AddSingleton<ISystemMemoryProbe, SystemMemoryProbe>();
+        services.AddSingleton<IMemoryWatchdog, MemoryWatchdog>();
+
+        // Owns whether that watchdog is sampling, so the Settings toggle means this session. Must
+        // be the same singleton the Settings page nudges and RefreshMemoryWatchdogAsync commits to,
+        // or the two writers would each hold their own idea of "on".
+        services.AddSingleton<MemoryWatchdogGate>();
+
+        // Runtime contested-mutex watcher (Task 8) — polls only while we don't hold the mutex,
+        // surfacing when the tray-resident Roblox releases it so the runtime banner can offer
+        // in-place recovery without a restart. Registered here so its lifetime matches the other
+        // Diagnostics singletons; wired to the UI in WireContestedWatcher.
+        services.AddSingleton<MutexContestedWatcher>(sp =>
+            new MutexContestedWatcher(sp.GetRequiredService<IMutexHolder>()));
+
+        // Cycle 5 RobloxUserId backfill — fire-and-forget worker that resolves and persists
+        // any saved account where RobloxUserId is null. Triggered post-MainWindow.Show in
+        // RunStartupChecksAsync; idempotent on subsequent runs. Lives in Core for testability.
+        services.AddSingleton<AccountUserIdBackfillService>();
+
+        // Account facts lane (v1.36): Robux, friends online, membership. Constructing this does
+        // NOTHING: no request, no timer, no thread. The slow timer is armed by RunStartupChecksAsync
+        // only after the backfill above has finished (the v1.1.2 anti-fraud lesson, quoted in the
+        // service). The roster delegate reads AccountsSnapshot lazily, never Accounts: it fires on
+        // the worker's threadpool thread, and MainViewModel depends on this service, so resolving
+        // MainViewModel here eagerly would form a construction cycle (same shape as PresenceService).
+        services.AddSingleton(sp => new AccountFactsService(
+            sp.GetRequiredService<IAccountStore>(),
+            sp.GetRequiredService<IAccountFactsApi>(),
+            () => sp.GetRequiredService<MainViewModel>().AccountsSnapshot
+                    .Select(a => new FactsTarget(a.Id, a.RobloxUserId, a.Facts, a.SessionExpired))
+                    .ToList(),
+            sp.GetRequiredService<ILogger<AccountFactsService>>(),
+            // Membership on (2026-11-02): the C1 probe measured validate-membership answering for
+            // every cookie, true only for the account Este confirmed is on Plus. Core keeps it off by
+            // default so a construction site that has not measured it cannot turn it on by accident.
+            membershipEnabled: true,
+            icons: sp.GetRequiredService<IGameIconCache>()));
+
+        // Library join (v1.36): favourites + saved servers + Recent. ListAsync is a pure read; icon
+        // lookups happen only when a caller asks for a place on screen, and they ride the facts
+        // worker above (one request at a time, the shared pacing).
+        services.AddSingleton<IGameIconCache>(sp => new GameIconCache(
+            sp.GetRequiredService<IRobloxApi>(),
+            log: sp.GetService<ILogger<GameIconCache>>()));
+        services.AddSingleton<LibraryCatalog>();
+
+        // Tray avatar painter — owns its own HttpClient (default UA fine for public Roblox CDN
+        // avatar URLs). TrayService is registered as ITrayService elsewhere; the painter takes
+        // the concrete type because SetCustomStateIcons is App-internal.
+        services.AddSingleton(sp =>
+        {
+            var tray = (Tray.TrayService)sp.GetRequiredService<ITrayService>();
+            var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
+            var http = httpFactory.CreateClient(nameof(Tray.MainAvatarTrayPainter));
+            return new Tray.MainAvatarTrayPainter(
+                tray,
+                http,
+                sp.GetRequiredService<ILogger<Tray.MainAvatarTrayPainter>>());
+        });
+
+        var dataDir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ROROROblox");
+
+        // #246: last-exit.json. Registered here, begun in OnStartup right after the container builds.
+        services.AddSingleton(sp => new ROROROblox.Core.Diagnostics.LastExitRecorder(
+            dataDir, TimeProvider.System, sp.GetRequiredService<ILogger<ROROROblox.Core.Diagnostics.LastExitRecorder>>()));
+
+        // Discord presence + Join config (Task 9) — DPAPI-encrypted, alongside accounts.dat and
+        // consent.dat under the same data dir. Registered unconditionally, independent of whether
+        // Discord:ApplicationId is configured: Preferences needs to read/write the toggle state
+        // (see PreferencesWindow) even in a build where the feature itself can't run yet, so a
+        // saved preference is honored automatically the moment a future build ships an app id.
+        services.AddSingleton(_ => new DiscordConfigStore(
+            System.IO.Path.Combine(dataDir, "discord.dat")));
+
+        // Phone-alert settings: its own DPAPI blob, deliberately NOT inside discord.dat — the
+        // 2026-09-04 ruling keeps the Discord webhook feature separate, and a file's name should
+        // not lie about what it holds. Spec: docs/superpowers/specs/2026-09-04-phone-alerts-design.md.
+        services.AddSingleton<ROROROblox.Core.Notify.IPhoneNotifyConfigStore>(_ =>
+            new ROROROblox.Core.Notify.PhoneNotifyConfigStore(
+                System.IO.Path.Combine(dataDir, "notify.dat")));
+        services.AddSingleton(sp => new ROROROblox.Core.Notify.PhoneNotifyConfigService(
+            sp.GetRequiredService<ROROROblox.Core.Notify.IPhoneNotifyConfigStore>()));
+
+        // Alerts are registered unconditionally and — unlike presence — do NOT depend on
+        // Discord:ApplicationId or on Discord being installed at all. The desktop-notification
+        // destination is the whole point: someone who never makes a webhook still gets told when
+        // a client drops. Gating this on the Discord app id would silently remove the only part
+        // of the feature that needs no setup.
+        services.AddHttpClient<DiscordWebhookSender>(client =>
+        {
+            // Short timeout: an alert that has not landed in ten seconds has missed its moment,
+            // and a hung POST must never be what keeps the app alive at shutdown.
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+
+        services.AddHttpClient<WebhookProbe>(client =>
+        {
+            // Setup help is best-effort and blocks a visible field, so it fails fast.
+            client.Timeout = TimeSpan.FromSeconds(5);
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+
+        // The two push senders take the webhook sender's contract wholesale: ten-second timeout
+        // (an alert that has not landed in ten seconds has missed its moment), our own UA, and
+        // exactly one (HttpClient, ILogger<T>) ctor — TypedHttpClientRegistrationTests pins both.
+        services.AddHttpClient<Notify.PushoverSender>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+        services.AddHttpClient<Notify.NtfySender>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("RORORO", version));
+        });
+        services.AddSingleton(sp => new Notify.PhoneAlertSender(
+            sp.GetRequiredService<Notify.PushoverSender>(),
+            sp.GetRequiredService<Notify.NtfySender>(),
+            sp.GetRequiredService<ILogger<Notify.PhoneAlertSender>>()));
+
+        // The single owner of the Discord record (F-013 prerequisite): every write goes through
+        // its gate, every reader sees its Current, and Changed is how views stay current. It
+        // replaced DiscordConfigCache, whose one job (a torn-free synchronous read) it absorbed.
+        services.AddSingleton(sp => new DiscordConfigService(sp.GetRequiredService<DiscordConfigStore>()));
+
+        services.AddSingleton(sp => new AlertDispatcher(
+            sp.GetRequiredService<DiscordWebhookSender>(),
+            sp.GetRequiredService<ITrayService>(),
+            () => sp.GetRequiredService<DiscordConfigService>().Current,
+            TimeProvider.System,
+            sp.GetRequiredService<ILogger<AlertDispatcher>>(),
+            sp.GetRequiredService<Notify.PhoneAlertSender>(),
+            () => sp.GetRequiredService<ROROROblox.Core.Notify.PhoneNotifyConfigService>().Current,
+            () => AlertCadenceSetting));
+
+        // #52: the version and channel Diagnostics reports. Same IHostBuildIdentity the plugin host uses.
+        // A factory, not the type form: HostBuildIdentity has two public ctors and only the parameterless one is production.
+        services.AddSingleton<ROROROblox.App.Plugins.IHostBuildIdentity>(_ => new ROROROblox.App.Plugins.HostBuildIdentity());
+        services.AddSingleton<IInstallIdentity>(sp => new Distribution.InstallIdentity(
+            sp.GetRequiredService<Distribution.IDistributionMode>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IHostBuildIdentity>()));
+
+        services.AddSingleton<IDiagnosticsCollector>(sp => new DiagnosticsCollector(
+            sp.GetRequiredService<IAccountStore>(),
+            sp.GetRequiredService<IRobloxProcessTracker>(),
+            sp.GetRequiredService<IMutexHolder>(),
+            AppLogging.LogDirectory,
+            dataDir,
+            sp.GetRequiredService<ISystemMemoryProbe>(),
+            sp.GetRequiredService<IMemoryWatchdog>(),
+            sp.GetRequiredService<IInstallIdentity>()));
+
+        // ViewModel + Window.
+        services.AddSingleton<MainViewModel>();
+        services.AddSingleton<MainWindow>();
+
+        // === Plugins (v1.4) =========================================================
+        // Wires the gRPC plugin host (items 5-14) into the App lifecycle. The host runs
+        // on a per-user named pipe; failure to start MUST NOT break RoRoRo's normal
+        // launch — every plugin-side service is wrapped at the App.OnStartup hook so a
+        // broken plugins root or a corrupt consent file just disables plugin support.
+        var pluginsRoot = ROROROblox.App.Plugins.PluginRegistry.DefaultPluginsRoot;
+        var consentPath = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ROROROblox", "consent.dat");
+
+        services.AddSingleton(_ => new ROROROblox.App.Plugins.ConsentStore(consentPath));
+        services.AddSingleton(sp => new ROROROblox.App.Plugins.PluginRegistry(
+            pluginsRoot,
+            sp.GetRequiredService<ROROROblox.App.Plugins.ConsentStore>()));
+        services.AddSingleton<ROROROblox.App.Plugins.IInstalledPluginsLookup>(sp =>
+            new ROROROblox.App.Plugins.Adapters.InstalledPluginsLookupAdapter(
+                sp.GetRequiredService<ROROROblox.App.Plugins.PluginRegistry>(),
+                loggerFactory.CreateLogger<ROROROblox.App.Plugins.Adapters.InstalledPluginsLookupAdapter>()));
+
+        // PluginInstaller takes (HttpClient, pluginsRoot, stopRunningPluginAsync) — register
+        // the typed HttpClient with the right UA, then build the installer with the resolved
+        // client + a stop-hook that kills a running instance before a re-install touches its dir.
+        services.AddHttpClient(nameof(ROROROblox.App.Plugins.PluginInstaller), client =>
+        {
+            var version = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+            client.DefaultRequestHeaders.UserAgent.Add(
+                new ProductInfoHeaderValue("ROROROblox-PluginInstaller", version));
+
+            // Issue #136: HttpClient's default is 100 seconds for the WHOLE request, and a
+            // plugin.zip is megabytes — so a user on a slow line got "the request was canceled
+            // due to the configured HttpClient.Timeout of 100 seconds elapsing" and no install,
+            // ever, however many times they tried. It is not a per-read idle timeout, so a
+            // download that is progressing fine still dies at 100 seconds. Ten minutes is a
+            // budget for a big plugin on a bad connection, and PluginInstaller streams the body
+            // rather than buffering it under this clock.
+            client.Timeout = ROROROblox.App.Plugins.PluginInstaller.DownloadTimeout;
+        });
+        services.AddSingleton(sp =>
+        {
+            var http = sp.GetRequiredService<IHttpClientFactory>()
+                .CreateClient(nameof(ROROROblox.App.Plugins.PluginInstaller));
+            var supervisor = sp.GetRequiredService<ROROROblox.App.Plugins.PluginProcessSupervisor>();
+            // Host version sourced from the App assembly — the manifest minHostVersion
+            // gate compares against this. Fallback of 0.0.0.0 means a missing AssemblyVersion
+            // refuses every minHostVersion-bearing manifest, which is the safe default.
+            var hostVersion = typeof(App).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
+            return new ROROROblox.App.Plugins.PluginInstaller(http, pluginsRoot, (pluginId, installDir) =>
+                // Re-installing fails on Directory.Delete if anything is still running out of
+                // the plugin's dir — a tracked instance OR an orphan that outlived a prior
+                // RoRoRo session. StopByInstallDirAsync kills both (orphans found by image
+                // path) and polls until their file handles release.
+                supervisor.StopByInstallDirAsync(pluginId, installDir),
+                hostVersion);
+        });
+
+        // F-101: one job object per host, owned by the container so its handle lives exactly as
+        // long as the process. Closing that handle is what makes the kernel kill the plugins.
+        services.AddSingleton<ROROROblox.App.Plugins.Adapters.PluginJobObject>(sp =>
+            new ROROROblox.App.Plugins.Adapters.PluginJobObject(
+                sp.GetService<ILogger<ROROROblox.App.Plugins.Adapters.PluginJobObject>>()));
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginProcessStarter>(sp =>
+            new ROROROblox.App.Plugins.Adapters.DefaultPluginProcessStarter(
+                sp.GetService<ILogger<ROROROblox.App.Plugins.Adapters.DefaultPluginProcessStarter>>(),
+                sp.GetRequiredService<ROROROblox.App.Plugins.Adapters.PluginJobObject>()));
+        services.AddSingleton<ROROROblox.App.Plugins.PluginProcessSupervisor>();
+
+        // Concrete first, interface mapped onto the SAME instance. Registering
+        // AddSingleton<IPluginEventBus, InProcessPluginEventBus>() alone would hand a resolver
+        // asking for the concrete type a SECOND bus, and a second bus is a bus nobody's events
+        // reach. ThemeFeedAdapter asks for the concrete type (it raises, it doesn't listen).
+        services.AddSingleton<ROROROblox.App.Plugins.InProcessPluginEventBus>();
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginEventBus>(sp =>
+            sp.GetRequiredService<ROROROblox.App.Plugins.InProcessPluginEventBus>());
+
+        // ThemeService viewed as "the current palette, plus a nudge when it changes". Without this
+        // line ThemeFeedAdapter cannot be constructed AT ALL — ThemeService is registered as a
+        // concrete type only, so resolving IThemeAppliedSource throws and takes the whole plugin
+        // host down with it at startup. Caught by ThemeFeedWiringTests on its first run, which is
+        // the entire reason that test exists.
+        services.AddSingleton<ROROROblox.Core.Theming.IThemeAppliedSource>(sp =>
+            sp.GetRequiredService<ThemeService>());
+
+        // Bridges ThemeService's apply to the plugin bus, and caches the palette so GetTheme can
+        // answer before the user has ever touched the theme picker — which is most sessions.
+        services.AddSingleton<ROROROblox.App.Plugins.Adapters.ThemeFeedAdapter>();
+        services.AddSingleton<ROROROblox.App.Plugins.Adapters.IThemePaletteSource>(sp =>
+            sp.GetRequiredService<ROROROblox.App.Plugins.Adapters.ThemeFeedAdapter>());
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginHostStateProvider,
+            ROROROblox.App.Plugins.Adapters.MutexHostStateAdapter>();
+        services.AddSingleton<ROROROblox.App.Plugins.IRunningAccountsProvider,
+            ROROROblox.App.Plugins.Adapters.MainViewModelRunningAccountsAdapter>();
+        services.AddSingleton<ROROROblox.App.Plugins.ISavedAccountsProvider,
+            ROROROblox.App.Plugins.Adapters.MainViewModelSavedAccountsAdapter>();
+        services.AddSingleton<ROROROblox.App.Plugins.IActivitySnapshotProvider,
+            ROROROblox.App.Plugins.ActivitySnapshotProvider>();
+        services.AddSingleton<ROROROblox.App.Plugins.IAccountActivityMarker>(sp =>
+            new ROROROblox.App.Plugins.AccountActivityMarker(
+                sp.GetRequiredService<IActivityMonitor>(),
+                sp.GetRequiredService<IClock>()));
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginLaunchInvoker,
+            ROROROblox.App.Plugins.Adapters.MainViewModelLaunchInvokerAdapter>();
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginUIHost,
+            ROROROblox.App.Plugins.Adapters.WpfPluginUIHost>();
+        services.AddSingleton<ROROROblox.App.Plugins.PluginUITranslator>();
+        services.AddSingleton<ROROROblox.App.Plugins.IPluginAccountStopper,
+            ROROROblox.App.Plugins.Adapters.ProcessTrackerAccountStopper>();
+
+        // Metric alerts. LocalFileMetricRuleSource is the rule source, permanently — the signed
+        // manifest once planned to replace it was dropped (2026-09-11: see "The decision this plan
+        // records" in docs/superpowers/plans/2026-09-11-metric-alerts-close-out.md). IMetricRuleSource
+        // stays a seam regardless: this registration is the only thing a future source would touch.
+        // The file is absent on a fresh install, which means no rules, which means the feature is
+        // inert — the correct shipped default for an opt-in alert.
+        //
+        // MetricRulesPath is DERIVED from the settings file rather than rebuilt from dataDir
+        // above: the rules sit beside settings.json by definition, and the app's data folder has
+        // moved once already. A path expression that tracks AppSettings.DefaultPath() moves with
+        // it; a second literal would not. Read inside the factory, so it stays as lazy as every
+        // other registration in this method.
+        services.AddSingleton<ROROROblox.Core.Metrics.IMetricRuleSource>(sp =>
+            new ROROROblox.App.Metrics.LocalFileMetricRuleSource(
+                MetricRulesPath,
+                sp.GetRequiredService<ILogger<ROROROblox.App.Metrics.LocalFileMetricRuleSource>>()));
+
+        // The sink is the only thing on the report path that knows about this app — the RPC
+        // handler is a pass-through and the coordinator is Core — so all four of its funcs are
+        // supplied here, and every one of them is called on a gRPC handler thread:
+        //
+        //   the gate     reads a cached volatile bool, never IAppSettings. GetMetricAlertsEnabled-
+        //                Async waits on a semaphore and then reads a file; blocking a handler
+        //                thread on that is a deadlock waiting for a busy disk. See
+        //                MetricAlertsEnabled and RefreshMetricAlertsGateAsync.
+        //   the names    read MainViewModel.AccountsSnapshot, never Accounts — the lock-free
+        //                mirror is the only account list safe to enumerate off the UI thread.
+        //   running-here reads the same AccountsSnapshot for IsRunning (2026-10-19): a metric alert
+        //                names only accounts running on this PC. See IsRunningHere.
+        //   the clock    is the same TimeProvider the rest of the alert path uses, so the skew
+        //                check and the rate windows agree on "now".
+        services.AddSingleton<ROROROblox.App.Plugins.IMetricReportSink>(sp =>
+        {
+            // Resolved here rather than inside the name func: that func runs once per reported
+            // number on a gRPC thread, and a container lookup per report — to have a logger ready
+            // for a failure that should never happen — would cost more than the thing it reports.
+            var appLog = sp.GetRequiredService<ILogger<App>>();
+            return new ROROROblox.App.Plugins.Adapters.MetricReportSinkAdapter(
+                sp.GetRequiredService<ROROROblox.Core.Metrics.IMetricRuleSource>(),
+                () => MetricAlertsEnabled,
+                accountId => ResolveAlertNames(sp, accountId, appLog),
+                accountId => IsRunningHere(sp, accountId, appLog),
+                TimeProvider.System,
+                sp.GetRequiredService<ILogger<ROROROblox.App.Plugins.Adapters.MetricReportSinkAdapter>>());
+        });
+
+        services.AddSingleton(sp => new ROROROblox.App.Plugins.PluginHostService(
+            sp.GetRequiredService<ROROROblox.App.Plugins.IInstalledPluginsLookup>(),
+            typeof(App).Assembly.GetName().Version?.ToString(3) ?? "0.0.0",
+            "1.0",
+            sp.GetRequiredService<ROROROblox.App.Plugins.IPluginHostStateProvider>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IRunningAccountsProvider>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IPluginEventBus>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IPluginLaunchInvoker>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.PluginUITranslator>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IActivitySnapshotProvider>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IAccountActivityMarker>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IPluginAccountStopper>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.Adapters.IThemePaletteSource>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.ISavedAccountsProvider>(),
+            sp.GetRequiredService<ROROROblox.App.Plugins.IMetricReportSink>(),
+            lastExit: sp.GetRequiredService<ROROROblox.Core.Diagnostics.LastExitRecorder>()));
+
+        // CapabilityInterceptor: per-connection plugin id binding is deferred to v1.5+
+        // (the gRPC interceptor sees the call before any plugin-id metadata is bound).
+        // For v1.4 we pass a no-op accessor; the consent lookup goes through the
+        // (decrypted) ConsentStore each call. Wrapped in try/catch so a corrupt
+        // consent.dat returns empty capabilities rather than throwing into the host.
+        services.AddSingleton(sp => new ROROROblox.App.Plugins.CapabilityInterceptor(
+            currentPluginAccessor: () => null,
+            consentLookup: pluginId =>
+            {
+                try
+                {
+                    var consent = sp.GetRequiredService<ROROROblox.App.Plugins.ConsentStore>();
+                    var records = consent.ListAsync().GetAwaiter().GetResult();
+                    return records.FirstOrDefault(r => r.PluginId == pluginId)?.GrantedCapabilities
+                        ?? Array.Empty<string>();
+                }
+                catch
+                {
+                    return Array.Empty<string>();
+                }
+            }));
+        services.AddSingleton<ROROROblox.App.Plugins.PluginHostStartupService>();
+    }
+
+    private void WireTrayEvents(ITrayService tray, IMutexHolder mutex, MainWindow mainWindow)
+    {
+        // F-001 — subscribing is now a table (Tray.TrayWiring), not eleven inline lambdas, so a
+        // transposed subscription (Stop all wired to Quit) is a test failure instead of a silent
+        // behaviour swap that compiles cleanly. StopAllInstances/OpenLogs route through
+        // MainViewModel's commands so the tray and the Tools menu share one implementation.
+        Tray.TrayWiring.Connect(tray, new Tray.TrayHandlers(
+            OpenMainWindow: () => SurfaceMainWindow(mainWindow),
+            ToggleMutex: () => ToggleMutex(mutex, tray),
+            StopAllInstances: () => _services!.GetRequiredService<MainViewModel>().StopAllCommand.Execute(null),
+            Quit: RequestShutdown,
+            OpenDiagnostics: () => OpenDiagnosticsFromTray(mainWindow),
+            OpenLogs: () => _services!.GetRequiredService<MainViewModel>().OpenLogFolderCommand.Execute(null),
+            OpenPreferences: () => OpenPreferencesFromTray(mainWindow),
+            ActivateMain: () => ActivateMainFromTray(mainWindow),
+            OpenHistory: () => OpenHistoryFromTray(mainWindow),
+            OpenPlugins: () => OpenPluginsFromTray(mainWindow),
+            // Task 8's click-to-focus, GENERALISED 2026-10-06 (v1.33 item 4). It used to fire only
+            // for a memory warning, because only ShowMemoryWarning stamped an account id for the
+            // shell's payload-free balloon click to replay. Every notification now carries the
+            // account it is about — when it is about exactly one — so this handler runs for a drop,
+            // a recycle, an idle crossing and a metric breach too, and a group of three accounts
+            // never reaches it because such a balloon carries no id at all.
+            //
+            // Raised from AlertBalloon's own MouseLeftButtonUp, a WPF-originated UI event (unlike
+            // PressureCrossed), so no dispatcher marshaling is needed here.
+            FocusAccount: accountId =>
+            {
+                try
+                {
+                    SurfaceMainWindow(mainWindow);
+                    mainWindow.FocusAccountRow(accountId);
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogDebug(ex, "RequestFocusAccount handling threw; window surfaced (if it got that far) but the row may not be highlighted.");
+                }
+            }));
+    }
+
+    private void WireMainViewModelEvents(MainWindow mainWindow)
+    {
+        if (_services is null) return;
+        var vm = _services.GetRequiredService<MainViewModel>();
+        vm.RequestOpenPlugins += (_, _) => OpenShellPage(Shell.ShellPage.Plugins);
+    }
+
+    /// <summary>The one shell window (F-013). Null when closed; recreated on the next door.</summary>
+    private Shell.ShellWindow? _shell;
+
+    /// <summary>Pages already built for the main window's embedded page host.</summary>
+    private readonly Dictionary<Shell.ShellPage, System.Windows.Controls.UserControl> _embeddedPages = [];
+
+    /// <summary>
+    /// Every door to the six former modal islands — toolbar buttons, Tools menu items, tray items,
+    /// the VM's commands — lands here: one shell, surfaced and navigated. One route per
+    /// destination now means one WINDOW per six destinations, which also retires the tray-vs-VM
+    /// double-door class (two Preferences with independent snapshots was statically reachable
+    /// before this).
+    /// </summary>
+    internal void OpenShellPage(Shell.ShellPage page)
+    {
+        if (_services is null) return;
+        try
+        {
+            // Multi Manager Roblox: pages open inside the main window, not a separate shell window.
+            if (!_embeddedPages.TryGetValue(page, out var control))
+            {
+                control = CreateShellPage(page);
+                _embeddedPages[page] = control;
+            }
+
+            var navId = page switch
+            {
+                Shell.ShellPage.Games => "ToolbarGames",
+                Shell.ShellPage.Settings => "ToolbarSettings",
+                Shell.ShellPage.History => "ToolsHistory",
+                Shell.ShellPage.Diagnostics => "ToolsDiagnostics",
+                Shell.ShellPage.Plugins => "ToolsPlugins",
+                Shell.ShellPage.About => "ToolsAbout",
+                Shell.ShellPage.KnownRobloxIssues => "ToolsKnownRobloxIssues",
+                _ => null,
+            };
+            _services.GetRequiredService<MainWindow>().ShowEmbeddedPage(control, navId);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Couldn't open the {Page} page.", page);
+        }
+    }
+
+    /// <summary>
+    /// The composition root's page factory — the one place that knows what each destination
+    /// needs, the role BuildPreferencesWindow used to play for Settings alone.
+    /// </summary>
+    private System.Windows.Controls.UserControl CreateShellPage(Shell.ShellPage page)
+    {
+        ArgumentNullException.ThrowIfNull(_services);
+        return page switch
+        {
+            Shell.ShellPage.Games => BuildLibraryPage(),
+            Shell.ShellPage.Settings => BuildSettingsPage(),
+            Shell.ShellPage.History => new History.SessionHistoryPage(
+                _services.GetRequiredService<ISessionHistoryStore>(),
+                _services.GetRequiredService<IFavoriteGameStore>(),
+                _services.GetRequiredService<IRobloxApi>(),
+                // Same streamer-identity singleton the VM's opener always threaded through — the
+                // page must never show the real roster while streamer mode is active.
+                _services.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerIdentityProvider>(),
+                libraryChanged: () => _ = _services.GetRequiredService<MainViewModel>().ReloadGamesAsync(),
+                stats: _services.GetRequiredService<ISessionStatsStore>(),
+                // A Func, not a snapshot: the roster can change while the page is open, and
+                // AccountsSnapshot is the VM's lock-free point-in-time copy (safe off-thread).
+                roster: () => _services.GetRequiredService<MainViewModel>().AccountsSnapshot),
+            Shell.ShellPage.Diagnostics => new Diagnostics.DiagnosticsPage(
+                _services.GetRequiredService<IDiagnosticsCollector>()),
+            Shell.ShellPage.Plugins => BuildPluginsPage(),
+            Shell.ShellPage.About => new About.AboutPage(),
+            Shell.ShellPage.KnownRobloxIssues => new KnownIssues.KnownRobloxIssuesPage(
+                _services.GetRequiredService<KnownIssues.KnownIssuesNoticeModel>(),
+                GoToKnownIssueFeature,
+                _services.GetRequiredService<IShellOpener>()),
+            _ => throw new ArgumentOutOfRangeException(nameof(page), page, null),
+        };
+    }
+
+    /// <summary>
+    /// The Library page (v1.36 item 9): the view model is built here, beside <c>MainViewModel</c>, so the page
+    /// is wiring. Paste routing needs the main view model's share-link resolver; Play and Play as go through
+    /// <c>LaunchAccountByIdAsync</c>, the one launch path; the Play as picker lists the live roster.
+    /// </summary>
+    private Games.GamesPage BuildLibraryPage()
+    {
+        ArgumentNullException.ThrowIfNull(_services);
+        var main = _services.GetRequiredService<MainViewModel>();
+        var viewModel = new Games.LibraryViewModel(
+            _services.GetRequiredService<LibraryCatalog>(),
+            _services.GetRequiredService<IFavoriteGameStore>(),
+            _services.GetRequiredService<IPrivateServerStore>(),
+            _services.GetRequiredService<IRobloxApi>(),
+            _services.GetRequiredService<IAppSettings>(),
+            url => main.ResolveShareUrlAsync(url),
+            // AccountsSnapshot, never Accounts: PlayAsync may resolve off the UI thread.
+            () => main.AccountsSnapshot,
+            (accountId, target) => main.LaunchAccountByIdAsync(accountId, target),
+            // The refresh the modal did on close, now done when the data changes.
+            libraryChanged: () => _ = main.ReloadGamesAsync(),
+            icons: _services.GetRequiredService<IGameIconCache>(),
+            ui: new Threading.WpfUiDispatcher());
+        return new Games.GamesPage(viewModel, main.Accounts);
+    }
+
+    /// <summary>Where a known issue's "Multi Manager Roblox can help" button goes (spec §4).</summary>
+    private void GoToKnownIssueFeature(KnownIssues.KnownIssueFeatureRoute route)
+    {
+        switch (route)
+        {
+            case KnownIssues.KnownIssueFeatureRoute.MemorySettings:
+                OpenShellPage(Shell.ShellPage.Settings);
+                (_shell?.CurrentPage as Preferences.SettingsPage)?.RevealMemorySettings();
+                break;
+            case KnownIssues.KnownIssueFeatureRoute.MainWindow:
+                if (Current.MainWindow is { } main)
+                {
+                    SurfaceMainWindow(main);
+                }
+
+                break;
+        }
+    }
+
+    private Plugins.PluginsPage BuildPluginsPage()
+    {
+        ArgumentNullException.ThrowIfNull(_services);
+        var registry = _services.GetRequiredService<ROROROblox.App.Plugins.PluginRegistry>();
+        var registryAdapter = (ROROROblox.App.Plugins.Adapters.InstalledPluginsLookupAdapter)
+            _services.GetRequiredService<ROROROblox.App.Plugins.IInstalledPluginsLookup>();
+        var consentStore = _services.GetRequiredService<ROROROblox.App.Plugins.ConsentStore>();
+        var installer = _services.GetRequiredService<ROROROblox.App.Plugins.PluginInstaller>();
+        var supervisor = _services.GetRequiredService<ROROROblox.App.Plugins.PluginProcessSupervisor>();
+
+        // Show the manifest consent sheet so the user can review + per-capability opt
+        // out (system.* default-off, host.* default-on). Cancel returns null and the VM
+        // rolls back the install dir. Owned by the shell — the surface the user is installing
+        // from — falling back to the main window if the shell closed mid-install.
+        Func<ROROROblox.App.Plugins.PluginManifest, Task<IReadOnlyList<string>?>> showSheet =
+            manifest => ROROROblox.App.Plugins.ConsentSheet.ShowAndAwaitDecisionAsync(
+                (Window?)_shell ?? Current.MainWindow, manifest);
+
+        var catalogHttp = _services.GetRequiredService<IHttpClientFactory>().CreateClient();
+        catalogHttp.DefaultRequestHeaders.UserAgent.Clear();
+        var catalogVersion = Distribution.AppVersion.Display(new Distribution.Win32DistributionMode());
+        catalogHttp.DefaultRequestHeaders.UserAgent.Add(
+            new System.Net.Http.Headers.ProductInfoHeaderValue("RORORO", catalogVersion));
+        var catalogClient = new ROROROblox.App.Plugins.PluginCatalogClient(
+            catalogHttp,
+            "https://github.com/estevanhernandez-stack-ed/ROROROblox/releases/latest/download/plugins-catalog.json");
+        var vm = new ROROROblox.App.Plugins.PluginsViewModel(
+            registry, registryAdapter, consentStore, installer, supervisor, showSheet,
+            _services.GetRequiredService<ROROROblox.App.Distribution.IDistributionMode>(),
+            catalogClient,
+            typeof(App).Assembly.GetName().Version ?? new Version(0, 0, 0, 0),
+            _services.GetRequiredService<ILogger<ROROROblox.App.Plugins.PluginsViewModel>>());
+        return new Plugins.PluginsPage(vm);
+    }
+
+    /// <summary>
+    /// Tray double-click target. If a main is set + idle + not expired, launch it. Otherwise
+    /// fall back to surfacing the main window so the user can pick one. Either way, this is
+    /// the "do the most useful thing" path.
+    /// </summary>
+    private void ActivateMainFromTray(Window mainWindow)
+    {
+        if (_services is null)
+        {
+            SurfaceMainWindow(mainWindow);
+            return;
+        }
+        try
+        {
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var main = vm.MainAccount;
+            if (main is { SessionExpired: false, IsRunning: false, IsLaunching: false })
+            {
+                _log?.LogInformation("Tray double-click: launching main {AccountId}", main.Id);
+                if (vm.StartMainCommand.CanExecute(null))
+                {
+                    vm.StartMainCommand.Execute(null);
+                    return;
+                }
+            }
+            // Fallback: open the window so the user can see/pick.
+            SurfaceMainWindow(mainWindow);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "ActivateMainFromTray failed; falling back to window surface");
+            SurfaceMainWindow(mainWindow);
+        }
+    }
+
+    /// <summary>
+    /// Subscribe to the ViewModel's MainAccount changes and ask the avatar painter to refresh
+    /// the tray icons whenever the user picks a new main, unsets, or adds the first account.
+    /// Painter runs off-thread; failures silently fall back to the bundled defaults.
+    /// </summary>
+    /// <summary>
+    /// Hook the window decorator to <see cref="IRobloxProcessTracker"/> events: when a Roblox
+    /// player process attaches to an account, push the title text + per-account caption color
+    /// onto its main HWND (re-applied every 1.5s by the decorator's own timer to defeat
+    /// Roblox's occasional self-rename). Untrack on exit so we don't leak entries.
+    /// <para>
+    /// Also the single place the memory watchdog (Task 7) learns about launches/exits —
+    /// <see cref="IMemoryWatchdog.OnAccountLaunched"/>/<see cref="IMemoryWatchdog.OnAccountExited"/>
+    /// fire right alongside <c>decorator.Track</c>/<c>Untrack</c> so ALL per-account process
+    /// bookkeeping stays in one call site instead of a second parallel subscription. Cheap
+    /// dictionary ops even when the watchdog's sample timer was never started (disabled in
+    /// settings) — see <see cref="WireMemoryWatchdogAsync"/>.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// #222. Starts the idle tray client sweeper. Runs in the Wire* block, after the startup gate
+    /// has answered (the Leftover branch has already cleared windowless strays silently) and after
+    /// the plugin pipe is bound, so it can never act on a client the gate is still deciding about.
+    /// A passenger feature: failure is logged and never blocks startup.
+    /// </summary>
+    private void WireIdleTrayClientSweeper()
+    {
+        try
+        {
+            var tracker = _services.GetRequiredService<IRobloxProcessTracker>();
+            _idleTraySweeper = new Tray.IdleTrayClientSweeper(
+                _services.GetRequiredService<IRobloxInstanceStopper>(),
+                // Same source as the pre-launch clear in MainViewModel: the tracker's pid copy.
+                trackedPids: () => tracker.Attached.Values.Select(p => p.Pid).ToHashSet(),
+                log: _loggerFactory?.CreateLogger<Tray.IdleTrayClientSweeper>());
+            _idleTraySweeper.Start();
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WireIdleTrayClientSweeper failed; idle tray clients are only cleared before a launch.");
+        }
+    }
+
+    private void WireRobloxWindowDecorator()
+    {
+        if (_services is null) return;
+        try
+        {
+            var tracker = _services.GetRequiredService<IRobloxProcessTracker>();
+            var decorator = _services.GetRequiredService<RobloxWindowDecorator>();
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var watchdog = _services.GetRequiredService<IMemoryWatchdog>();
+
+            tracker.ProcessAttached += (_, e) =>
+            {
+                // AccountsSnapshot: tracker events fire on threadpool continuations.
+                var summary = vm.AccountsSnapshot.FirstOrDefault(a => a.Id == e.AccountId);
+                if (summary is null) return;
+                decorator.Track(e.Pid, summary);
+                watchdog.OnAccountLaunched(e.AccountId, e.Pid);
+            };
+
+            // Peak concurrent alts, sampled here because it is a property of a MOMENT rather than
+            // of any session (spec §3.3). It cannot be reconstructed from history later: rows for
+            // the third and fourth simultaneous alt may already have been pruned by the time
+            // anyone asks. Fire-and-forget with a logged catch — this must never delay an attach.
+            var statsStore = _services.GetRequiredService<ISessionStatsStore>();
+            tracker.ProcessAttached += (_, _) =>
+            {
+                var concurrent = tracker.Attached.Count;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await statsStore.ApplyAsync(new StatsEvent.ConcurrencyObserved(concurrent))
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.LogDebug(ex, "Recording peak concurrency failed; stats only.");
+                    }
+                });
+            };
+
+            // Per-alt landing streaks (v1.23 addendum). The chain marks presence-confirmed
+            // landings, never launches: ProcessAttached fires for a client that lands at Roblox
+            // home, and "logged in today" for daily-reward purposes means IN A GAME. Presence is
+            // the signal v1.5 made authoritative, so it is the signal the streak trusts.
+            //
+            // Deduped per (account, local day) in memory before touching the store — the
+            // heartbeat reports InGame roughly every 25 seconds per account, and a day is a day.
+            // The dictionary is process-lifetime; a restart re-emits at most one redundant event
+            // per alt, which the store's own same-day check absorbs.
+            var presenceForStats = _services.GetRequiredService<IPresenceService>();
+            var landedDays = new System.Collections.Concurrent.ConcurrentDictionary<Guid, string>();
+            presenceForStats.AccountPresenceUpdated += (_, e) =>
+            {
+                if (e.PresenceType != UserPresenceType.InGame) return;
+                var day = ROROROblox.Core.DayKey.For(e.OccurredAtUtc);
+                if (landedDays.TryGetValue(e.AccountId, out var seen) && seen == day) return;
+                landedDays[e.AccountId] = day;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await statsStore.ApplyAsync(new StatsEvent.AccountLanded(e.AccountId, e.OccurredAtUtc))
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.LogDebug(ex, "Recording a landing failed; stats only.");
+                    }
+                });
+            };
+            // F-103. Roblox restarts itself after an update, and the replacement is a process we
+            // never launched: the decorator keys by launched pid, so the new window keeps the bare
+            // "Roblox" title forever. That title is also the re-attach key, so the client counts
+            // toward the running total and the memory watchdog while no row owns it and no row's
+            // Stop can reach it.
+            //
+            // Adoption goes through AttachExisting deliberately, because that raises ProcessAttached
+            // — so an adopted client takes the exact same path a freshly launched one does, picking
+            // up decoration and watchdog tracking from the handler above rather than a second,
+            // drifting copy of that wiring here.
+            _orphanSweeper = new Tray.OrphanedClientSweeper(
+                _services.GetRequiredService<IClock>(),
+                isTracked: pid => tracker.Attached.Values.Any(p => p.Pid == pid),
+                adopt: (accountId, pid) => tracker.AttachExisting(accountId, pid),
+                log: _loggerFactory?.CreateLogger<Tray.OrphanedClientSweeper>());
+            _orphanSweeper.Start();
+
+            tracker.ProcessExited += (_, e) =>
+            {
+                decorator.Untrack(e.Pid);
+                watchdog.OnAccountExited(e.AccountId, e.Pid);
+                // The successor carries nothing linking it back to an account. This record is the
+                // only reason attribution is possible at all.
+                _orphanSweeper?.OnClientExited(e.AccountId, e.Pid);
+            };
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WireRobloxWindowDecorator failed; window titles stay default.");
+        }
+    }
+
+    /// <summary>
+    /// Seeds <see cref="IActivityMonitor"/> with any already-attached accounts (e.g. re-attached
+    /// by <see cref="RunningRobloxScanner"/> before this runs), subscribes it to
+    /// <see cref="IRobloxProcessTracker"/>'s launch/exit lifecycle, and starts its 1s sample
+    /// timer. Wrapped defensively — a wiring failure here must not block RoRoRo's normal launch;
+    /// worst case is idle-warning simply doesn't fire this session.
+    /// </summary>
+    private void WireActivityMonitor()
+    {
+        if (_services is null) return;
+        try
+        {
+            var tracker = _services.GetRequiredService<IRobloxProcessTracker>();
+            var monitor = _services.GetRequiredService<IActivityMonitor>();
+
+            foreach (var id in tracker.Attached.Keys)
+            {
+                monitor.OnAccountLaunched(id);
+            }
+
+            tracker.ProcessAttached += (_, e) => monitor.OnAccountLaunched(e.AccountId);
+            tracker.ProcessExited += (_, e) => monitor.OnAccountExited(e.AccountId);
+            monitor.Start();
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WireActivityMonitor failed; idle warnings disabled this session.");
+        }
+    }
+
+    /// <summary>
+    /// Memory watchdog (v1.11, Task 7) — reads the enabled flag + reserve/cap/projection settings
+    /// from <see cref="IAppSettings"/> and starts <see cref="IMemoryWatchdog"/>'s sample timer.
+    /// <para>
+    /// <b>Derive ONCE, never re-derive over an explicit value.</b> <c>MemoryReserveMb</c>/
+    /// <c>MemoryCapMb</c> are <c>int?</c>: <see langword="null"/> means the user never touched the
+    /// setting (derive from installed RAM via <see cref="MemoryDefaults"/>), any value — including
+    /// <c>0</c> for the cap — is a deliberate user choice that must be honoured verbatim (<c>0</c>
+    /// disables the cap trigger; see <see cref="MemoryDefaults.CapMb"/> doc). The pattern is
+    /// <c>settings.Value ?? MemoryDefaults.XMb(total)</c>, converted MB -&gt; bytes with
+    /// <c>* 1024L * 1024L</c>.
+    /// </para>
+    /// <para>
+    /// <see cref="IMemoryWatchdog.OnAccountLaunched"/>/<c>OnAccountExited</c> bookkeeping is wired
+    /// separately, in <see cref="WireRobloxWindowDecorator"/>, at the same
+    /// <see cref="IRobloxProcessTracker.ProcessAttached"/>/<c>ProcessExited</c> call sites the
+    /// decorator uses — this method only owns settings + <see cref="IMemoryWatchdog.Start"/>.
+    /// </para>
+    /// <para>
+    /// <c>MemoryWatchdogEnabled == false</c> means no timer, no sampling, no cost — but as of
+    /// 2026-10-05 that decision is no longer taken once and frozen. The flag goes through
+    /// <see cref="MemoryWatchdogGate"/>, the Settings toggle nudges it the moment it saves, and the
+    /// view model's 30s tick re-reads it so a hand-edited settings.json still counts. Before that,
+    /// unticking the box mid-session persisted the value and changed nothing until the next launch:
+    /// Este had the box clear on his second machine and a memory warning arrived anyway.
+    /// </para>
+    /// <para>
+    /// The reserve/cap/projection numbers ride the same refresh, so editing one takes effect within
+    /// a tick instead of at next launch. They are pushed before the gate is applied: a stopped
+    /// watchdog taking new numbers is free, and a starting one must not sample on stale ones.
+    /// </para>
+    /// <para>
+    /// Wrapped defensively like every other Wire*/Initialize* startup step: a watchdog wiring
+    /// failure must never block a user from launching Roblox.
+    /// </para>
+    /// </summary>
+    private async Task WireMemoryWatchdogAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var settings = _services.GetRequiredService<IAppSettings>();
+            await RefreshMemoryWatchdogAsync(settings).ConfigureAwait(true);
+
+            // Piggybacks the existing 30s tick, this app's habit for exactly this kind of re-read
+            // (the idle chips, the memory repaint, the uptime mark and the metric-alert gate all
+            // ride it rather than stand up a timer of their own).
+            var vm = _services.GetRequiredService<MainViewModel>();
+            vm.PeriodicTick += (_, _) => _ = RefreshMemoryWatchdogAsync(settings);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Memory watchdog wiring failed; continuing without it.");
+        }
+    }
+
+    /// <summary>
+    /// Pushes the memory settings into the live watchdog and opens or closes
+    /// <see cref="MemoryWatchdogGate"/> to match the opt-in.
+    /// <para>
+    /// <b>Derive ONCE, never re-derive over an explicit value.</b> <c>MemoryReserveMb</c>/
+    /// <c>MemoryCapMb</c> are <c>int?</c>: <see langword="null"/> means the user never touched the
+    /// setting (derive from installed RAM via <see cref="MemoryDefaults"/>), any value — including
+    /// <c>0</c> for the cap — is a deliberate user choice that must be honoured verbatim (<c>0</c>
+    /// disables the cap trigger; see <see cref="MemoryDefaults.CapMb"/> doc). The pattern is
+    /// <c>settings.Value ?? MemoryDefaults.XMb(total)</c>, converted MB -&gt; bytes with
+    /// <c>* 1024L * 1024L</c>.
+    /// </para>
+    /// <para>
+    /// <see cref="IMemoryWatchdog.OnAccountLaunched"/>/<c>OnAccountExited</c> bookkeeping is wired
+    /// separately, in <see cref="WireRobloxWindowDecorator"/>, at the same
+    /// <see cref="IRobloxProcessTracker.ProcessAttached"/>/<c>ProcessExited</c> call sites the
+    /// decorator uses — this method only owns settings plus start/stop.
+    /// </para>
+    /// <para>
+    /// <b>The generation is captured before the first read, not after.</b> Everything between that
+    /// capture and the commit is the window in which a Settings nudge outranks this read. Without
+    /// it, a tick that picked up <c>true</c> a moment before the user unticked the box would
+    /// restart the watchdog seconds after an explicit opt-out — the interleaving
+    /// <c>MetricAlertsGateTests</c> records for the metric opt-in, which this mirrors.
+    /// </para>
+    /// </summary>
+    private async Task RefreshMemoryWatchdogAsync(IAppSettings settings)
+    {
+        if (_services is null) return;
+        try
+        {
+            var gate = _services.GetRequiredService<MemoryWatchdogGate>();
+            var generation = gate.BeginRead();
+
+            var enabled = await settings.GetMemoryWatchdogEnabledAsync().ConfigureAwait(true);
+
+            var watchdog = _services.GetRequiredService<IMemoryWatchdog>();
+            var systemProbe = _services.GetRequiredService<ISystemMemoryProbe>();
+            systemProbe.TryRead(out var totalPhysicalBytes, out _);
+
+            var reserveMb = await settings.GetMemoryReserveMbAsync().ConfigureAwait(true);
+            var capMb = await settings.GetMemoryCapMbAsync().ConfigureAwait(true);
+            watchdog.ReserveBytes = (reserveMb ?? MemoryDefaults.ReserveMb(totalPhysicalBytes)) * 1024L * 1024L;
+            watchdog.CapBytes = (capMb ?? MemoryDefaults.CapMb(totalPhysicalBytes)) * 1024L * 1024L;
+            watchdog.ProjectionWarnMinutes = await settings.GetProjectionWarnMinutesAsync().ConfigureAwait(true);
+
+            if (!gate.TryCommit(generation, enabled))
+            {
+                _log?.LogDebug("Memory watchdog re-read dropped: the toggle moved while it was in flight.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Couldn't refresh the memory watchdog settings; it keeps its current state.");
+        }
+    }
+
+    /// <summary>
+    /// Bridges <see cref="IMemoryWatchdog.PressureCrossed"/> to the tray warning badge, and to
+    /// nothing else (Task 8; narrowed to the badge alone on 2026-10-06 by v1.33 item 3).
+    /// Deliberately its own Wire* method — <see cref="WireMemoryWatchdogAsync"/> only owns settings
+    /// + <see cref="IMemoryWatchdog.Start"/>, matching that method's own doc note that
+    /// <c>OnAccountLaunched</c>/<c>OnAccountExited</c> bookkeeping lives elsewhere too.
+    /// <para>
+    /// THE BALLOON USED TO BE HERE, and it was the defect. This method called
+    /// <c>ITrayService.ShowMemoryWarning</c> — a method that no longer exists at all, deleted with
+    /// the rest of its chain on 2026-10-06 by item 4 — on every crossing while knowing nothing about alert
+    /// destinations, the per-account mute or the quiet period — so the measured outcome on
+    /// 2026-10-05 was <c>AlertDispatcher</c> logging "routed nowhere" under the cooldown while the
+    /// balloon went out anyway. The <see cref="AlertKind.MemoryWarning"/> trigger
+    /// <c>MainViewModel.BuildMemoryAlerts</c> already raises off the same crossing is now the only
+    /// thing that reaches a screen, and it routes like every other kind.
+    /// <c>OnePathToTheScreenFenceTests</c> in the test project is what keeps a second
+    /// producer from coming back; the alternative — teaching this method the routing rules — would
+    /// mean two places that know them, and the one most likely to be edited in a hurry is the one
+    /// that cannot be reached from a test (spec §1, "Why not gate the tray path instead").
+    /// </para>
+    /// <para>
+    /// THE BADGE STAYS, unconditional and uncadenced. It is a colour change, not an interruption,
+    /// so there is nothing for a quiet period to protect — and it is what keeps memory pressure
+    /// visible to a user who has turned every destination off (PRD, "still find out").
+    /// </para>
+    /// <para>
+    /// <see cref="IMemoryWatchdog.PressureCrossed"/> fires from <c>MemoryWatchdog.Sample()</c>,
+    /// which runs on the watchdog's own <see cref="System.Threading.Timer"/> callback — NOT the UI
+    /// thread. <see cref="TrayService.SetMemoryWarning"/> marshals internally, so this handler
+    /// doesn't need to; it still wraps in try/catch because an unhandled exception on a threadpool
+    /// timer callback takes the whole process down, and this is the one code path that only runs
+    /// when a user is already in trouble.
+    /// </para>
+    /// <para>
+    /// Only ever calls <c>SetMemoryWarning(true)</c> here — edge-triggered, once per latched
+    /// crossing. Clearing back to <c>false</c> is NOT this method's job:
+    /// <see cref="MainViewModel"/>'s existing 30s ticker re-evaluates
+    /// <see cref="MemoryPressureEvaluator.IsClear"/> against the watchdog's latest snapshot and
+    /// clears the badge once the warning condition actually recedes.
+    /// </para>
+    /// </summary>
+    private void WireMemoryWarningTray()
+    {
+        if (_services is null) return;
+        try
+        {
+            var watchdog = _services.GetRequiredService<IMemoryWatchdog>();
+            var tray = _services.GetRequiredService<ITrayService>();
+
+            watchdog.PressureCrossed += (_, _) =>
+            {
+                try
+                {
+                    tray.SetMemoryWarning(true);
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogWarning(ex, "Memory-warning tray bridge threw; the badge may not have coloured for this crossing.");
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Memory-warning tray wiring failed; the tray badge won't colour this session.");
+        }
+    }
+
+    /// <summary>
+    /// Runs the one-time <c>MuteIdleAlerts</c> migration (v1.33 item 3): a v1.8 user who ticked
+    /// "mute idle alerts" gets <c>IdleDestinations = []</c>, and the flag is cleared so this never
+    /// runs again. Guarded like every other startup step — a failed migration must not block
+    /// startup, and it is self-healing: the flag is only cleared after the destinations are
+    /// written, so a failure here retries on the next launch rather than losing the user's answer.
+    /// </summary>
+    private async Task MigrateIdleMuteAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var migrated = await ROROROblox.Core.Discord.IdleMuteMigration.RunAsync(
+                _services.GetRequiredService<IAppSettings>(),
+                _services.GetRequiredService<DiscordConfigService>()).ConfigureAwait(true);
+
+            if (migrated)
+            {
+                _log?.LogInformation(
+                    "Carried the v1.8 \"mute idle alerts\" preference forward as an empty idle destination list; the setting is now a routing row.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "The idle-mute migration failed; it will be retried on the next launch.");
+        }
+    }
+
+    /// <summary>
+    /// Pushes the cached idle-warn threshold from <see cref="IAppSettings"/> into
+    /// <see cref="MainViewModel"/> (which forwards the threshold into
+    /// <see cref="IActivityMonitor.WarnThreshold"/>). Called once at startup after
+    /// <see cref="WireActivityMonitor"/> has started the monitor; after that, the Settings page
+    /// re-pushes per edit (F-013 — a shell page has no close moment to ride). Wrapped
+    /// defensively — a settings-read
+    /// failure must not block startup; idle awareness just falls back to the 15-minute default.
+    /// </summary>
+    private async Task InitializeIdleSettingsAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var settings = _services.GetRequiredService<IAppSettings>();
+            var vm = _services.GetRequiredService<MainViewModel>();
+            await vm.InitializeIdleSettingsAsync(settings);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "InitializeIdleSettingsAsync failed; idle awareness stays at defaults.");
+        }
+    }
+
+    /// <summary>
+    /// Streamer mode (v1.9) — seed the identity provider with every saved account's persisted
+    /// fake identity before the provider is ever consulted. Reads accounts directly from
+    /// <see cref="IAccountStore"/> rather than <see cref="MainViewModel.AccountsSnapshot"/>: the
+    /// VM's own load is kicked off by MainWindow's Loaded handler and isn't guaranteed to have
+    /// completed by this point, while the store read here is independent and authoritative.
+    /// Guarded like every other OnStartup init step — a seeding failure must not block startup;
+    /// worst case, identities lazily reassign (and re-persist) the first time streamer mode
+    /// resolves an account that missed the seed.
+    /// </summary>
+    private async Task InitializeStreamerModeAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var accountStore = _services.GetRequiredService<IAccountStore>();
+            var provider = _services.GetRequiredService<ROROROblox.Core.StreamerMode.IStreamerIdentityProvider>();
+            var accounts = await accountStore.ListAsync();
+            var seed = accounts
+                .Where(a => !string.IsNullOrEmpty(a.StreamerName))
+                .Select(a => (a.Id, new ROROROblox.Core.StreamerMode.StreamerIdentity(a.StreamerName!, a.StreamerAvatarId ?? "noodle")))
+                .ToList();
+            await provider.InitializeAsync(seed);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Streamer-mode identity provider seed failed; identities will lazily assign on first resolve.");
+        }
+    }
+
+    /// <summary>
+    /// Bridges the app's two alert producers — <see cref="MainViewModel.AlertsRaised"/> and
+    /// <c>MetricReportSinkAdapter.AlertsRaised</c> — to <see cref="AlertDispatcher"/>, and seeds
+    /// the metric-alert opt-in gate.
+    /// <para>
+    /// Deliberately independent of Discord presence: this runs whether or not Discord is
+    /// installed, configured, or running, because the desktop-notification destination is the one
+    /// that needs no setup and therefore the one most users will actually have.
+    /// </para>
+    /// </summary>
+    private async Task WireAlertsAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var configService = _services.GetRequiredService<DiscordConfigService>();
+            var phoneConfigService = _services.GetRequiredService<ROROROblox.Core.Notify.PhoneNotifyConfigService>();
+            // Together, not sequentially: two independent DPAPI blobs (separate files, separate
+            // gates) on the startup critical path, and neither load should wait on the other
+            // (review 2026-09-04).
+            await Task.WhenAll(configService.InitializeAsync(), phoneConfigService.InitializeAsync())
+                .ConfigureAwait(true);
+
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var dispatcher = _services.GetRequiredService<AlertDispatcher>();
+
+            // Paint the saved mutes onto the rows. Without this the preference persists but the
+            // row shows unmuted after every restart — the user re-mutes an account that was never
+            // going to alert, and stops trusting the toggle.
+            var muted = configService.Current.MutedAccountIds.ToHashSet();
+            foreach (var row in vm.Accounts)
+            {
+                row.AlertsMuted = muted.Contains(row.Id);
+            }
+
+            // Fire-and-forget on purpose: AlertsRaised is raised from ApplyPresence and the
+            // watchdog's crossing handler, both of which are on the UI thread and neither of which
+            // may be made to wait on an HTTP POST to Discord. DispatchAsync swallows its own
+            // failures (see its remarks), so there is no unobserved-exception hazard here.
+            vm.AlertsRaised += (_, triggers) => _ = dispatcher.DispatchAsync(triggers);
+
+            // Metric breaches reach the dispatcher by exactly the path every other alert kind
+            // takes, which is what makes mute, the cooldown and coalescing apply to them without a
+            // line of new routing code (the cooldown slot for a breach is per account and metric
+            // id rather than per account and kind, corrected 2026-09-15; see AlertCooldownKey).
+            // Fire-and-forget for the reason above and one more: this event is raised on a
+            // thread-pool timer thread when a metric grouping window closes (corrected 2026-09-15;
+            // through 1.28 it was the gRPC handler thread), and a timer callback must not be
+            // parked on an HTTP POST either.
+            //
+            // Cast to the concrete adapter on purpose. AlertsRaised lives there and not on
+            // IMetricReportSink, because that interface is the plugin-facing sink and an event on
+            // it would advertise a second subscriber path into the same pipe. GetService, not
+            // GetRequiredService: the alert path is a passenger, and a missing sink must not be
+            // what takes the dispatcher wiring down with it.
+            if (_services.GetService<ROROROblox.App.Plugins.IMetricReportSink>()
+                is ROROROblox.App.Plugins.Adapters.MetricReportSinkAdapter metricSink)
+            {
+                metricSink.AlertsRaised += (_, triggers) => _ = dispatcher.DispatchAsync(triggers);
+            }
+
+            // Seed the opt-in gate (see MetricAlertsEnabled for why it is a cached bool and not a
+            // settings read), then keep it current on the view model's existing 30s tick. A tick
+            // rather than a settings-change hook because there is no such hook to use: IAppSettings
+            // broadcasts nothing. The tick is no longer the only writer, though — as of 2026-09-11
+            // the metric-alerts toggle in Settings calls SetMetricAlertsGate the moment it saves,
+            // so a flip is live immediately rather than up to 30 s later (and rather than never,
+            // on the install with no rules file yet). The tick stays because it is what catches a
+            // hand-edited settings.json, which is still a supported way in. Piggybacking it is this
+            // app's habit for exactly this reason — the idle chips, the memory repaint and the
+            // uptime mark all ride it rather than stand up a timer of their own.
+            var settings = _services.GetRequiredService<IAppSettings>();
+            await RefreshMetricAlertsGateAsync(settings).ConfigureAwait(true);
+            vm.PeriodicTick += (_, _) => _ = RefreshMetricAlertsGateAsync(settings);
+
+            // Same seed-then-ride-the-tick shape, and for the same reason: IAppSettings broadcasts
+            // nothing, so there is no change hook to use. Unlike the metric gate this one has no
+            // file-existence shortcut — the cadence applies to every kind on every install, so
+            // there is nothing to skip.
+            await RefreshAlertCadenceAsync(settings).ConfigureAwait(true);
+            vm.PeriodicTick += (_, _) => _ = RefreshAlertCadenceAsync(settings);
+
+            // And the sound (v1.33 item 5), on the same tick for the same reason.
+            await RefreshAlertSoundAsync(settings).ConfigureAwait(true);
+            vm.PeriodicTick += (_, _) => _ = RefreshAlertSoundAsync(settings);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Couldn't wire Discord alerts; the app runs without them.");
+        }
+    }
+
+    /// <summary>
+    /// Re-reads the metric-alert opt-in into <see cref="MetricAlertsEnabled"/>. Async all the way
+    /// down on purpose — see that field for why the gate itself may never wait on this.
+    ///
+    /// <para><b>A failed read turns the gate OFF; it does not preserve it.</b> That is worth saying
+    /// plainly because the obvious reading is the opposite one. <c>AppSettings.LoadAsync</c> never
+    /// throws: a locked file (<c>IOException</c>), a zero-length read mid-save, and a corrupt blob
+    /// (<c>JsonException</c>) all return a DEFAULT <c>SettingsBlob</c>, whose
+    /// <c>MetricAlertsEnabled</c> is <c>false</c>. So the likeliest failure — this tick colliding
+    /// with a concurrent save — never reaches the catch below; it writes <c>false</c> over a
+    /// <c>true</c> gate and silences alerts until the next tick reads the file cleanly. At most 30
+    /// seconds, self-healing, and in the safe direction, which is why it is accepted rather than
+    /// worked around. The catch below is for the genuinely exceptional (a disposed settings
+    /// object, say), and only THAT path leaves the gate at its previous value.</para>
+    ///
+    /// <para><b>It cannot overwrite a nudge that landed after its read began.</b> The generation is
+    /// captured before the read and checked as part of the assignment — see
+    /// <see cref="MetricAlertsGateLock"/> for the interleaving that made this necessary, and note
+    /// that the losing direction is the one that matters: the tick dropping a read costs at most
+    /// 30 seconds of staleness against a value the user did not just choose, while the tick winning
+    /// costs up to 30 seconds of alerts after an explicit opt-out.</para>
+    /// </summary>
+    private async Task RefreshMetricAlertsGateAsync(IAppSettings settings)
+    {
+        try
+        {
+            // No rules file, no rules; no rules, and the sink returns before the gate's value can
+            // change any outcome. Skipping the read here is what keeps this tick free for the
+            // overwhelming majority of installs that will never write that file: the accessor has
+            // no cache, so every call takes the settings semaphore and re-reads and re-parses
+            // settings.json — every 30 seconds, for the whole process lifetime, in every session.
+            // One existence check on a local path replaces all of it, and the tick after the file
+            // appears picks the setting up, so the skip costs at most 30 s of latency at the one
+            // moment the feature starts to exist.
+            //
+            // The gate is deliberately NOT forced false here. A stale-true gate with no rules is
+            // already inert, and writing to it would only add a second place that decides what
+            // the opt-in is.
+            if (!System.IO.File.Exists(MetricRulesPath)) return;
+
+            // BEFORE the read, not after: the window a nudge has to win is exactly the span
+            // between this line and the commit below.
+            var generation = BeginMetricAlertsGateRead();
+            var enabled = await settings.GetMetricAlertsEnabledAsync().ConfigureAwait(false);
+            if (!TryCommitMetricAlertsGate(generation, enabled))
+            {
+                // Debug, not a warning: this is the mechanism working. It is logged at all because
+                // a gate that disagrees with a file read seconds earlier is otherwise unexplainable
+                // from a log.
+                _log?.LogDebug(
+                    "Metric-alert opt-in re-read was overtaken by a Settings change; the newer value stands.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Metric-alert opt-in re-read threw; the gate keeps its last value.");
+        }
+    }
+
+    /// <summary>
+    /// Re-reads the two cadence keys into <see cref="AlertCadenceSetting"/>.
+    ///
+    /// <para>A failed read lands on the shipped five minutes rather than keeping the last value, and
+    /// that is the same deliberate direction <see cref="RefreshMetricAlertsGateAsync"/> documents:
+    /// <c>AppSettings.LoadAsync</c> never throws — a locked file, a zero-length read mid-save and a
+    /// corrupt blob all return a DEFAULT <c>SettingsBlob</c>, whose <c>AlertCadenceMinutes</c> is 5.
+    /// So the likeliest failure writes the default over a user's choice for at most 30 seconds,
+    /// self-healing, and in the quieter direction. Only a genuinely exceptional throw reaches the
+    /// catch below, which leaves the cadence at its previous value.</para>
+    ///
+    /// <para><b>It cannot overwrite a nudge that landed after its read began</b> (item 6). The
+    /// generation is captured before the FIRST of the two reads, not between them: a nudge landing
+    /// in the gap would otherwise be overwritten by a global read from before it paired with an
+    /// override read from after it — a cadence that was never in the file at all.</para>
+    /// </summary>
+    private async Task RefreshAlertCadenceAsync(IAppSettings settings)
+    {
+        try
+        {
+            // BEFORE the first read, not between the two: see the remark above.
+            var generation = BeginAlertCadenceRead();
+            var minutes = await settings.GetAlertCadenceMinutesAsync().ConfigureAwait(false);
+            var overrides = await settings.GetAlertCadenceOverridesJsonAsync().ConfigureAwait(false);
+            var resolved = ROROROblox.Core.Discord.AlertCadence.FromSettings(minutes, overrides);
+            if (!TryCommitAlertCadence(generation, resolved))
+            {
+                // Debug, not a warning: this is the mechanism working, and the same level
+                // RefreshMetricAlertsGateAsync logs its own drop at.
+                _log?.LogDebug(
+                    "Alert-cadence re-read was overtaken by a Settings change; the newer value stands.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Alert-cadence re-read threw; the cadence keeps its last value.");
+        }
+    }
+
+    /// <summary>
+    /// Re-reads the sound choice into <see cref="AlertSoundSetting"/>.
+    ///
+    /// <para>Every failure direction here ends on the chime, which is the opposite of what
+    /// <see cref="RefreshAlertCadenceAsync"/> does and deliberately so. <c>AppSettings.LoadAsync</c>
+    /// never throws — a locked file, a zero-length read mid-save and a corrupt blob all return a
+    /// DEFAULT <c>SettingsBlob</c>, whose <c>AlertSound</c> is <c>"Chime"</c> — so the likeliest
+    /// failure overwrites a user's chosen silence with a noise for at most 30 seconds. That is the
+    /// annoying direction rather than the harmful one: the quiet direction is a user who stops being
+    /// told about a crashed client and has no way to tell that from nothing happening.</para>
+    /// </summary>
+    private async Task RefreshAlertSoundAsync(IAppSettings settings)
+    {
+        try
+        {
+            var generation = BeginAlertSoundRead();
+            var stored = await settings.GetAlertSoundAsync().ConfigureAwait(false);
+            var resolved = ROROROblox.Core.Discord.AlertSoundSetting.FromSetting(stored);
+            if (!TryCommitAlertSound(generation, resolved))
+            {
+                _log?.LogDebug(
+                    "Alert-sound re-read was overtaken by a Settings change; the newer value stands.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Alert-sound re-read threw; the sound keeps its last value.");
+        }
+    }
+
+    /// <summary>
+    /// Account id to (masked display name, real name) for an alert raised off the UI thread.
+    /// Masked first, because it is the one nearly every destination gets and only the clan channel
+    /// is allowed the real one — the same order and the same two properties every other
+    /// <c>AlertTrigger</c> site in this app uses.
+    ///
+    /// <para>Reads <see cref="MainViewModel.AccountsSnapshot"/>, never <c>Accounts</c>: this runs
+    /// on a gRPC handler thread, and the observable collection is UI-owned. The snapshot is the
+    /// lock-free mirror that exists for exactly this call.</para>
+    ///
+    /// <para><b>Resolving the view model here is safe only because of startup order, and that is
+    /// load-bearing.</b> <see cref="MainViewModel"/> is WPF-affine and is NOT registered through
+    /// <see cref="UiBoundFactory"/>, so whichever thread resolves it first is the thread that
+    /// constructs it. This func must therefore never be the first resolver. It is not, and cannot
+    /// become one by accident, because <see cref="MetricAlertsEnabled"/> stays false until a writer
+    /// turns it on, and BOTH writers run after the view model's first UI-thread resolve (this said
+    /// "until <c>WireAlertsAsync</c> seeds it" and named one writer until 2026-09-11).
+    /// <see cref="WireAlertsAsync"/>'s seed is one: by then <c>OnStartup</c> has resolved the view
+    /// model on the UI thread several times over (<c>WireMainViewModelEvents</c>, the
+    /// <c>ShellPageOpener</c> assignment, and <c>WireAlertsAsync</c>'s own <c>vm</c>).
+    /// <see cref="SetMetricAlertsGate"/> is the other, and only <see cref="Preferences.SettingsPage"/>
+    /// calls it — a page that cannot be opened before the shell exists, which is later still.
+    /// A false gate returns from <c>Report</c> before reaching this func at all, so every call that
+    /// gets here is already behind one of them. Moving the seed earlier than the view model's first UI-thread
+    /// resolve would reintroduce the hazard silently — the container would happily build a
+    /// <see cref="MainViewModel"/> on a gRPC thread and the crash would land somewhere else
+    /// entirely.</para>
+    ///
+    /// <para>An id with no account — including <see cref="Guid.Empty"/>, the documented global
+    /// carrier a plugin lands on when it reports something that belongs to no account — yields a
+    /// pair of empty strings rather than throwing. A name is decoration on a metric alert; the
+    /// number is the message, and losing the decoration must not lose the alert.</para>
+    /// </summary>
+    private static (string Display, string Real) ResolveAlertNames(
+        IServiceProvider sp, Guid accountId, ILogger<App> log)
+    {
+        try
+        {
+            var summary = sp.GetRequiredService<MainViewModel>()
+                .AccountsSnapshot.FirstOrDefault(a => a.Id == accountId);
+            return summary is null
+                ? (string.Empty, string.Empty)
+                : (summary.RenderName, summary.DisplayName);
+        }
+        catch (Exception ex)
+        {
+            // Debug, like every other swallow on this path, but never silent: an alert that
+            // arrives with no name on it should be explicable from the log rather than looking
+            // like a rendering bug somewhere downstream.
+            log.LogDebug(ex, "Couldn't resolve names for metric-alert subject {AccountId}; the alert carries none.", accountId);
+            return (string.Empty, string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// Is this saved account running on THIS PC right now: the metric sink's "who may an alert name"
+    /// question (Este's ruling, 2026-10-19). Reads <see cref="MainViewModel.AccountsSnapshot"/>, the
+    /// same lock-free mirror <see cref="ResolveAlertNames"/> and the running-accounts provider read,
+    /// never <c>Accounts</c>, and is called on a gRPC handler thread behind the same gate (see
+    /// <see cref="ResolveAlertNames"/> for why it can never be the first resolver of the view model).
+    /// An id with no matching account answers false; a failure answers false too, so the alert
+    /// names nobody and says so rather than naming an alt that may not be running here.
+    /// </summary>
+    private static bool IsRunningHere(IServiceProvider sp, Guid accountId, ILogger<App> log)
+    {
+        try
+        {
+            return sp.GetRequiredService<MainViewModel>()
+                .AccountsSnapshot.Any(a => a.Id == accountId && a.IsRunning);
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "Couldn't tell whether metric-alert subject {AccountId} is running here; treating it as not running.", accountId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Discord presence + Join, startup half (Task 9). Skips the whole feature — no client, no
+    /// presence service, nothing assigned to <see cref="MainViewModel.DiscordPresence"/> — when
+    /// <c>Discord:ApplicationId</c> (appsettings.json) is empty. The committed file ships the real
+    /// public id since commit 8c75544 (2026-08-03), so on a normal install this branch is not taken;
+    /// a stripped or hand-edited config still lands here (this line said "which it is by default"
+    /// until 2026-08-30).
+    /// <see cref="LacheeDiscordRpcClientAdapter.Initialize"/> already guards the same case
+    /// defensively, but constructing and starting a presence service that can never connect is
+    /// pointless ceremony, and Preferences needs to know NOW (not discover it lazily on first
+    /// toggle) so it can disable the checkboxes and say why instead of showing controls that
+    /// quietly do nothing. <see cref="JoinUriScheme.Register"/> already ran earlier in
+    /// <see cref="OnStartup"/>, well before this — Discord refuses to accept a presence carrying
+    /// join secrets until that registration exists.
+    /// <para>
+    /// Subscribes BOTH inbound-join paths to the same <see cref="MainViewModel.HandleDiscordJoinAsync"/>
+    /// — the brief for this task only mentions <see cref="DiscordPresenceService.JoinRequested"/>
+    /// (the in-client Join button), but <see cref="JoinRequested"/> (this class's own event, the
+    /// <c>roblox-rororo:</c> OS protocol-handler path Task 7 built) has no other subscriber
+    /// anywhere in the codebase. Without this second subscription, a Join click that arrives while
+    /// RoRoRo is closed (Discord cold-starts us with the URI) decodes correctly, raises the event,
+    /// and then goes nowhere — the entire protocol-handler path would ship as dead code.
+    /// </para>
+    /// <para>
+    /// The two events are marshalled differently, per each one's own doc remarks:
+    /// <see cref="JoinRequested"/> already arrives on the UI thread (<c>SingleInstanceGuard</c>
+    /// raises its relay inside <c>Dispatcher.Invoke</c>; cold start runs from <c>OnStartup</c>,
+    /// itself on the UI thread) and is wired directly. <see cref="DiscordPresenceService.JoinRequested"/>
+    /// arrives on Lachee's background RPC thread with nothing in its chain that marshals, so it is
+    /// hopped onto the UI thread via <c>Dispatcher.InvokeAsync</c> before ever touching
+    /// <see cref="MainViewModel"/> or showing <see cref="Modals.JoinRequestWindow"/> — skipping
+    /// that hop is the common crash here (every in-client Join goes through this path), not a rare
+    /// edge case.
+    /// </para>
+    /// <para>
+    /// No account name enters the presence payload today — <c>PresencePayloadBuilder.Build</c>
+    /// only ever reads <c>InGame</c>/<c>Server</c>/<c>GameName</c>/<c>InGameSinceUtc</c> off each
+    /// <see cref="ROROROblox.Core.Discord.RosterAccount"/>, never <c>DisplayName</c> — so streamer
+    /// mode flipping <c>RenderName</c> has nothing to leak outbound and does not need to trigger
+    /// <see cref="DiscordPresenceService.Refresh"/>. If a future change puts a name on the wire,
+    /// that same commit must wire <c>IStreamerIdentityProvider.Changed</c> to
+    /// <c>DiscordPresence?.Refresh()</c> (Task 6 review finding).
+    /// </para>
+    /// <para>
+    /// <b>Fix round 1, Finding 1.</b> Both events are dispatched through one
+    /// <see cref="InboundJoinDispatcher"/> instance rather than calling
+    /// <c>HandleDiscordJoinAsync</c> directly, so both gate on the LIVE <c>JoinEnabled</c> setting
+    /// (<see cref="DiscordPresenceService.JoinEnabled"/>) before dispatching anything. Before this
+    /// fix, the <see cref="JoinRequested"/> (protocol-handler) path had no such gate anywhere in its
+    /// chain — <see cref="JoinUriScheme.Register"/> runs unconditionally on every install, and
+    /// neither <c>InboundJoinRelay.Handle</c> nor <c>HandleDiscordJoinAsync</c> check
+    /// <c>JoinEnabled</c> — so once a real application id shipped, the URI alone could launch a
+    /// saved account (and take over a running session) whether or not the user ever turned Join on.
+    /// </para>
+    /// </summary>
+    private async Task WireDiscordPresenceAsync(MainWindow mainWindow, string applicationId)
+    {
+        if (_services is null) return;
+        try
+        {
+            // FIX 6: applicationId is now read once, by OnStartup, BEFORE deciding whether to
+            // register the URI scheme — see that call site's remarks. Re-checking here (rather
+            // than trusting the caller) keeps this method safe to call on its own.
+            if (string.IsNullOrWhiteSpace(applicationId))
+            {
+                _log?.LogDebug("Discord:ApplicationId is empty; Discord presence disabled this session.");
+                return;
+            }
+
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var configService = _services.GetRequiredService<DiscordConfigService>();
+            await configService.InitializeAsync().ConfigureAwait(true);
+            var config = configService.Current;
+
+            var client = new LacheeDiscordRpcClientAdapter(
+                applicationId,
+                _services.GetRequiredService<ILogger<LacheeDiscordRpcClientAdapter>>(),
+                packagedInstall: _services.GetRequiredService<Distribution.IDistributionMode>().IsPackaged);
+            var presence = new DiscordPresenceService(
+                client,
+                vm.BuildRosterSnapshot,
+                _services.GetRequiredService<ILogger<DiscordPresenceService>>());
+            vm.DiscordPresence = presence;
+
+            await presence.ApplyAsync(config).ConfigureAwait(true);
+
+            // Views, not snapshots: every future write reaches the live presence service through
+            // the owner's Changed event, whoever the writer is — the Preferences toggles no
+            // longer call ApplyAsync themselves. Marshalled: the owner raises inside its write
+            // gate, on whatever thread the mutation completed on, and ApplyAsync has only ever
+            // been called from the UI thread.
+            configService.Changed += (_, updated) =>
+                _ = Dispatcher.InvokeAsync(() => _ = presence.ApplyAsync(updated));
+
+            // Fix round 1, Finding 1: both inbound-join paths gate on the LIVE JoinEnabled setting.
+            // Fix round 2: they're two SEPARATE InboundJoinDispatcher instances now, not one shared
+            // one — origin is fixed per call site and, as of round 2, changes what
+            // HandleDiscordJoinAsync does (a UriHandler join always confirms; a DiscordClient join
+            // only confirms for a private server). See InboundJoinDispatcher's + HandleDiscordJoinAsync's
+            // remarks for the full reasoning.
+            //
+            // FIX 4 (final whole-branch review, 2026-08-03): the two origins are NOT equally
+            // visible when their confirm fires. Both URI paths already surface the window before
+            // this delegate can run — SingleInstanceGuard's relay calls SurfaceWindow inside the
+            // same Dispatcher.Invoke that raises JoinUriReceived, and cold start's mainWindow.Show()
+            // runs before OnStartup ever dispatches the cold-start join. The in-client Discord Join
+            // button has no such guarantee: RoRoRo's steady state is minimized to tray, and nothing
+            // upstream of DiscordPresenceService.JoinRequested touches the window. Without this,
+            // JoinRequestWindow.Confirm centers on an owner that is not on screen — surface it first.
+            var discordClientConfirm = new Func<string, bool>(msg =>
+            {
+                SurfaceMainWindow(mainWindow);
+                return Modals.JoinRequestWindow.Confirm(mainWindow, msg);
+            });
+            var uriHandlerConfirm = new Func<string, bool>(msg => Modals.JoinRequestWindow.Confirm(mainWindow, msg));
+            var inClientJoin = new InboundJoinDispatcher(
+                joinEnabled: () => presence.JoinEnabled,
+                viewModel: vm,
+                origin: JoinOrigin.DiscordClient,
+                confirm: discordClientConfirm,
+                log: _log);
+            var uriHandlerJoin = new InboundJoinDispatcher(
+                joinEnabled: () => presence.JoinEnabled,
+                viewModel: vm,
+                origin: JoinOrigin.UriHandler,
+                confirm: uriHandlerConfirm,
+                log: _log);
+
+            // In-client Join button — Lachee's background RPC thread. Must hop to the UI thread
+            // before reaching InboundJoinDispatcher.HandleAsync (see this method's remarks + both
+            // types' own doc comments) — it ends up at HandleDiscordJoinAsync, which can show a
+            // modal (JoinRequestWindow.Confirm) and reach LaunchAccountAsync, neither of which
+            // should run on the RPC thread. InvokeAsync with an async lambda, not a bare Invoke, so
+            // the hop doesn't block that thread either.
+            presence.JoinRequested += (_, target) =>
+                Dispatcher.InvokeAsync(async () => await inClientJoin.HandleAsync(target).ConfigureAwait(true));
+
+            // roblox-rororo: URI (cold start or relayed from a second instance) — already
+            // UI-thread-marshalled by the time it reaches here; see JoinRequested's own remarks.
+            // Fire-and-forget is safe: HandleAsync never throws (see its own doc comment).
+            JoinRequested += (_, target) => _ = uriHandlerJoin.HandleAsync(target);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Discord presence wiring failed; continuing without it.");
+        }
+    }
+
+    /// <summary>
+    /// The single place that knows what the Settings page needs. Every door goes through the
+    /// shell (<see cref="CreateShellPage"/>), so a dependency added to the page is added once,
+    /// in the composition root, rather than in every caller.
+    /// </summary>
+    private Preferences.SettingsPage BuildSettingsPage()
+    {
+        ArgumentNullException.ThrowIfNull(_services);
+        return new Preferences.SettingsPage(
+            _services.GetRequiredService<IAppSettings>(),
+            _services.GetRequiredService<IStartupRegistration>(),
+            _services.GetRequiredService<IThemeStore>(),
+            _services.GetRequiredService<ThemeService>(),
+            _services.GetRequiredService<IAccountStore>(),
+            _services.GetRequiredService<ROROROblox.Core.Transport.IAccountTransport>(),
+            _services.GetRequiredService<MainViewModel>(),
+            _services.GetRequiredService<DiscordConfigService>(),
+            _services.GetRequiredService<AlertDispatcher>(),
+            _services.GetRequiredService<DiscordWebhookSender>(),
+            _services.GetRequiredService<WebhookProbe>(),
+            _services.GetRequiredService<ROROROblox.Core.Notify.PhoneNotifyConfigService>(),
+            _services.GetRequiredService<Notify.PhoneAlertSender>(),
+            // v1.18 item 4a — the Memory section states what a blank box resolves to on this
+            // machine, and it resolves it through the same MemoryDefaults calls
+            // WireMemoryWatchdogAsync uses. Same registration (:717), same singleton, so the
+            // figure on screen and the figure the watchdog runs with cannot come apart.
+            _services.GetRequiredService<ISystemMemoryProbe>(),
+            // Same singleton RefreshMemoryWatchdogAsync commits to: the toggle has to move the
+            // watchdog this session, not just the file.
+            _services.GetRequiredService<MemoryWatchdogGate>(),
+            _services.GetRequiredService<Tray.IAlertSoundPlayer>());
+    }
+
+    /// <summary>
+    /// Reads <c>Discord:ApplicationId</c> straight out of appsettings.json next to the exe. No
+    /// <c>IConfiguration</c> binder runs anywhere in this process —
+    /// <see cref="ROROROblox.App.Plugins.PluginHostStartupService"/> deliberately uses
+    /// <c>WebApplication.CreateSlimBuilder</c> specifically to skip that config stack (see its own
+    /// remarks) — so this is a direct, minimal JSON read rather than pulling in
+    /// Microsoft.Extensions.Configuration.Json for one string. A missing file, malformed JSON, or
+    /// a missing/non-string key all resolve to <see cref="string.Empty"/> (feature off), same
+    /// tamper-tolerant shape as <see cref="DiscordConfigStore"/>.
+    /// </summary>
+    private static string ReadDiscordApplicationId()
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            if (!System.IO.File.Exists(path))
+            {
+                return string.Empty;
+            }
+
+            using var doc = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText(path));
+            if (doc.RootElement.TryGetProperty("Discord", out var discord) &&
+                discord.TryGetProperty("ApplicationId", out var appId) &&
+                appId.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                return appId.GetString() ?? string.Empty;
+            }
+
+            return string.Empty;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    private void WireMainAvatarTrayPainter()
+    {
+        if (_services is null) return;
+        try
+        {
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var painter = _services.GetRequiredService<MainAvatarTrayPainter>();
+            var dispatcher = Dispatcher;
+
+            // Initial paint — runs after Load fills the accounts list (LoadAsync triggers
+            // OnPropertyChanged for MainAccount, which we'll catch). But also kick once now
+            // in case the VM was already populated synchronously.
+            _ = painter.UpdateAsync(vm.MainAccount?.AvatarUrl, dispatcher);
+
+            vm.PropertyChanged += async (_, e) =>
+            {
+                if (e.PropertyName == nameof(MainViewModel.MainAccount))
+                {
+                    await painter.UpdateAsync(vm.MainAccount?.AvatarUrl, dispatcher);
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WireMainAvatarTrayPainter failed; tray stays default.");
+        }
+    }
+
+    // The idle-settings re-push that used to ride this door's close now happens per-edit inside
+    // the Settings page itself, which also covers the main-window door (it never re-pushed at
+    // all); the Discord re-read died with the owner rework (PR A of this wave).
+    private void OpenPreferencesFromTray(Window owner) => OpenShellPage(Shell.ShellPage.Settings);
+
+    private void OpenHistoryFromTray(Window owner) => OpenShellPage(Shell.ShellPage.History);
+
+    private void OpenPluginsFromTray(Window owner) => OpenShellPage(Shell.ShellPage.Plugins);
+
+    private void OpenDiagnosticsFromTray(Window owner)
+    {
+        try
+        {
+            OpenShellPage(Shell.ShellPage.Diagnostics);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Couldn't open Diagnostics window from tray");
+        }
+    }
+
+    private void WireMutexLost(IMutexHolder mutex, ITrayService tray)
+    {
+        mutex.MutexLost += (_, _) =>
+        {
+            // MutexLost fires on a System.Timers.Timer thread; marshal to UI for tray update.
+            Current.Dispatcher.Invoke(() => tray.UpdateStatus(MultiInstanceState.Error));
+            // Plugin bus is thread-safe (synchronous Action invoke) — fire from the
+            // timer thread directly so subscribers see the event without the UI marshal.
+            TryRaiseMutexBusEvent("Error");
+        };
+    }
+
+    private void ToggleMutex(IMutexHolder mutex, ITrayService tray)
+    {
+        if (mutex.IsHeld)
+        {
+            mutex.Release();
+            tray.UpdateStatus(MultiInstanceState.Off);
+            TryRaiseMutexBusEvent("Off");
+        }
+        else
+        {
+            var acquired = mutex.Acquire();
+            tray.UpdateStatus(acquired ? MultiInstanceState.On : MultiInstanceState.Error);
+            TryRaiseMutexBusEvent(acquired ? "On" : "Error");
+        }
+    }
+
+    /// <summary>How long Retry keeps re-attempting the singleton name before giving up.</summary>
+    private static readonly TimeSpan RecoveryWindow = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan RecoveryInterval = TimeSpan.FromMilliseconds(150);
+
+    /// <summary>
+    /// Seamless takeover: when Roblox holds the singleton Event but ONLY via windowless tray
+    /// clients, close them and reclaim the name — no modal, and no tray client put back (#241, 2026-10-26). Returns true
+    /// when RoRoRo now owns the Event; false means the caller should fall through to the BLOCKED
+    /// modal (an in-game client is present, or the reclaim failed).
+    ///
+    /// <para>The windowless-only gate (<see cref="SeamlessTakeover.WindowlessOnly"/>) is the whole
+    /// safety story: a windowed client may be mid-game, so it is never closed without the confirming
+    /// modal. A tray client has nothing to lose, so closing it silently is safe — and it is exactly
+    /// what makes RoRoRo coexist with Roblox-on-startup instead of blocking on every launch.</para>
+    /// </summary>
+    private async Task<bool> TrySeamlessTakeoverAsync()
+    {
+        if (_services is null) return false;
+
+        IReadOnlyList<RobloxProcessInfo> players;
+        try
+        {
+            players = _services.GetRequiredService<IRobloxRunningProbe>().GetRunningPlayers();
+        }
+        catch (Exception ex)
+        {
+            // Can't tell windowed from windowless — be conservative and let the modal handle it.
+            _log?.LogDebug(ex, "Seamless takeover: player scan threw; deferring to the modal.");
+            return false;
+        }
+
+        if (!SeamlessTakeover.WindowlessOnly(players))
+        {
+            return false; // in-game client (or nothing) — not eligible for a silent close
+        }
+
+        _log?.LogInformation(
+            "Seamless takeover: {Count} windowless tray Roblox client(s) hold the Event; closing and reclaiming.",
+            players.Count);
+
+        try { _services.GetRequiredService<IRobloxInstanceStopper>().StopAll(); }
+        catch (Exception ex) { _log?.LogWarning(ex, "Seamless takeover: StopAll failed; still attempting to acquire."); }
+
+        var mutex = _services.GetRequiredService<IMutexHolder>();
+        var outcome = await mutex
+            .TryAcquireWithRetryAsync(RecoveryWindow, RecoveryInterval)
+            .ConfigureAwait(true);
+
+        if (outcome != MutexAcquireOutcome.Acquired)
+        {
+            _log?.LogInformation(
+                "Seamless takeover: could not reclaim the name after closing tray clients ({Outcome}); deferring to the modal.",
+                outcome);
+            return false;
+        }
+
+        // No tray client is put back here (#241, live 2026-10-26): the relaunched
+        // `--launch-to-tray` client took the next roblox-player launch, so RoRoRo's launcher exited in
+        // ~4 s and the game ran in an untracked tray process. Roblox spawns its own tray client when a
+        // game window closes, so the user's tray presence returns on its own, and every launch now
+        // ends idle tray clients first anyway.
+
+        var tray = _services.GetRequiredService<ITrayService>();
+        tray.UpdateStatus(MultiInstanceState.On);
+        TryRaiseMutexBusEvent("On");
+        return true;
+    }
+
+    /// <summary>Shared multi-instance recovery: optionally close all Roblox first (with the
+    /// unsaved-state confirm when windowed clients exist), then re-attempt the singleton name.
+    /// Returns whether RoRoRo may proceed with multi-instance working. Used by the BLOCKED startup
+    /// modal and the runtime banner.
+    ///
+    /// <para><b>Why this polls.</b> The named kernel object dies only when its LAST handle closes,
+    /// and a just-quit (or just-killed) RobloxPlayerBeta takes a beat to tear down. The old code
+    /// made one instantaneous attempt, which is why "quit Roblox from the tray, then hit Retry"
+    /// so often failed the first press and worked the second. A bounded poll absorbs the lag.</para>
+    ///
+    /// <para>Returns true for <see cref="MutexAcquireOutcome.HeldByCompatibleTool"/> too: we don't
+    /// own the handle, but Roblox lost its singleton to that tool, so multi-instance works and
+    /// there is nothing left to recover.</para>
+    /// </summary>
+    internal async Task<bool> TryRecoverMultiInstanceAsync(bool closeRobloxFirst)
+    {
+        if (_services is null) return false;
+        var mutex = _services.GetRequiredService<IMutexHolder>();
+        if (mutex.IsHeld) return true;
+
+        if (closeRobloxFirst)
+        {
+            var probe = _services.GetRequiredService<IRobloxRunningProbe>();
+            var players = probe.GetRunningPlayers();
+            var windowed = players.Count(p => p.HasWindow);
+            if (windowed > 0)
+            {
+                // Live game windows among the processes — confirm before killing.
+                var confirm = new Modals.StopAllConfirmWindow(players.Count);
+                if (confirm.ShowDialog() != true) return mutex.IsHeld; // user cancelled
+            }
+            try { _services.GetRequiredService<IRobloxInstanceStopper>().StopAll(); }
+            catch (Exception ex) { _log?.LogWarning(ex, "Close-for-me StopAll failed; retrying acquire anyway."); }
+        }
+
+        var outcome = await mutex
+            .TryAcquireWithRetryAsync(RecoveryWindow, RecoveryInterval)
+            .ConfigureAwait(true); // continue on the UI thread — tray + modal touch it below
+
+        var state = outcome switch
+        {
+            MutexAcquireOutcome.Acquired => MultiInstanceState.On,
+            // A peer tool holds the name: multi-instance works, we just don't own the handle.
+            // "Off" (not "Error") is the honest tray state — same as a Start-anyway launch.
+            MutexAcquireOutcome.HeldByCompatibleTool => MultiInstanceState.Off,
+            _ => MultiInstanceState.Error,
+        };
+
+        var tray = _services.GetRequiredService<ITrayService>();
+        tray.UpdateStatus(state);
+        TryRaiseMutexBusEvent(state.ToString());
+
+        _log?.LogInformation("Multi-instance recovery finished: {Outcome} (closeRobloxFirst={CloseFirst}).",
+            outcome, closeRobloxFirst);
+
+        return outcome is MutexAcquireOutcome.Acquired or MutexAcquireOutcome.HeldByCompatibleTool;
+    }
+
+    /// <summary>LEFTOVER "Clean up + continue": stop leftover clients, with the unsaved-state
+    /// confirm only when windowed clients exist. The mutex is already held here.</summary>
+    private void CleanUpLeftoverRoblox(bool hasWindowedClients)
+    {
+        if (_services is null) return;
+        try
+        {
+            if (hasWindowedClients)
+            {
+                var count = _services.GetRequiredService<IRobloxRunningProbe>().GetRunningPlayerPids().Count;
+                var confirm = new Modals.StopAllConfirmWindow(count);
+                if (confirm.ShowDialog() != true) return;
+            }
+            _services.GetRequiredService<IRobloxInstanceStopper>().StopAll();
+        }
+        catch (Exception ex) { _log?.LogWarning(ex, "Leftover clean-up failed."); }
+    }
+
+    /// <summary>
+    /// LEFTOVER modal's "Clear strays" action: stops only the windowless orphans and leaves any
+    /// windowed clients running untouched — no confirmation, because a windowless orphan has
+    /// nothing to lose (same reasoning as <see cref="SeamlessTakeover.WindowlessOnly"/>).
+    /// </summary>
+    private void ClearLeftoverStrays()
+    {
+        if (_services is null) return;
+        try
+        {
+            var stopped = _services.GetRequiredService<IRobloxInstanceStopper>().StopWindowless();
+            _log?.LogInformation("Leftover clean-up: cleared {Stopped} windowless stray Roblox process(es).", stopped);
+        }
+        catch (Exception ex) { _log?.LogWarning(ex, "Leftover stray clean-up failed."); }
+    }
+
+    /// <summary>
+    /// Wires the runtime contested-mutex watcher (Task 4/8): when Roblox grabs the lock while
+    /// RoRoRo is running (tray-resident), <see cref="MutexContestedWatcher.ContestedChanged"/>
+    /// flips the banner on; the banner's two actions re-enter the same
+    /// <see cref="TryRecoverMultiInstance"/> recovery path the startup BLOCKED modal uses, and
+    /// clear the banner on success. The watcher's own timer thread marshals to the UI thread via
+    /// Dispatcher; VM event handlers already run on the UI thread (RelayCommand.Execute), so no
+    /// further marshaling is needed there.
+    /// </summary>
+    private void WireContestedWatcher(MainWindow mainWindow)
+    {
+        if (_services is null) return;
+        var watcher = _services.GetRequiredService<MutexContestedWatcher>();
+        var vm = _services.GetRequiredService<MainViewModel>();
+
+        watcher.ContestedChanged += (_, contested) =>
+            Dispatcher.Invoke(() => vm.SetContested(contested));
+
+        // async void by necessity — these are fire-and-forget VM events raised on the UI thread.
+        // TryRecoverMultiInstanceAsync polls for up to RecoveryWindow, so awaiting keeps the banner
+        // responsive instead of freezing the window while Roblox's handles drain.
+        vm.RequestCloseRobloxForMe += async () =>
+        {
+            if (await TryRecoverMultiInstanceAsync(closeRobloxFirst: true)) vm.SetContested(false);
+        };
+        vm.RequestRetryMutex += async () =>
+        {
+            if (await TryRecoverMultiInstanceAsync(closeRobloxFirst: false)) vm.SetContested(false);
+        };
+
+        watcher.Start();
+    }
+
+    private void TryRaiseMutexBusEvent(string state)
+    {
+        if (_services is null) return;
+        try
+        {
+            var bus = _services.GetService<ROROROblox.App.Plugins.IPluginEventBus>()
+                as ROROROblox.App.Plugins.InProcessPluginEventBus;
+            bus?.RaiseMutexStateChanged(state);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Plugin event bus mutex-state raise failed; ignoring.");
+        }
+    }
+
+    /// <summary>
+    /// Task 9: a plugin stop is never mistaken for a drop.
+    /// <see cref="ROROROblox.App.Plugins.Adapters.ProcessTrackerAccountStopper"/> is registered
+    /// singleton against <see cref="ROROROblox.App.Plugins.IPluginAccountStopper"/> (see the
+    /// AddSingleton call above) — <c>PluginHostService</c> resolves that same interface, so
+    /// resolving it here too and casting back to the concrete type reaches the exact instance the
+    /// plugin host calls into, not a second one. Its <c>OnStopping</c> hook fires right before a
+    /// stop it is actually going to issue; marshalling that onto <c>MainViewModel.ExpectClose</c>
+    /// through the UI dispatcher stamps the same expected-close protection a user's own Stop button
+    /// gets, so auto-rejoin, the dropped-out alert and the relaunch-pending logic all leave the
+    /// account alone during the grace window.
+    ///
+    /// <para>
+    /// FIX ROUND 1 (review finding): called right after <c>StartPluginHostListener</c>, not down
+    /// with the other <c>Wire*</c> calls near <c>mainWindow</c>. The plugin pipe binds and becomes
+    /// reachable the moment <c>StartPluginHostListener</c> returns — deliberately before the
+    /// startup gate's modals, so an agent can reach RoRoRo while a dialog waits (see that call's own
+    /// comment). The old placement left the hook null for exactly that window: a plugin could call
+    /// StopAccounts while a human was still looking at the already-running or leftover-processes
+    /// dialog, and <c>ExpectClose</c> would never fire.
+    /// </para>
+    /// <para>
+    /// This does NOT force <see cref="MainViewModel"/> into existence any earlier than it already
+    /// is. By the time <c>StartPluginHostListener</c> returns, <see cref="MainViewModel"/> is
+    /// already a constructed, cached singleton — an unavoidable side effect of resolving
+    /// <c>PluginHostStartupService</c>, whose constructor takes <c>PluginHostService</c> directly,
+    /// which takes <see cref="ROROROblox.App.Plugins.IRunningAccountsProvider"/> directly, whose
+    /// only registration (<c>MainViewModelRunningAccountsAdapter</c>) takes <see cref="MainViewModel"/>
+    /// directly — three required constructor parameters, no lazy seam anywhere in the chain.
+    /// <c>PluginAccountStopperWiringTests</c> locks that chain by constructor reflection (never by
+    /// resolving <see cref="MainViewModel"/> for real, which would hit production user-data stores).
+    /// If that chain ever grows a lazy link, resolving <see cref="MainViewModel"/> here would start
+    /// forcing real early construction instead of finding it already done — worth re-reading this
+    /// comment before "simplifying" any of those three constructors.
+    /// </para>
+    /// </summary>
+    private void WirePluginAccountStopper()
+    {
+        if (_services is null) return;
+        try
+        {
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var stopper = _services.GetRequiredService<ROROROblox.App.Plugins.IPluginAccountStopper>()
+                as ROROROblox.App.Plugins.Adapters.ProcessTrackerAccountStopper;
+            if (stopper is null) return;
+
+            stopper.OnStopping = id => vm.UiDispatcher.Invoke(() => vm.ExpectClose(id));
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Plugin account stopper wiring threw; ignoring.");
+        }
+    }
+
+    /// <summary>
+    /// Bridges existing App-layer events into the plugin event bus so subscribed plugins
+    /// see them via the SubscribeAccountLaunched / SubscribeAccountExited /
+    /// SubscribeMutexStateChanged / SubscribeMemoryPressure gRPC streams. Wrapped in
+    /// try/catch — a wiring failure must not block App startup.
+    /// </summary>
+    private void WirePluginEventBus()
+    {
+        if (_services is null) return;
+        try
+        {
+            var tracker = _services.GetRequiredService<IRobloxProcessTracker>();
+            var vm = _services.GetRequiredService<MainViewModel>();
+            var bus = _services.GetRequiredService<ROROROblox.App.Plugins.IPluginEventBus>()
+                as ROROROblox.App.Plugins.InProcessPluginEventBus;
+            if (bus is null) return;
+
+            // Memory pressure (Task 10): forward every tracked account on the snapshot the
+            // watchdog fires with, not just the target -- WireMemoryWarningTray (separate
+            // subscriber, untouched by this change) only cares about the fattest client for
+            // the tray balloon, but a plugin driving an automated recycle-and-macro-back flow
+            // needs the full per-account picture (over_cap / is_target / read_ok) to decide
+            // what to act on.
+            var watchdog = _services.GetRequiredService<IMemoryWatchdog>();
+            watchdog.PressureCrossed += (_, snap) =>
+            {
+                try
+                {
+                    foreach (var account in snap.Accounts)
+                    {
+                        bus.RaiseMemoryPressure(account);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogDebug(ex, "Plugin bus MemoryPressure bridge threw; ignoring.");
+                }
+            };
+
+            tracker.ProcessAttached += (_, e) =>
+            {
+                try
+                {
+                    // AccountsSnapshot: tracker events fire on threadpool continuations.
+                    var summary = vm.AccountsSnapshot.FirstOrDefault(a => a.Id == e.AccountId);
+                    if (summary is null) return;
+                    var snapshot = new ROROROblox.App.Plugins.RunningAccountSnapshot(
+                        AccountId: summary.Id.ToString(),
+                        RobloxUserId: summary.RobloxUserId ?? 0,
+                        DisplayName: summary.RenderName,
+                        ProcessId: e.Pid,
+                        PlaceId: summary.CurrentPlaceId ?? 0,
+                        PlaceName: summary.CurrentGameName ?? string.Empty);
+                    bus.RaiseAccountLaunched(snapshot);
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogDebug(ex, "Plugin bus AccountLaunched bridge threw; ignoring.");
+                }
+            };
+
+            tracker.ProcessExited += (_, e) =>
+            {
+                try
+                {
+                    // AccountsSnapshot: tracker events fire on threadpool continuations.
+                    var summary = vm.AccountsSnapshot.FirstOrDefault(a => a.Id == e.AccountId);
+                    var snapshot = new ROROROblox.App.Plugins.RunningAccountSnapshot(
+                        AccountId: e.AccountId.ToString(),
+                        RobloxUserId: summary?.RobloxUserId ?? 0,
+                        DisplayName: summary?.RenderName ?? string.Empty,
+                        ProcessId: e.Pid);
+                    bus.RaiseAccountExited(snapshot, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogDebug(ex, "Plugin bus AccountExited bridge threw; ignoring.");
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "WirePluginEventBus failed; plugins will not see runtime events.");
+        }
+    }
+
+    /// <summary>
+    /// Binds the gRPC plugin host (Kestrel + named pipe). Runs BEFORE the startup gate's
+    /// modals, deliberately.
+    ///
+    /// <para>The gate's modals are shown with <c>ShowDialog()</c>, which pumps a nested message
+    /// loop and blocks the rest of OnStartup until the user answers. When leftover Roblox
+    /// processes exist the leftover modal is always up, so binding the pipe after the gate meant
+    /// the pipe never bound until a human clicked a button. That is exactly the state an internet
+    /// outage leaves behind — dead clients still running — which is precisely when an agent needs
+    /// to reach RoRoRo to clear and relaunch them. Binding first makes the host reachable while
+    /// the dialog waits.</para>
+    ///
+    /// <para>Autostart is NOT kicked here. See <see cref="StartPluginAutostart"/> — no plugin
+    /// process may launch until the user has answered the gate.</para>
+    ///
+    /// <para>The plugin host failing must NOT break RoRoRo's normal launch — a fully-broken
+    /// plugin host still leaves RoRoRo launching, without plugin support.</para>
+    /// </summary>
+    private void StartPluginHostListener()
+    {
+        if (_services is null) return;
+        try
+        {
+            var pluginHost = _services.GetRequiredService<ROROROblox.App.Plugins.PluginHostStartupService>();
+            // Fire-and-forget: StartAsync's first await yields after Kestrel's bind, so
+            // OnStartup doesn't block on it. The continuation observes a faulted task so a
+            // bind failure surfaces as a debug log rather than an unobserved exception.
+            _pluginHostListening = pluginHost.StartAsync(CancellationToken.None);
+            _ = _pluginHostListening.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _log?.LogDebug(t.Exception, "PluginHostStartupService.StartAsync threw; plugins disabled this session.");
+                }
+            }, TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            _pluginHostListening = null;
+            _log?.LogWarning(ex, "Resolving PluginHostStartupService threw; PLUGINS DISABLED this session. "
+                    + "Every installed plugin is unavailable until this is resolved.");
+        }
+    }
+
+    /// <summary>
+    /// Launches autostart-enabled plugin processes, once the startup gate has been answered.
+    ///
+    /// <para>Split from <see cref="StartPluginHostListener"/> so the pipe can bind while a gate
+    /// modal is still up without any plugin acting on the user's machine first. A leftover-processes
+    /// modal that the user answers with "Clean up + continue" stops Roblox clients — a keep-alive
+    /// or macro plugin racing that teardown is not a state worth allowing.</para>
+    ///
+    /// <para>Ordering still matters within the plugin path: plugin processes handshake immediately
+    /// on launch, so the gRPC server has to be listening first or that first call fails with
+    /// "pipe not found". Hence the continuation off the bind task rather than a bare call.</para>
+    /// </summary>
+    private void StartPluginAutostart()
+    {
+        if (_pluginHostListening is null) return; // never bound; nothing to handshake against
+        _ = _pluginHostListening.ContinueWith(t =>
+        {
+            if (t.IsFaulted) return; // already logged by the bind continuation
+            _ = Task.Run(StartPluginAutostartAsync);
+        }, TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Scans the plugin registry and launches every plugin whose consent record has
+    /// AutostartEnabled=true. Runs on the threadpool, well after MainWindow.Show — a
+    /// broken plugin or registry must NOT break RoRoRo's normal startup.
+    /// </summary>
+    private async Task StartPluginAutostartAsync()
+    {
+        if (_services is null) return;
+        try
+        {
+            var registry = _services.GetRequiredService<ROROROblox.App.Plugins.PluginRegistry>();
+            var supervisor = _services.GetRequiredService<ROROROblox.App.Plugins.PluginProcessSupervisor>();
+            // F-101: clear anything left by a previous session BEFORE starting more, so a pile
+            // made before the job object shipped (or in the gap between Start and assignment)
+            // does not survive indefinitely. Runs first so it can never kill our own children.
+            try
+            {
+                var swept = supervisor.SweepOrphans(ROROROblox.App.Plugins.PluginRegistry.DefaultPluginsRoot);
+                if (swept > 0)
+                {
+                    _log?.LogInformation("Swept {Count} orphaned plugin process(es) from a previous session.", swept);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning(ex, "Orphan sweep failed; continuing to autostart.");
+            }
+
+            var plugins = await registry.ScanAsync().ConfigureAwait(false);
+            var autostartCount = plugins.Count(p => p.Consent.AutostartEnabled);
+            _log?.LogDebug(
+                "Plugin autostart: registry scan found {Count} plugin(s), {AutostartCount} autostart-enabled.",
+                plugins.Count, autostartCount);
+            supervisor.StartAutostart(plugins);
+            if (autostartCount > 0)
+            {
+                _log?.LogInformation("Started {Count} plugin process(es) on autostart.", autostartCount);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Plugin autostart threw; plugins not launched this session.");
+        }
+    }
+
+    private ITimer? _knownIssuesTimer;
+
+    private static readonly TimeSpan KnownIssuesRefreshInterval = TimeSpan.FromHours(4);
+
+    /// <summary>
+    /// Known Roblox issues (spec 2026-09-23 §2). Shows the saved copy at once, then downloads now and
+    /// every four hours on the thread pool. Called after the gate, beside plugin autostart, so it never
+    /// touches the theme → mutex → gate order. A failure here costs the page, never startup.
+    /// </summary>
+    private void StartKnownIssuesFeed()
+    {
+        if (_services is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var state = _services.GetRequiredService<ROROROblox.Core.KnownIssues.KnownIssuesState>();
+            var model = _services.GetRequiredService<KnownIssues.KnownIssuesNoticeModel>();
+            state.Changed += (_, snapshot) => model.Apply(snapshot);
+            state.LoadSavedCopy(_services.GetRequiredService<ROROROblox.Core.KnownIssues.IKnownIssuesFeed>());
+
+            _knownIssuesTimer = TimeProvider.System.CreateTimer(
+                _ => _ = RefreshKnownIssuesAsync(),
+                state: null,
+                dueTime: TimeSpan.Zero,
+                period: KnownIssuesRefreshInterval);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(ex, "Known issues could not start; the page stays empty this session.");
+        }
+    }
+
+    private async Task RefreshKnownIssuesAsync()
+    {
+        try
+        {
+            var services = _services;
+            if (services is null)
+            {
+                return;
+            }
+
+            // A fresh typed client per attempt: IHttpClientFactory pools the handler, so this is the
+            // intended use and keeps DNS rotation honest over a days-long session.
+            await services.GetRequiredService<ROROROblox.Core.KnownIssues.KnownIssuesState>()
+                .RefreshAsync(services.GetRequiredService<ROROROblox.Core.KnownIssues.IKnownIssuesFeed>())
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Known issues refresh threw; trying again on the next tick.");
+        }
+    }
+
+    private static void SurfaceMainWindow(Window mainWindow)
+    {
+        if (!mainWindow.IsVisible)
+        {
+            mainWindow.Show();
+        }
+        if (mainWindow.WindowState == WindowState.Minimized)
+        {
+            mainWindow.WindowState = WindowState.Normal;
+        }
+        mainWindow.Activate();
+    }
+
+    private void RequestShutdown()
+    {
+        IsShuttingDown = true;
+
+        // Quitting closes every client at once. Without this, the last thing RoRoRo does on its
+        // way out is page the user about a roster they deliberately shut down.
+        try { _services?.GetRequiredService<MainViewModel>().ExpectCloseForAll(); }
+        catch (Exception ex) { _log?.LogDebug(ex, "Couldn't mark shutdown closes as expected."); }
+
+        Shutdown(0);
+    }
+
+    /// <summary>#246: Windows is ending the session (logoff or shutdown); WPF still runs OnExit after this, which must not read as clean.</summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        _lastExit?.RecordSessionEnding(e.ReasonSessionEnding.ToString());
+        base.OnSessionEnding(e);
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        IsShuttingDown = true;
+        _log?.LogInformation("ROROROblox exiting (code {Code}).", e.ApplicationExitCode);
+        _lastExit?.RecordClean(); // no-op after a recorded crash or session end
+
+        // Stop the plugin host BEFORE disposing the service provider. Kestrel needs the
+        // logger / DI graph alive to drain in-flight calls cleanly. Wrap defensively —
+        // a hung StopAsync must not block the user's exit path.
+        //
+        // Run on the threadpool (not the WPF UI sync context) and bound by a hard timeout —
+        // some Kestrel/Hosting continuations capture the calling DispatcherSynchronizationContext,
+        // and a blocking GetResult() on the UI thread deadlocks (same pattern the comment on
+        // ApplyAtStartup above already calls out). On timeout we abandon the stop and let the
+        // process exit reclaim the pipe handle; OnExit must always finish promptly.
+        if (_services is not null)
+        {
+            // Stop plugin PROCESSES before the host they speak to. Nothing used to: the supervisor
+            // is not IDisposable and no shutdown path called StopAll(), so whether an autostarted
+            // plugin outlived RoRoRo depended entirely on the plugin. A well-behaved one notices
+            // the pipe drop and exits on its own (626labs.ur-task self-exits in ~0.2s). One that
+            // doesn't watch the pipe simply lingers — which is why StopByInstallDirAsync has to
+            // sweep for "a plugin process that outlived the Multi Manager Roblox session that launched it"
+            // before it can wipe an install dir.
+            //
+            // Teardown shouldn't be contingent on third-party goodwill. StopAll kills the tracked
+            // process trees (the starter passes entireProcessTree). There is no graceful path to
+            // take first: Plugin.OnShutdown exists in the contract but nothing has ever called it —
+            // no per-plugin gRPC client is wired. When that lands, it belongs here, ahead of the kill.
+            //
+            // Ordering: plugins first, then Kestrel. Killing them first means their open streams
+            // are gone before the host drains, rather than the host yanking the pipe out from
+            // under processes that are about to die anyway.
+            try
+            {
+                _services.GetService<ROROROblox.App.Plugins.PluginProcessSupervisor>()?.StopAll();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "PluginProcessSupervisor.StopAll threw on exit; plugin processes may be orphaned.");
+            }
+
+            try
+            {
+                var pluginHost = _services.GetService<ROROROblox.App.Plugins.PluginHostStartupService>();
+                if (pluginHost is not null)
+                {
+                    var stopped = Task.Run(() => pluginHost.StopAsync(CancellationToken.None))
+                        .Wait(TimeSpan.FromSeconds(2));
+                    if (!stopped)
+                    {
+                        _log?.LogDebug("PluginHostStartupService.StopAsync did not complete within 2s; abandoning.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "PluginHostStartupService.StopAsync threw on exit; ignoring.");
+            }
+
+            // Close the metric grouping window right after the plugin host stops (2026-09-15).
+            // The sink holds breaches for five seconds before raising them to the alert dispatcher;
+            // until this call it was disposed only by the container at the very end of OnExit, so a
+            // group opened just before quit could still toast or POST while the tray and the HTTP
+            // clients were being torn down. Disposing here drops what is pending (see
+            // MetricBreachBatcher's Exit paragraph), and a report from a handler still draining
+            // after a timed-out host stop opens no new group. A group whose window had ALREADY
+            // closed is already dispatching and is not recalled. The container's dispose below is
+            // then a harmless second call. MetricSinkExitOrderFenceTests pins this ordering.
+            try
+            {
+                (_services.GetService<ROROROblox.App.Plugins.IMetricReportSink>() as IDisposable)?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "MetricReportSinkAdapter.Dispose threw on exit; ignoring.");
+            }
+
+            // Stop the presence poll loop before the provider disposes (mirrors the process
+            // tracker / plugin-host shutdown shape). _services.Dispose() also disposes it
+            // (PresenceService : IDisposable), but stopping first halts the timer cleanly.
+            try
+            {
+                var presence = _services.GetService<IPresenceService>();
+                presence?.Stop();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "PresenceService.Stop threw on exit; ignoring.");
+            }
+
+            // Stop the orphan sweep's timer before anything it calls into goes away. It is not in
+            // the container (constructed with closures over tracker/vm), so nothing else disposes
+            // it — unlike the timers below, which _services.Dispose() would also catch.
+            try
+            {
+                _orphanSweeper?.Dispose();
+                _orphanSweeper = null;
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "Orphan sweeper dispose threw on exit; ignoring.");
+            }
+
+            try
+            {
+                _idleTraySweeper?.Dispose();
+                _idleTraySweeper = null;
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "Idle tray sweeper dispose threw on exit; ignoring.");
+            }
+
+            // Stop the activity-monitor sample timer before the provider disposes (same shape
+            // as the presence poller above). _services.Dispose() also disposes it
+            // (ActivityMonitor : IDisposable), but stopping first halts the timer cleanly.
+            try
+            {
+                var monitor = _services.GetService<IActivityMonitor>();
+                monitor?.Stop();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "ActivityMonitor.Stop threw on exit; ignoring.");
+            }
+
+            // Stop the runtime contested-mutex watcher's poll timer (Task 8) before the provider
+            // disposes. _services.Dispose() also disposes it (MutexContestedWatcher : IDisposable),
+            // but stopping first halts the timer cleanly, same shape as the two stops above.
+            try
+            {
+                _services.GetService<MutexContestedWatcher>()?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "MutexContestedWatcher.Dispose threw on exit; ignoring.");
+            }
+
+            // Discord presence (Task 9) — not DI-registered (WireDiscordPresenceAsync constructs
+            // it conditionally, skipped whenever Discord:ApplicationId is empty), so
+            // _services.DisposeAsync() below never reaches it; this is its only cleanup call.
+            // Dispose() tears down the Lachee IPC client, which is what actually makes Discord
+            // clear the presence on exit rather than leaving a stale status showing until Discord
+            // notices the pipe died on its own.
+            try
+            {
+                _services.GetService<MainViewModel>()?.DiscordPresence?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "DiscordPresenceService.Dispose threw on exit; ignoring.");
+            }
+        }
+
+        _singleInstance?.Dispose();
+
+        // The container holds IAsyncDisposable-only singletons (PluginHostStartupService),
+        // and a sync Dispose() throws InvalidOperationException for those — the repeated
+        // "type only implements IAsyncDisposable" lines in the shutdown log. DisposeAsync
+        // off the dispatcher with a bounded wait, same shape as the StopAsync call above.
+        if (_services is not null)
+        {
+            try
+            {
+                var disposed = Task.Run(() => _services.DisposeAsync().AsTask())
+                    .Wait(TimeSpan.FromSeconds(2));
+                if (!disposed)
+                {
+                    _log?.LogDebug("ServiceProvider.DisposeAsync did not complete within 2s; abandoning.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "ServiceProvider.DisposeAsync threw on exit; ignoring.");
+            }
+        }
+
+        AppLogging.Shutdown();
+        base.OnExit(e);
+    }
+
+    /// <summary>
+    /// Three nets so a stray exception writes to the log instead of vanishing into a Windows
+    /// Error Reporting dialog. None of these <em>recover</em> — they record. The app still
+    /// shuts down on a true unhandled crash; we just have evidence afterward. The one exception
+    /// is a transient DWM composition fault (#246): the dispatcher net marks that one handled.
+    /// </summary>
+    private void WireGlobalExceptionHandlers()
+    {
+        DispatcherUnhandledException += (_, args) =>
+        {
+            // #246, 2026-10-24: two field crashes on v1.33.0, identical. A desktop-composition flip
+            // (0x80263001) lands in WindowChromeWorker's WM_DWMCOMPOSITIONCHANGED handler while DWM
+            // is mid-flip; the next flip re-extends the frame, so the window is fine. Warn and carry on.
+            if (CompositionFaultFilter.IsTransientCompositionFault(args.Exception.HResult, args.Exception.StackTrace))
+            {
+                _log?.LogWarning(args.Exception, "Desktop composition flipped under the window chrome; ignoring (#246).");
+                args.Handled = true;
+                return;
+            }
+
+            _log?.LogError(args.Exception, "Unhandled WPF dispatcher exception.");
+            // Don't mark Handled — let the app crash visibly. Silent crash is worse than loud crash.
+        };
+
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            if (args.ExceptionObject is Exception ex)
+            {
+                _log?.LogCritical(ex, "Unhandled AppDomain exception (terminating={IsTerminating}).", args.IsTerminating);
+                if (args.IsTerminating)
+                {
+                    _lastExit?.RecordCrash(ex);
+                }
+            }
+            else
+            {
+                _log?.LogCritical("Unhandled non-Exception object thrown: {Object}", args.ExceptionObject);
+            }
+            // Best-effort flush before the runtime tears us down.
+            try { AppLogging.Shutdown(); } catch { }
+        };
+
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            _log?.LogWarning(args.Exception, "Unobserved Task exception (already detached from its Task).");
+            args.SetObserved(); // Don't escalate to AppDomain.UnhandledException for a fire-and-forget.
+        };
+
+        // Fourth net: exceptions RelayCommand.Execute swallows. These never reach the
+        // dispatcher handler (Execute's catch eats them first), so without this hook a
+        // command body's unguarded await fails with zero trace.
+        ViewModels.RelayCommand.OnExceptionSwallowed = ex =>
+            _log?.LogWarning(ex, "Exception escaped a command handler (swallowed by RelayCommand).");
+    }
+}

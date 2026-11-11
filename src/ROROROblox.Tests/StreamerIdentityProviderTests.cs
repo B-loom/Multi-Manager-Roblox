@@ -1,0 +1,349 @@
+﻿using ROROROblox.Core;
+using ROROROblox.Core.StreamerMode;
+
+namespace ROROROblox.Tests;
+
+public class StreamerIdentityProviderTests
+{
+    private static StreamerIdentityProvider Make(bool active = false)
+    {
+        var settings = new FakeSettings(active);
+        var provider = new StreamerIdentityProvider(
+            new StreamerNamePool(new[] { "CaptainNoodle", "SirRerollington", "LadyPixel" }),
+            new StreamerAvatarPool(new[] { "noodle", "duck", "potato" }),
+            new InMemoryIdentityStore(),
+            settings,
+            persistAccount: (_, _) => Task.CompletedTask);
+        provider.InitializeAsync(System.Array.Empty<(Guid, StreamerIdentity)>()).GetAwaiter().GetResult();
+        return provider;
+    }
+
+    // Variant exposing the friend store + an account-persist recorder so friend-vs-account
+    // routing can be asserted. Pools stay small (3) — callers that need reroll headroom build inline.
+    private static (StreamerIdentityProvider provider, InMemoryIdentityStore friendStore, List<Guid> accountPersists) MakeWithProbes(bool active)
+    {
+        var friendStore = new InMemoryIdentityStore();
+        var accountPersists = new List<Guid>();
+        var provider = new StreamerIdentityProvider(
+            new StreamerNamePool(new[] { "CaptainNoodle", "SirRerollington", "LadyPixel" }),
+            new StreamerAvatarPool(new[] { "noodle", "duck", "potato" }),
+            friendStore,
+            new FakeSettings(active),
+            persistAccount: (id, _) => { accountPersists.Add(id); return Task.CompletedTask; });
+        provider.InitializeAsync(System.Array.Empty<(Guid, StreamerIdentity)>()).GetAwaiter().GetResult();
+        return (provider, friendStore, accountPersists);
+    }
+
+    private static readonly Guid A = Guid.NewGuid();
+
+    [Fact]
+    public async Task Inactive_ReturnsRealIdentityVerbatim()
+    {
+        var p = Make(active: false);
+        var id = p.ForAccount(A, "RealName", "https://real/avatar.png");
+        Assert.Equal("RealName", id.Name);
+        Assert.Equal("https://real/avatar.png", id.AvatarSource);
+    }
+
+    [Fact]
+    public async Task Active_LeakScan_NeverReturnsRealNameAvatarOrUrl()
+    {
+        var p = Make(active: true);
+        var id = p.ForAccount(A, "RealName", "https://real/avatar.png");
+        Assert.NotEqual("RealName", id.Name);
+        Assert.DoesNotContain("real", id.AvatarSource, System.StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("http", id.AvatarSource, System.StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("pack://", id.AvatarSource);
+    }
+
+    [Fact]
+    public async Task Active_SameAccount_StableAcrossCalls()
+    {
+        var p = Make(active: true);
+        var first = p.ForAccount(A, "RealName", "x");
+        var second = p.ForAccount(A, "RealName", "x");
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public async Task Reroll_ChangesTheIdentity_AndRaisesChanged()
+    {
+        var p = Make(active: true);
+        var before = p.ForAccount(A, "RealName", "x");
+        var raised = false; p.Changed += (_, _) => raised = true;
+        await p.RerollAsync($"account:{A}");
+        var after = p.ForAccount(A, "RealName", "x");
+        Assert.True(raised);
+        Assert.NotEqual(before.Name, after.Name);
+    }
+
+    [Fact]
+    public async Task SetActive_PersistsToSettings_AndRaisesChanged()
+    {
+        var p = Make(active: false);
+        var raised = false; p.Changed += (_, _) => raised = true;
+        await p.SetActiveAsync(true);
+        Assert.True(p.IsActive);
+        Assert.True(raised);
+    }
+
+    [Fact]
+    public async Task RerollAll_AcrossAccounts_AllDistinctAndChanged()
+    {
+        // Pools sized above the account count (6 names/avatars for 3 accounts) so a reroll has
+        // room to land a genuinely different identity — a saturated 3-name pool can't guarantee change.
+        var provider = new StreamerIdentityProvider(
+            new StreamerNamePool(new[] { "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot" }),
+            new StreamerAvatarPool(new[] { "a", "b", "c", "d", "e", "f" }),
+            new InMemoryIdentityStore(),
+            new FakeSettings(on: true),
+            persistAccount: (_, _) => Task.CompletedTask);
+        await provider.InitializeAsync(System.Array.Empty<(Guid, StreamerIdentity)>());
+
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid() };
+        var before = ids.Select(g => provider.ForAccount(g, "RealName", "x").Name).ToArray();
+
+        var raised = false; provider.Changed += (_, _) => raised = true;
+        await provider.RerollAllAsync();
+
+        var after = ids.Select(g => provider.ForAccount(g, "RealName", "x").Name).ToArray();
+
+        Assert.True(raised);
+        Assert.Equal(3, after.Distinct().Count());       // no two accounts collide on one fake name
+        for (var i = 0; i < ids.Length; i++)
+            Assert.NotEqual(before[i], after[i]);          // every account's identity actually changed
+    }
+
+    [Fact]
+    public async Task Inactive_ForFriend_ReturnsRealIdentityVerbatim()
+    {
+        var (p, _, _) = MakeWithProbes(active: false);
+        var id = p.ForFriend(12345L, "FriendReal", "https://real/friend.png");
+        Assert.Equal("FriendReal", id.Name);
+        Assert.Equal("https://real/friend.png", id.AvatarSource);
+    }
+
+    [Fact]
+    public async Task Active_ForFriend_LeakScan_NeverReturnsRealNameAvatarOrUrl()
+    {
+        var (p, _, _) = MakeWithProbes(active: true);
+        var id = p.ForFriend(12345L, "FriendReal", "https://real/friend.png");
+        Assert.NotEqual("FriendReal", id.Name);
+        Assert.DoesNotContain("real", id.AvatarSource, System.StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("http", id.AvatarSource, System.StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("pack://", id.AvatarSource);
+    }
+
+    [Fact]
+    public async Task Active_SameFriend_StableAcrossCalls()
+    {
+        var (p, _, _) = MakeWithProbes(active: true);
+        var first = p.ForFriend(12345L, "FriendReal", "x");
+        var second = p.ForFriend(12345L, "FriendReal", "x");
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public async Task Active_ForFriend_PersistsViaFriendStore_NotAccountCallback()
+    {
+        var (p, friendStore, accountPersists) = MakeWithProbes(active: true);
+        p.ForFriend(12345L, "FriendReal", "x");
+
+        var saved = await friendStore.LoadAllAsync();
+        Assert.True(saved.ContainsKey("friend:12345"));    // routed to the friend store under the friend key
+        Assert.Empty(accountPersists);                     // never routed through the account persist callback
+    }
+
+    // ---- v1.36 item 6 (spec 2.5): the facts line joins the streamer switch. One row per masked
+    // fact, and two rows for the facts that must NOT mask. The summary reads the provider's
+    // IsActive, so the masking is asserted on the real row, not on the provider.
+
+    private static ROROROblox.App.ViewModels.AccountSummary FactsRow(StreamerIdentityProvider provider)
+    {
+        var row = new ROROROblox.App.ViewModels.AccountSummary(new Account(
+            Id: Guid.NewGuid(), DisplayName: "FakeAlt", AvatarUrl: "", CreatedAt: DateTimeOffset.UtcNow,
+            LastLaunchedAt: null,
+            Facts: new AccountFacts(1240, "plus", 3, DateTimeOffset.UtcNow.AddMinutes(-3), null),
+            Note: "Farm alt"));
+        row.AttachIdentityProvider(provider);
+        return row;
+    }
+
+    [Theory]
+    [InlineData("robux")]
+    [InlineData("membership")]
+    [InlineData("friends")]
+    [InlineData("note")]
+    public async Task Active_MasksEachFact_AndInactiveShowsIt(string fact)
+    {
+        var p = Make(active: false);
+        var row = FactsRow(p);
+        string Read() => fact switch
+        {
+            "robux" => row.RobuxText,
+            "membership" => row.MembershipText,
+            "friends" => row.FriendsOnlineText,
+            _ => row.NoteFirstLine,
+        };
+        string Name() => fact switch
+        {
+            "robux" => row.RobuxAccessibleName,
+            "membership" => row.MembershipAccessibleName,
+            "friends" => row.FriendsOnlineAccessibleName,
+            _ => row.NoteAccessibleName,
+        };
+
+        var shown = Read();
+        Assert.NotEqual("••••", shown);
+        Assert.NotEmpty(shown);
+
+        var raised = new List<string?>();
+        row.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+        await p.SetActiveAsync(true);
+
+        if (fact == "note")
+        {
+            Assert.Equal(string.Empty, Read());      // hidden entirely, not masked
+            Assert.False(row.ShowNoteBadge);
+        }
+        else
+        {
+            Assert.Equal("••••", Read());
+            Assert.EndsWith("hidden", Name());       // the accessible name never carries the value
+            Assert.DoesNotContain("1,240", Name());
+        }
+        Assert.Contains(fact switch
+        {
+            "robux" => nameof(ROROROblox.App.ViewModels.AccountSummary.RobuxText),
+            "membership" => nameof(ROROROblox.App.ViewModels.AccountSummary.MembershipText),
+            "friends" => nameof(ROROROblox.App.ViewModels.AccountSummary.FriendsOnlineText),
+            _ => nameof(ROROROblox.App.ViewModels.AccountSummary.NoteFirstLine),
+        }, raised);
+    }
+
+    [Fact]
+    public async Task Active_HidesThePanelsNoteBox_AndNamesStayWithTheMaskedName()
+    {
+        var p = Make(active: false);
+        var row = FactsRow(p);
+        Assert.True(row.ShowNoteBox);
+        Assert.Equal("Farm alt", row.NoteText);
+
+        var raised = new List<string?>();
+        row.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+        await p.SetActiveAsync(true);
+
+        Assert.False(row.ShowNoteBox);                                  // item 7: the box goes with the note
+        Assert.Contains(nameof(ROROROblox.App.ViewModels.AccountSummary.ShowNoteBox), raised);
+        Assert.DoesNotContain("FakeAlt", row.PanelExpanderName);        // the expander's name follows RenderName, so it never leaks the real one
+        Assert.Contains(row.RenderName, row.PanelExpanderName);
+        Assert.Contains(row.RenderName, row.PanelOpenHomeName);
+        Assert.Contains(row.RenderName, row.PanelNoteName);
+    }
+
+    [Fact]
+    public async Task Active_DoesNotMaskTheAgeHint()
+    {
+        var p = Make(active: false);
+        var row = FactsRow(p);
+        var before = row.FactsAgeText;
+        await p.SetActiveAsync(true);
+
+        Assert.Equal("Updated 3 min ago", row.FactsAgeText);
+        Assert.Equal(before, row.FactsAgeText);
+    }
+
+    [Fact]
+    public async Task Active_DoesNotMaskLastPlayed()
+    {
+        var p = Make(active: false);
+        var row = FactsRow(p);
+        var panel = new ROROROblox.App.ViewModels.AccountPanelViewModel(
+            row,
+            () => Task.FromResult<IReadOnlyList<LaunchSession>>([]),
+            () => Task.FromResult<IReadOnlyList<LibraryEntry>>([]),
+            _ => Task.CompletedTask,
+            () => Task.CompletedTask);
+        row.AttachPanel(panel);
+        panel.PrimeLastPlayed([new LaunchSession(Guid.NewGuid(), row.Id, "Alt", null, "Pet Simulator 99", 1L, false,
+            DateTimeOffset.UtcNow.AddHours(-2), null, null)]);
+        var before = row.LastPlayedText;
+        Assert.StartsWith("Pet Simulator 99", before);
+
+        await p.SetActiveAsync(true);
+
+        Assert.Equal(before, row.LastPlayedText);
+        Assert.True(row.ShowLastPlayedBadge);
+    }
+
+    private sealed class FakeSettings : IAppSettings
+    {
+        private bool _on;
+        public FakeSettings(bool on) => _on = on;
+        public Task<bool> GetStreamerModeAsync() => Task.FromResult(_on);
+        public Task SetStreamerModeAsync(bool on) { _on = on; return Task.CompletedTask; }
+        // Remaining IAppSettings members throw NotImplementedException — not exercised here.
+        public Task<string?> GetDefaultPlaceUrlAsync() => throw new NotImplementedException();
+        public Task<bool> GetLaunchMainOnStartupAsync() => throw new NotImplementedException();
+        public Task SetLaunchMainOnStartupAsync(bool e) => throw new NotImplementedException();
+        public Task<bool> GetLaunchWindowedAsync() => throw new NotImplementedException();
+        public Task SetLaunchWindowedAsync(bool e) => throw new NotImplementedException();
+        public Task<string?> GetActiveThemeIdAsync() => throw new NotImplementedException();
+        public Task SetActiveThemeIdAsync(string t) => throw new NotImplementedException();
+        public Task<bool?> GetEdgeRemediationAnswerAsync(string themeId) => throw new NotImplementedException();
+        public Task SetEdgeRemediationAnswerAsync(string themeId, bool accepted) => throw new NotImplementedException();
+        public Task<bool> GetBloxstrapWarningDismissedAsync() => throw new NotImplementedException();
+        /// <summary>F-111. Settable so the stop-grace path can be driven both ways.</summary>
+        public bool AutoForceStop { get; set; }
+        public Task<bool> GetAutoForceStopAsync() => Task.FromResult(AutoForceStop);
+        public Task SetAutoForceStopAsync(bool auto) { AutoForceStop = auto; return Task.CompletedTask; }
+        public Task SetBloxstrapWarningDismissedAsync(bool v) => throw new NotImplementedException();
+        public Task<string?> GetDismissedFpsCapWarningSignatureAsync() => throw new NotImplementedException();
+        public Task SetDismissedFpsCapWarningSignatureAsync(string? s) => throw new NotImplementedException();
+        public Task<bool> GetMuteIdleAlertsAsync() => throw new NotImplementedException();
+        public Task SetMuteIdleAlertsAsync(bool m) => throw new NotImplementedException();
+        public Task<int> GetIdleWarnThresholdMinutesAsync() => throw new NotImplementedException();
+        public Task SetIdleWarnThresholdMinutesAsync(int m) => throw new NotImplementedException();
+        public Task<bool> GetCarefulSquadLaunchAsync() => throw new NotImplementedException();
+        public Task<bool> GetAlwaysShowRecycleAsync() => throw new NotImplementedException();
+        public Task SetAlwaysShowRecycleAsync(bool always) => throw new NotImplementedException();
+        public Task SetCarefulSquadLaunchAsync(bool c) => throw new NotImplementedException();
+        public Task<bool> GetMemoryWatchdogEnabledAsync() => throw new NotImplementedException();
+        public Task SetMemoryWatchdogEnabledAsync(bool e) => throw new NotImplementedException();
+        public Task<int?> GetMemoryReserveMbAsync() => throw new NotImplementedException();
+        public Task SetMemoryReserveMbAsync(int? r) => throw new NotImplementedException();
+        public Task<int?> GetMemoryCapMbAsync() => throw new NotImplementedException();
+        public Task SetMemoryCapMbAsync(int? c) => throw new NotImplementedException();
+        public Task<int> GetProjectionWarnMinutesAsync() => throw new NotImplementedException();
+        public Task SetProjectionWarnMinutesAsync(int m) => throw new NotImplementedException();
+        /// <summary>F-060. Records rather than discards, so the round trip is assertable.</summary>
+        public WindowPlacement? Placement;
+        public Task<WindowPlacement?> GetMainWindowPlacementAsync() => Task.FromResult(Placement);
+        public Task SetMainWindowPlacementAsync(WindowPlacement? placement) { Placement = placement; return Task.CompletedTask; }
+
+        public Task<bool> GetCompactModeAsync() => throw new NotImplementedException();
+        public Task SetCompactModeAsync(bool compact) => throw new NotImplementedException();
+        public Task<string?> GetUiLanguageAsync() => throw new NotImplementedException();
+        public Task SetUiLanguageAsync(string? cultureName) => throw new NotImplementedException();
+        public Task<bool> GetMetricAlertsEnabledAsync() => throw new NotImplementedException();
+        public Task SetMetricAlertsEnabledAsync(bool enabled) => throw new NotImplementedException();
+        public Task<int> GetAlertCadenceMinutesAsync() => throw new NotImplementedException();
+        public Task SetAlertCadenceMinutesAsync(int minutes) => throw new NotImplementedException();
+        public Task<string> GetAlertCadenceOverridesJsonAsync() => throw new NotImplementedException();
+        public Task SetAlertCadenceOverridesJsonAsync(string? overridesJson) => throw new NotImplementedException();
+        public Task<string> GetAlertSoundAsync() => throw new NotImplementedException();
+        public Task SetAlertSoundAsync(string? sound) => throw new NotImplementedException();
+        public Task<string> GetLibraryViewAsync() => throw new NotImplementedException();
+        public Task SetLibraryViewAsync(string? view) => throw new NotImplementedException();
+        public Task<string> GetLibraryFiltersAsync() => throw new NotImplementedException();
+        public Task SetLibraryFiltersAsync(string? filters) => throw new NotImplementedException();
+    }
+
+    private sealed class InMemoryIdentityStore : IStreamerIdentityStore
+    {
+        private readonly Dictionary<string, StreamerIdentity> _m = new();
+        public Task<IReadOnlyDictionary<string, StreamerIdentity>> LoadAllAsync()
+            => Task.FromResult<IReadOnlyDictionary<string, StreamerIdentity>>(_m);
+        public Task SaveAsync(string key, StreamerIdentity id) { _m[key] = id; return Task.CompletedTask; }
+    }
+}

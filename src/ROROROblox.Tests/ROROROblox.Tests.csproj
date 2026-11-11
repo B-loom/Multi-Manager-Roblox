@@ -1,0 +1,59 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="DiscordRichPresence" Version="1.6.1.70" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ROROROblox.Core\ROROROblox.Core.csproj" />
+    <ProjectReference Include="..\ROROROblox.App\ROROROblox.App.csproj" />
+    <!-- The metric-alert smoke harness (tools/MetricSmoke). Referenced so ProfileGuard — which writes
+         the user's real settings, plugin consent and Discord webhook URLs when the harness runs for
+         real — is under the same unit suite as everything else. The direction is tests -> tool -> app;
+         nothing in src/ references tools/, and the Store build publishes the App project by path, so
+         this reference cannot reach a shipped binary. -->
+    <ProjectReference Include="..\..\tools\MetricSmoke\MetricSmoke.csproj" />
+    <!-- The endpoint probe (tools/EndpointProbe). Referenced so its redaction and its "never prints a
+         cookie" guarantee are under the unit suite, not just a manual grep. Same direction as above. -->
+    <ProjectReference Include="..\..\tools\EndpointProbe\EndpointProbe.csproj" />
+  </ItemGroup>
+
+  <!-- Modal XAML copied next to the test binary so ModalDefaultButtonSafetyTests can assert that
+       no destructive button is the Enter-key default. Instantiating a WPF Window in a test needs an
+       STA dispatcher; parsing the shipped markup checks the same property with none of that. -->
+  <ItemGroup>
+    <None Include="..\ROROROblox.App\Modals\RobloxAlreadyRunningWindow.xaml" Link="Modals\RobloxAlreadyRunningWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\ROROROblox.App\Modals\StopAllConfirmWindow.xaml" Link="Modals\StopAllConfirmWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\ROROROblox.App\Modals\FlaggedLaunchWindow.xaml" Link="Modals\FlaggedLaunchWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\ROROROblox.App\Modals\LeftoverProcessesWindow.xaml" Link="Modals\LeftoverProcessesWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <!-- FIX 10 (final whole-branch review, 2026-08-03): JoinRequestWindow was missing from this
+         group, so ModalDefaultButtonSafetyTests never saw it at all. -->
+    <None Include="..\ROROROblox.App\Modals\JoinRequestWindow.xaml" Link="Modals\JoinRequestWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\ROROROblox.App\Modals\EdgeRemediationWindow.xaml" Link="Modals\EdgeRemediationWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\ROROROblox.App\Modals\LaunchHeadroomWindow.xaml" Link="Modals\LaunchHeadroomWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Anonymised 100-row history sample shaped like spec 0 (93 ended, 8 accounts).
+         Committed so backfill tests never read a developer's live session-history.json,
+         which differs per machine and is empty in CI. -->
+    <None Include="Fixtures\session-history-sample.json" Link="Fixtures\session-history-sample.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,203 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using Xunit;
+
+namespace ROROROblox.Tests;
+
+/// <summary>
+/// Validates docs/ui-routes.json as a contract rather than as prose.
+/// <para>
+/// The route file drives a tool that clicks buttons in the live app against real accounts, so two
+/// of these assertions are safety properties, not tidiness: every step must name a control type
+/// (five elements in this app share the name "Settings", and a name-only match binds the Window,
+/// which carries no InvokePattern), and no route may target a denied control by name or AutomationId
+/// (those controls stop Roblox clients, delete accounts, or launch game sessions). Safety properties
+/// belong at build time, not discovered while the tool is driving a live app.
+/// </para>
+/// <para>
+/// <b>WHAT THIS FILE DOES NOT CHECK, stated because it already cost a route (F-098).</b> Every
+/// assertion here is about the route file's SHAPE — known verbs, known control types, deny-list
+/// membership, surface count. <b>None asks whether an element a step names actually exists in the
+/// XAML.</b> When v1.20 moved Games out of the Tools menu, surface 08's <c>invoke Games MenuItem</c>
+/// step stopped resolving against anything and all four tests here stayed green; the break would
+/// have surfaced only when someone next drove the live app.
+/// </para>
+/// <para>
+/// Closing that means either a XAML element index or a running app, and neither is cheap enough to
+/// bolt on here. So the gap is named rather than papered over: <b>a green run of this file means the
+/// route file is well-formed, not that the routes work.</b> Treat a control moving between the
+/// toolbar and a popup as a route change, because it is one.
+/// </para>
+/// </summary>
+public class UiRoutesSchemaTests
+{
+    private static readonly string[] KnownVerbs = { "invoke", "select", "expand", "close-window" };
+
+    /// <summary>Control types the PowerShell resolver knows how to map. Keep in lockstep with
+    /// the $script:ControlTypes table in scripts/capture-ui.ps1.</summary>
+    private static readonly string[] KnownTypes =
+        { "Button", "MenuItem", "ListItem", "Window", "ComboBox", "CheckBox", "List", "Text" };
+
+    private static JsonElement LoadRoutes()
+    {
+        var root = XamlStyleScanner.FindRepoRoot();
+        Assert.NotNull(root);
+        var path = Path.Combine(root!, "docs", "ui-routes.json");
+        Assert.True(File.Exists(path), $"route file missing at {path}");
+        return JsonDocument.Parse(File.ReadAllText(path)).RootElement.Clone();
+    }
+
+    private static IEnumerable<JsonElement> Surfaces(JsonElement doc) =>
+        doc.GetProperty("surfaces").EnumerateArray();
+
+    private static IEnumerable<JsonElement> StepsOf(JsonElement surface)
+    {
+        foreach (var key in new[] { "open", "close" })
+        {
+            if (!surface.TryGetProperty(key, out var arr)) continue;
+            foreach (var step in arr.EnumerateArray()) yield return step;
+        }
+    }
+
+    [Fact]
+    public void EveryStepNamesATypeAndExactlyOneSelector()
+    {
+        var doc = LoadRoutes();
+        var problems = new List<string>();
+
+        foreach (var surface in Surfaces(doc))
+        {
+            var id = surface.GetProperty("id").GetString();
+            foreach (var step in StepsOf(surface))
+            {
+                var verb = step.TryGetProperty("do", out var d) ? d.GetString() : null;
+                if (verb is null || !KnownVerbs.Contains(verb))
+                    problems.Add($"{id}: unknown verb '{verb}'");
+
+                if (!step.TryGetProperty("type", out var t) || string.IsNullOrWhiteSpace(t.GetString()))
+                    problems.Add($"{id}: step '{verb}' carries no type");
+                else if (!KnownTypes.Contains(t.GetString()))
+                    problems.Add($"{id}: step '{verb}' names unknown type '{t.GetString()}'");
+
+                var hasName = step.TryGetProperty("name", out _);
+                var hasAid = step.TryGetProperty("aid", out _);
+                if (hasName == hasAid)
+                    problems.Add($"{id}: step '{verb}' must carry exactly one of name/aid");
+            }
+        }
+
+        Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems));
+    }
+
+    [Fact]
+    public void EveryDenyAidIsDeclared_AndThePanelsAndTheLibrarysLaunchControlsAreAmongThem()
+    {
+        var doc = LoadRoutes();
+        var aids = doc.GetProperty("denyAids").EnumerateArray().Select(x => x.GetString()!).ToList();
+        Assert.Equal(11, aids.Count);
+        Assert.Contains("DangerPanelLaunch", aids);
+        Assert.Contains("DangerOpenRobloxHome", aids);
+        Assert.Contains("DangerPlay", aids);     // v1.36 item 9: the Library's per-entry Play
+        Assert.Contains("DangerPlayAs", aids);   // v1.36 item 9: the Library's per-entry Play as
+
+        // Each id is a real AutomationId in the XAML that owns it, so a rename cannot leave a dead guard behind.
+        // The main window owns the account row's and the panel's; the Library page owns Play and Play as (the
+        // picker those open is a ContextMenu of account items, which carry no Danger id of their own).
+        var appDir = Path.Combine(XamlStyleScanner.FindRepoRoot()!, "src", "ROROROblox.App");
+        var xaml = string.Join(Environment.NewLine, new[]
+        {
+            Path.Combine(appDir, "MainWindow.xaml"),
+            Path.Combine(appDir, "Games", "GamesPage.xaml"),
+            Path.Combine(appDir, "Games", "AccountPickerFlyout.xaml"),
+        }.Select(File.ReadAllText));
+        foreach (var aid in aids)
+            Assert.Contains($"AutomationProperties.AutomationId=\"{aid}\"", xaml);
+    }
+
+    [Fact]
+    public void NoRouteTargetsADeniedName()
+    {
+        var doc = LoadRoutes();
+        var deny = doc.GetProperty("deny").EnumerateArray()
+            .Select(x => x.GetString()!).ToHashSet(StringComparer.Ordinal);
+
+        // Guards the guard: an empty deny list or missing entries would make this test vacuously pass.
+        Assert.Contains("Stop all Roblox instances", deny);
+        Assert.Contains("Remove", deny);
+        Assert.Contains("Launch As", deny);
+        Assert.Contains("Launch multiple", deny);
+        Assert.Contains("Squad Launch", deny);
+        Assert.Contains("Stop", deny);
+        Assert.Contains("Recycle", deny);
+        Assert.Contains("Stop all", deny);
+        Assert.Contains("Open Roblox home", deny); // v1.36 item 7: the panel's launch button
+        Assert.Contains("Play", deny);              // v1.36 item 9: the Library's launch buttons
+        Assert.Contains("Play as", deny);
+        Assert.Equal(11, deny.Count);
+
+        var problems = new List<string>();
+        foreach (var surface in Surfaces(doc))
+        {
+            var id = surface.GetProperty("id").GetString();
+            foreach (var step in StepsOf(surface))
+            {
+                if (step.TryGetProperty("name", out var n) && deny.Contains(n.GetString()!))
+                    problems.Add($"{id}: step targets denied name '{n.GetString()}'");
+
+                if (step.TryGetProperty("aid", out var a) && deny.Contains(a.GetString()!))
+                    problems.Add($"{id}: step targets denied aid '{a.GetString()}'");
+            }
+        }
+
+        Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems));
+    }
+
+    [Fact]
+    public void SurfaceIdsAreUniqueAndEveryCapturedSurfaceHasATarget()
+    {
+        var doc = LoadRoutes();
+        var ids = Surfaces(doc).Select(s => s.GetProperty("id").GetString()!).ToList();
+
+        Assert.Equal(ids.Count, ids.Distinct(StringComparer.Ordinal).Count());
+
+        var problems = new List<string>();
+        foreach (var surface in Surfaces(doc))
+        {
+            var id = surface.GetProperty("id").GetString();
+            var skipped = surface.TryGetProperty("skip", out _);
+            var hasCapture = surface.TryGetProperty("capture", out var cap);
+
+            if (skipped && hasCapture) problems.Add($"{id}: skipped surfaces must not declare a capture target");
+            if (!skipped && !hasCapture) problems.Add($"{id}: captured surface declares no capture target");
+
+            if (hasCapture)
+            {
+                if (!cap.TryGetProperty("type", out _)) problems.Add($"{id}: capture target carries no type");
+                if (cap.TryGetProperty("name", out _) == cap.TryGetProperty("aid", out _))
+                    problems.Add($"{id}: capture target must carry exactly one of name/aid");
+            }
+        }
+
+        Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems));
+    }
+
+    [Fact]
+    public void TheFileDescribesTheCampaignItClaimsTo()
+    {
+        var doc = LoadRoutes();
+        var all = Surfaces(doc).ToList();
+        var captured = all.Where(s => !s.TryGetProperty("skip", out _)).ToList();
+
+        // Vacuity floor. A file that lost most of its surfaces would otherwise pass every
+        // assertion above, since they all quantify over whatever happens to be present.
+        Assert.Equal(18, all.Count);
+        Assert.True(captured.Count >= 13,
+            $"expected at least 13 captured surfaces, found {captured.Count}");
+
+        // 04 was retired by glow wave 2 and must not come back.
+        Assert.DoesNotContain(all, s => s.GetProperty("id").GetString() == "04");
+    }
+}

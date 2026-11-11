@@ -1,0 +1,241 @@
+---
+title: Privacy Policy
+description: How RORORO handles your Roblox session data on Windows.
+permalink: /privacy/
+---
+
+# Privacy Policy — RORORO
+
+**Effective date:** *(set on the day of public Store listing)*
+**Version:** *(matches release version when published)*
+**Publisher:** 626 Labs LLC
+**Contact:** support@626labs.dev
+
+---
+
+## TL;DR
+
+- **Your Roblox password is never seen by RORORO.** Login happens inside Roblox's own page, embedded in a Microsoft Edge WebView2 frame.
+- **Roblox session cookies are stored locally only**, encrypted with the Windows Data Protection API (DPAPI), tied to your Windows user account. Copying the file to another PC won't work — *unless you deliberately export your accounts* (Account export, v1.6), which re-encrypts them under a passphrase you choose into a file you save where you want. No cloud, no upload.
+- **Account facts *(v1.36+)*: shown, not kept in any plain file.** The Robux balance, Plus membership and friends-online count under each account are read from Roblox with that account's own session cookie, and cached only inside the same DPAPI-encrypted `accounts.dat`, along with the note you write for the account.
+- **No telemetry. No analytics. No third-party tracking.** RORORO makes network calls to Roblox-owned endpoints while it runs, not just at launch, including a presence heartbeat about every 25 seconds per saved account, and to GitHub Releases (for the daily update check, the compatibility feed, the known Roblox issues list (v1.31+), and, in direct-download builds only, the plugin catalog when you open the Plugins page).
+- **No data leaves your PC** except the Roblox-side calls described below — the same calls Roblox.com would make from your browser — and, if you choose to use it, a passphrase-encrypted account-export file that you save yourself (never auto-uploaded).
+- **You can delete everything, but uninstalling may not do it for you.** Your data sits in one of two places, and which one depends on how your copy got installed — Windows decides that, not RORORO. To find out which case you are in: press `Win+R`, paste `%LOCALAPPDATA%\ROROROblox`, and press Enter. If that folder opens, that is your data, and **uninstalling always leaves it behind** — delete the folder yourself for a full clean. If Windows says it does not exist, your copy keeps its data inside its own app package folder under `%LOCALAPPDATA%\Packages\`, and **uninstalling removes it with the app**. Checking that one path is all it takes. (Until 2026-08-30 this bullet claimed a Store uninstall always auto-removed the vault; until 2026-10-11 it claimed the opposite for every install type. Both were drawn from one PC. The paragraph under "What RORORO stores on your PC" explains the actual rule and says plainly which half is still unconfirmed.)
+
+---
+
+## What RORORO stores on your PC
+
+| Location | Contents | Encryption |
+|---|---|---|
+| `accounts.dat` (in the app's local data folder) | Your saved Roblox session cookies and minimal account metadata (display name, account ID, avatar URL); cached Robux, membership and friends-online count, and your note *(v1.36+)* | **DPAPI-encrypted** per Windows user |
+| `settings.json` (in the app's local data folder) | UI preferences: theme, window placement, compact-mode state, memory thresholds, toggles | Plain text — no secrets |
+| `webview2-data\` (in the app's local data folder) | Embedded-browser profiles used during Add Account. Every Add Account gets a fresh folder and older ones are swept afterwards, so a login never inherits the previous account's cookie. | Plain — swept, never reused across accounts |
+| `last-update-check.txt` (in the app's local data folder) | Timestamp of the most recent update check | Plain text — no secrets |
+| Logs (in the app's local data folder) | Structured operational logs. Cookie values are **never** logged — only redacted indicators. | Plain text — no secrets |
+| `consent.dat` *(v1.4+)* (in the app's local data folder) | Per-plugin consent records — which plugins you installed, which capabilities you granted, autostart toggles | **DPAPI-encrypted** per Windows user |
+| `plugins\<plugin-id>\` *(v1.4+)* (in the app's local data folder) | Files for plugins you installed (manifest, EXE, dependencies). Plugins are SHA-256-verified against the publisher's hash before extraction; the unpacked files are plain on disk. | Plain — integrity is enforced at install time, not at rest |
+| `favorites.json`, `private-servers.json` | Your games library and saved private-server links (a private-server link is a soft credential: anyone with it can join that server) | Plain text |
+| `session-history.json`, `session-stats.json` *(v1.23+)* | Your launch history (last 100 rows) and the stats rollup built from it. Local only; nothing is transmitted. | Plain text — no secrets |
+| `notify.dat` *(v1.25+)* (in the app's local data folder) | Phone-alert settings: which push service you picked, your Pushover user key and application token, your ntfy topic and server. Every one of these is a bearer credential. | **DPAPI-encrypted** per Windows user |
+| `themes\` | Custom theme files you added or built | Plain text — no secrets |
+| `streamer-identities.dat` *(v1.11+)* | The invented names streamer mode assigns to your friends (account identities live in `accounts.dat`) | Plain text — holds no secrets despite the extension |
+| `last-known-mutex.txt`, `.welcome-shown` | The last verified singleton name from the compatibility feed; a marker that the welcome tour has been shown | Plain text — no secrets |
+| `known-issues.cache.json` + `.sig`, `known-issues-dismissed.json` *(v1.31+)* | The last verified copy of the known Roblox issues list and its signature (re-verified every time it is loaded); the ids of the notices you closed | Plain text — no secrets, nothing about you |
+
+**Where the "app's local data folder" actually is depends on your install, and Windows decides it rather than RORORO.** The rule for packaged apps — which the Microsoft Store and sideload MSIX builds both are — is that Windows writes to a real AppData folder **only if that folder already exists on the PC**, and otherwise redirects the writes into the app's own package folder:
+
+| Your install | Where the files are | Does uninstall delete them? |
+|---|---|---|
+| Direct download, ever, on this PC | `%LOCALAPPDATA%\ROROROblox\` | **No.** Windows leaves it. Delete it yourself. |
+| Microsoft Store or sideload, on a PC that already has that folder | the same `%LOCALAPPDATA%\ROROROblox\` | **No.** Same folder, same leftover. |
+| Microsoft Store only, on a PC that never had a direct download | `%LOCALAPPDATA%\Packages\626LabsLLC.RoRoRoBlox_…\LocalCache\Local\ROROROblox\` | **Yes.** It goes with the app. |
+
+The practical version is the bullet above: check `%LOCALAPPDATA%\ROROROblox` once, and its presence or absence tells you which row you are in.
+
+**All three rows are now measured.** Rows 1 and 2 were verified live on this publisher's PC on 2026-08-30 and again on 2026-10-11, where the folder holds 1,189 files and the Store build writes into it. **Row 3 was measured on 2026-10-11**: with the real folder absent, the shipped Store build did not recreate it, and wrote all nine of its first-run files — settings, logs, caches and the singleton marker — into `…\Packages\626LabsLLC.RoRoRoBlox_…\LocalCache\Local\ROROROblox\` instead. A Store uninstall removes that folder. The reason RORORO is in the redirected case: a packaged app can ask Windows to switch this redirection off, but that switch is gated behind a restricted capability Microsoft reserves for games, and RORORO deliberately does not request it.
+
+One honest limit on row 3. That run did not create an account, so the vault file itself was never written — it lives in the same directory as the nine files above and is created by the same resolution, so it follows, but it is an inference from the folder rather than a direct sighting of that one file. Full method and raw output: `docs/store/smoke-2026-10-11-appdata-redirection.md`. Either way the one-step check above gives you the right answer for your own PC, which is why it is the instruction and this paragraph is only the reasoning. No row claims your data goes anywhere off your PC; this is only about which folder on it. (Until 2026-08-30 this section said Store installs used a virtualized folder that uninstall removes; until 2026-10-11 it said the real folder was used for every install type. Each was true of the PC it was tested on and overstated as a rule.)
+
+---
+
+## What RORORO does NOT store
+
+- Your Roblox password. RORORO never receives it; it travels directly from your keystrokes inside the embedded login page to Roblox's servers via HTTPS.
+- Personally identifiable information beyond what Roblox itself exposes via your saved session (display name, account ID, avatar URL — all of which are public on Roblox).
+- Any data on Microsoft, Anthropic, or 626 Labs servers. There is no backend; RORORO runs entirely on your PC.
+
+---
+
+## Network connections RORORO makes
+
+RORORO initiates HTTPS connections **only** to:
+
+| Host | When | Purpose |
+|---|---|---|
+| `auth.roblox.com` | During *Launch As* | Roblox's documented authentication-ticket endpoint — exchanges the saved cookie for a one-time launch ticket. The same endpoint Bloxstrap and other launchers use. |
+| `users.roblox.com` | When listing accounts | Public account metadata (display name, ID). Used to confirm the saved cookie still maps to a real account. |
+| `thumbnails.roblox.com` | When listing accounts | Public avatar imagery. |
+| `presence.roblox.com` and related Roblox endpoints (games, friends, universes, `apis.roblox.com` for pasted share links, `clientsettingscdn.roblox.com` for the current client version before a batch launch) | Continuously while RORORO is running, including a presence heartbeat about every 25 seconds per saved account | Keeps each saved account's online status, game details, and friends list current, and *(v1.36+)* the friends-online count shown under each account (`friends.roblox.com`). The same kind of ongoing call the Roblox website makes while you're signed in there. |
+| `economy.roblox.com` *(v1.36+)* | When an account's facts refresh: never at startup; while RoRoRo runs, about every ten minutes per account, or sooner (at most once a minute) when you open the account's panel or a launch ends | Reads that account's own Robux balance, with that account's own session cookie, to show it under the account. Cached only in the encrypted `accounts.dat`. |
+| `premiumfeatures.roblox.com` *(v1.36+)* | When an account's facts refresh | Reads whether that account has Roblox Plus (membership), with that account's own session cookie, to show the Plus badge. Cached only in the encrypted `accounts.dat`. |
+| `api.github.com` | At app startup, at most once a day | The update check against the public RORORO GitHub Releases. On a direct-download install, a newer version is downloaded from GitHub Releases and applied when you next quit RoRoRo; it never restarts RoRoRo under you (since v1.26). Versions before that only checked, so they need one new `Setup.exe` run by hand. Store installs never take this path; they update through the Store. |
+| `objects.githubusercontent.com` | When installing a plugin (v1.4+) | Plugin installs download `manifest.json`, `manifest.sha256`, and `plugin.zip` from the GitHub release URL you paste into Plugins → Install (or pick from the in-app marketplace in direct-download builds). |
+| `github.com` (Releases) | At app startup; the known-issues list also every four hours while RoRoRo runs *(v1.31+)* | Fetches `roblox-compat.json` (current known-good Roblox version + mutex name) from `releases/latest/download/`. Used so we can ship config updates within hours when Roblox renames the singleton mutex. Signed (ECDSA P-256/SHA-256) since v1.14.1.0 (2026-08-03): the app verifies the raw bytes against a pinned public key before trusting anything the feed returns; a missing or invalid signature is treated as no update available, never a crash and never a fallback to unverified content. Since v1.31 it also fetches `known-issues.json` and its signature from the same location, the list shown on the Known Roblox issues page: a plain download of a text file, verified against the same pinned key before it is read, with nothing about you or your PC sent. In direct-download builds (v1.9+), opening the Plugins page also fetches `plugins-catalog.json` from the same location for the in-app marketplace; the Store edition never does. |
+| `api.pushover.net` *(v1.25+)* | Only when **you** set up phone alerts with Pushover in Settings › Alerts, and an alert (or your own test) actually fires | Sends the alert's title and text to Pushover for delivery to your phone. Off by default; uses the user key and application token from **your own** Pushover account, stored DPAPI-encrypted; account names are streamer-masked when streamer mode is on. RoRoRo ships no Pushover credentials of its own. |
+| `ntfy.sh` — or a server address you set yourself *(v1.25+)* | Only when **you** set up phone alerts with ntfy in Settings › Alerts, and an alert (or your own test) actually fires | Publishes the alert's title and text to your randomly generated ntfy topic for delivery to your phone. Off by default. The topic is a secret RoRoRo generates for you (anyone holding it can read and spoof your alerts — don't share it); it travels to the server you configure and nowhere else. |
+| Plugin-publisher URLs *(v1.4+)* | Only when **you** paste a plugin install URL | RoRoRo fetches `manifest.json`, `manifest.sha256`, and `plugin.zip` from the exact URL you provide. Never auto-fetched. Each plugin's own network behavior after install is governed by that plugin's policy, not this one. |
+
+RORORO sends a `User-Agent` header of `RORORO/<version>` on every request. We do **not** spoof a browser UA. We are transparent and identifiable to the receiving servers.
+
+RORORO makes **no other network connections**. There are no analytics endpoints, telemetry endpoints, or third-party SDKs.
+
+---
+
+## Account cookies and DPAPI
+
+When you click *Add Account*, RORORO opens an embedded Microsoft Edge WebView2 control pointed at `https://www.roblox.com/login`. The login page is Roblox's own — same HTML, same form, same HTTPS connection your browser would make. Your keystrokes go from the embedded browser straight to Roblox's servers. RORORO is the window frame, not the form handler.
+
+After Roblox confirms a successful login, RORORO captures the `.ROBLOSECURITY` session cookie that Roblox sets in your browser. Before writing it to disk, RORORO runs it through Windows' [Data Protection API](https://learn.microsoft.com/en-us/dotnet/standard/security/how-to-use-data-protection) — encryption tied to your specific Windows user account on your specific machine. The encrypted file (`accounts.dat`) is unreadable on any other PC, by any other Windows user, or even by you if Windows ever loses its DPAPI master key (e.g., after a from-scratch reinstall).
+
+The cookie value is held in plaintext only briefly in memory during a single *Launch As* operation, then goes back to disk in encrypted form. The cookie value is **never** written to logs, **never** included in error reports, and **never** transmitted to any party other than Roblox.
+
+---
+
+## Account export and import (v1.6 and later)
+
+RoRoRo v1.6 added the ability to move your saved accounts to another PC. This is the **only** way your cookies leave the machine, and it only happens when you choose to do it:
+
+- **Export** asks you for a passphrase, then writes a single `.rororo-accounts` file wherever you pick. Inside, your accounts (cookies included) are encrypted with AES-256-GCM under a key derived from your passphrase (PBKDF2-SHA256, 600,000 iterations). The file is useless to anyone without the passphrase.
+- **Import** on the other PC asks for the same passphrase, decrypts the file, and re-encrypts the accounts into that machine's DPAPI vault. Accounts you already have are skipped.
+- **The file is yours.** RoRoRo never uploads it, never sends it anywhere, and never stores the passphrase. If you lose the passphrase the file can't be opened — by design; there's no recovery key, because a recovery key would mean we held a way in.
+- Treat the file like a password: anyone with both the file **and** the passphrase can sign in as you. Keep it private.
+
+---
+
+## Plugins (v1.4 and later)
+
+RoRoRo v1.4 introduced a plugin system. Plugins are **separate products** — separate Windows programs you choose to install by pasting a GitHub release URL into the Plugins page. The Microsoft Store edition never auto-fetches plugins, never polls a curated list, and never bundles plugin code in its own MSIX. Direct-download builds (v1.9+) also offer an in-app marketplace: opening the Plugins page fetches `plugins-catalog.json` from the RoRoRo GitHub release; installing still happens only when you click Install.
+
+What this means for your privacy:
+
+- **Each plugin's network behavior is governed by that plugin's own privacy policy**, not this one. When you install a plugin, review the publisher's policy on its release page.
+- **Capabilities are gated.** When you install a plugin, RoRoRo shows a consent sheet listing every capability the plugin asks for, in plain language. You grant capabilities individually. RoRoRo's gRPC server refuses any plugin call that needs a capability you haven't granted.
+- **Plugins run in their own processes**, separately from RoRoRo. A plugin process cannot read RoRoRo's memory, your saved accounts, or `accounts.dat`.
+- **Plugin install downloads** hit the URL you paste — typically `github.com` and `objects.githubusercontent.com` for the manifest + SHA + zip. The same hosts RoRoRo uses for its own updates.
+- **Removing a plugin** via Plugins → Remove kills its process, deletes its install directory, and removes its consent record from `consent.dat`.
+
+If you have not installed any plugins, this section does not apply to you — none of the plugin paths are written and no plugin-related network calls are made.
+
+---
+
+## Diagnostics bundle
+
+The Diagnostics page (in the tools window) lets you save a bundle for filing bug reports. The bundle is a `.zip` with two parts:
+
+- **`snapshot.txt`**, in English so whoever reads your report can read it:
+  - The RoRoRo version, and *(v1.36+)* the channel it was installed from (Store, Sideload, Direct download, or Dev).
+  - The .NET runtime and Windows versions.
+  - Whether multi-instance is on.
+  - **How many** accounts are saved, as a number only, and how many Roblox clients are running.
+  - Whether Roblox and WebView2 are installed, and their versions.
+  - *(v1.12+)* Your PC's total and available RAM, and the memory each running Roblox client is using, listed against an 8-character short id, never a name. See [Memory monitoring](#memory-monitoring-v112-and-later) below.
+- **Up to three of the most recent log files**, each passed through cookie redaction again as it is copied in.
+
+No account names, no account IDs, no avatars, and no cookie values are in the bundle. (Until v1.36 this section said the bundle carried a list of saved account display names and IDs, and the single current log file. It never did in this form: it carries a count, short ids, and up to three redacted logs. Corrected 2026-11-05.)
+
+**No cookie values are ever in the bundle.** You can inspect the bundle before sharing it with anyone — the bundle is a `.zip` file you save to a location of your choice; RORORO does not auto-upload it.
+
+**One thing to know before you share a bundle.** The log files inside it were written by Windows applications, and Windows error messages routinely quote full file paths — and a Windows user-profile path contains your account name. We don't put your name anywhere ourselves, but we can't promise it never turns up inside an operating-system error string. If you're posting a bundle somewhere public, open the `.zip` and have a look first.
+
+---
+
+## Memory monitoring (v1.12 and later)
+
+RoRoRo v1.12 added a memory watchdog. The Roblox client uses more memory the longer it runs, and several clients at once will eventually fill your PC — which is what was killing people's alt windows on long sessions. RoRoRo now watches for that and warns you before it happens.
+
+Here is exactly what that involves:
+
+- **What it reads.** For each Roblox client *that RoRoRo launched*, it reads the private-bytes counter — a number Windows already publishes about every running process. It's the same figure Task Manager shows in its Memory column. RoRoRo also reads your PC's total and available RAM. It samples this about every 30 seconds.
+- **What it does not read.** RoRoRo does **not** read the contents of the Roblox client's memory. It does not attach a debugger, inject code, hook the client, or call any memory-reading API. It reads one number per process. The source is open — the entire memory-reading surface is a single line in [`ProcessMemoryProbe.cs`](https://github.com/estevanhernandez-stack-ed/ROROROblox/blob/main/src/ROROROblox.Core/Diagnostics/ProcessMemoryProbe.cs).
+- **Where it goes.** On screen, and into your local log file — one line every 15 minutes recording what each client was using. That log stays on your PC like every other log. **Nothing about your memory use is transmitted anywhere.** There is no endpoint to send it to.
+- **Why the log line exists.** When someone reports "my windows closed on their own," that line is what lets us tell whether the machine ran out of memory. It's the difference between diagnosing a report in minutes and guessing.
+- **What it can do about it.** Nothing on its own. RoRoRo warns you; *you* click Recycle to close and reopen a client. The memory watchdog never closes a client by itself. (Since v1.32 one thing can close a client without a click: **auto-rejoin**, which you turn on per account, and which only closes a client that has already dropped out of its game. See [Auto-rejoin](#auto-rejoin-v132-and-later) below.)
+
+If a plugin asks for the memory-pressure capability, it receives these same figures — account identifier and memory numbers, no credentials — and only after you grant that capability on the consent sheet, like every other capability.
+
+---
+
+## Auto-rejoin (v1.32 and later)
+
+An option on each account's right-click menu, **off until you turn it on**, and never offered for your main account.
+
+- **What it reads.** Whether that account is in a game, from the Roblox presence check RoRoRo already makes for every saved account (see the network table above), and whether that account's Roblox client is still running on your PC. Nothing new is read and no new address is contacted. It does not read the screen.
+- **What it does.** If the client is still open but the account has been out of the game for 3 minutes, RoRoRo ends that client and launches the account again, the same launch your Launch button makes. At most 3 times an hour per account; after that it turns itself off for that account and tells you.
+- **What it never does.** It never reads, clicks, types into or answers anything inside the Roblox window, including Roblox's verification page.
+- **What it sends.** Nothing. The only message it can produce is the "auto-rejoin paused" alert, which goes where your other alerts go: a Windows notification by default, or the Discord webhook or phone push service you set up yourself.
+- **Where it's stored.** The on/off choice lives in your encrypted accounts file on this PC. It is not included in an account export.
+
+---
+
+## Discord integration (v1.15 and later)
+
+RoRoRo can connect to the Discord app on your PC to show what you're playing, and can send you alerts when something happens to an account while you're away. **Both are off until you turn them on**, and a fresh install makes no Discord connection of any kind.
+
+There are two halves and they are independent — you can use either, both, or neither.
+
+### Rich presence and Join
+
+- **How it connects.** Through a **local named pipe** to the Discord desktop app already running on your PC. This is the standard mechanism every game with a Discord status uses. It never leaves your machine and it is not a network connection.
+- **What it publishes.** The game name, how many of your accounts are in it, and how long the session has been going. If you also turn on Join, a friend clicking Join receives a code that points at the server your accounts are in.
+- **Streamer mode holds.** With streamer mode on, presence publishes your masked names and hides the roster count — the same promise the app makes on screen, kept on the way out.
+- **A visibility limit worth knowing.** While Roblox is running, Discord shows *Roblox* to your friends rather than RoRoRo, because Discord gives the "playing" slot to a game it detects and RoRoRo is an application, not a detected game. Your own card is always correct. This is a Discord platform rule, not a setting we can change.
+- **URI registration.** Every build that carries a Discord application id (all releases since v1.15) registers a `roblox-rororo:` link handler for your Windows user at startup, whether or not Join is on, so Discord can hand a join back to the app; with Join off, an inbound link is ignored. Every inbound join shows a confirmation naming what is about to launch before anything starts.
+
+### Alerts
+
+- **What triggers one.** An account dropping out of a game unexpectedly, a client crossing the memory warning threshold, a Recycle finishing, a two-hour uptime mark, a threshold rule you wrote for a number a plugin reports, and auto-rejoin pausing itself for an account (v1.32). Closes you asked for — Stop, Recycle, quitting RoRoRo — deliberately do not raise a dropped-out alert. (This line said "two things only" until v1.32; it had been out of date since v1.25.)
+- **Where they go.** A Windows notification, and/or a Discord channel of your choosing. The channel is reached with a **webhook URL that you create and paste in.** RoRoRo cannot see, discover, or reach any Discord channel you have not explicitly given it a webhook for.
+- **What an alert says.** The account name and the game name; for a memory warning, that client's memory figure. Nothing else.
+- **What an alert can never contain.** A private-server link, invite, or access code. This is enforced by the shape of the type that carries the message — it has two text fields and no field a link could occupy — and a test fails the build if anyone adds one. A Discord Join reaches only people who can see your Join button; a channel post is read by everyone in that channel, now and in future, so the two are held to different rules.
+- **Streamer mode, with one deliberate exception.** Alerts use your masked names everywhere except a channel you have designated as your **clan channel**, which sends real account names. That room is one you deliberately joined, with people who already know which accounts are yours, and a board of invented names there would be unusable. Note the consequence: if that channel is visible while you are streaming, real names are visible too.
+
+### What this adds to the tables above
+
+| Location | Contents | Encryption |
+|---|---|---|
+| `discord.dat` (in the app's local data folder) | Discord settings: which alerts are on, where each goes, any webhook URLs you pasted, and which accounts you muted | **DPAPI-encrypted** per Windows user |
+
+| Host | When | Purpose |
+|---|---|---|
+| `discord.com` | Only when you have pasted a webhook URL and chosen a destination that uses it | Posting your alerts to the channel that webhook belongs to, and a one-time read of the webhook to show you which channel it posts to before the first alert lands there. Sends `User-Agent: RORORO/<version>`, same as every other request. |
+
+A webhook URL is a credential — anyone holding it can post to that channel until you delete it in Discord. RoRoRo stores it encrypted, **never writes it to the log file**, and never includes it in a diagnostics bundle. If you paste something that looks like a Discord bot token, RoRoRo tells you what it is and refuses it rather than storing it.
+
+**No telemetry, still.** RoRoRo does not report whether you set any of this up, whether it worked, or whether you turned it off.
+
+---
+
+## Children's privacy
+
+RORORO is a launcher for the Roblox platform. We do not collect data from anyone, including children. Children should follow the privacy practices of Roblox itself when using the Roblox platform. RORORO launches the official Roblox client unmodified; we do not interpose between the user and Roblox's privacy-relevant flows.
+
+---
+
+## Trademark notice
+
+"Roblox" and the Roblox logo are trademarks of Roblox Corporation. RORORO is an independent third-party tool, **not affiliated with, endorsed by, or sponsored by Roblox Corporation**. The trademarked term is used solely to describe compatibility with the Roblox platform.
+
+---
+
+## Changes to this policy
+
+If we update this policy, we'll change the **Effective date** at the top and bump the **Version** to match. Material changes (e.g., adding a new network endpoint, adding any kind of data collection) will be called out in the release notes for the version that introduces them.
+
+---
+
+## Contact
+
+Questions, concerns, or rights requests: [support@626labs.dev](mailto:support@626labs.dev)
+
+Source code is open: [github.com/estevanhernandez-stack-ed/ROROROblox](https://github.com/estevanhernandez-stack-ed/ROROROblox)

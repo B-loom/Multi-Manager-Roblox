@@ -1,0 +1,336 @@
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using Microsoft.Win32;
+using ROROROblox.App.Localization;
+using ROROROblox.App.Logging;
+using ROROROblox.Core;
+using ROROROblox.Core.Diagnostics;
+
+namespace ROROROblox.App.Diagnostics;
+
+/// <summary>
+/// The Diagnostics destination, hosted by the shell (F-013 — formerly <c>DiagnosticsWindow</c>).
+/// <c>Loaded</c> refires every time the shell navigates back here, which preserves the old
+/// window's per-open semantics: every visit collects a fresh snapshot.
+/// </summary>
+internal partial class DiagnosticsPage : UserControl
+{
+    private readonly IDiagnosticsCollector _collector;
+    private DiagnosticsSnapshot? _snapshot;
+
+    public DiagnosticsPage(IDiagnosticsCollector collector)
+    {
+        _collector = collector;
+        InitializeComponent();
+        Loaded += OnLoaded;
+    }
+
+    private async void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        StatusText.Text = Loc.Get("Diag_Collecting");
+        try
+        {
+            _snapshot = await _collector.CollectAsync();
+            RenderSnapshot(_snapshot);
+            StatusText.Text = Loc.Format("Diag_Captured", _snapshot.CapturedAtUtc.ToLocalTime().ToString("HH:mm:ss"));
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = Loc.Format("Diag_CouldntCollect", ex.Message);
+        }
+    }
+
+    private void RenderSnapshot(DiagnosticsSnapshot s)
+    {
+        DetailsList.Children.Clear();
+        AddSection(Loc.Get("Diag_Section_Application"), new[]
+        {
+            (Loc.Get("Diag_Label_Version"), s.AppVersion),
+            (Loc.Get("Diag_Label_Channel"), ChannelLabel(s.Channel)),
+            (Loc.Get("Diag_Label_DotNet"), s.DotNetVersion),
+            (Loc.Get("Diag_Label_OS"), s.OsVersion),
+            ("Multi-Instance", s.MultiInstanceHeld ? Loc.Get("Diag_On") : Loc.Get("Diag_Off")),
+            (Loc.Get("Diag_Label_SavedAccounts"), s.AccountCount.ToString()),
+            (Loc.Get("Diag_Label_LiveClients"), s.LiveProcessCount.ToString()),
+        });
+        AddSection("Roblox", new[]
+        {
+            (Loc.Get("Diag_Label_Installed"), s.RobloxInstalled ? Loc.Get("Diag_Yes") : Loc.Get("Diag_No")),
+            (Loc.Get("Diag_Label_Version"), s.RobloxInstalledVersion ?? Loc.Get("Diag_NotDetected")),
+        });
+        AddSection("WebView2", new[]
+        {
+            (Loc.Get("Diag_Label_Installed"), s.WebView2Installed ? Loc.Get("Diag_Yes") : Loc.Get("Diag_No")),
+            (Loc.Get("Diag_Label_Version"), s.WebView2Version ?? Loc.Get("Diag_NotDetected")),
+        });
+        AddSection(Loc.Get("Diag_Section_Memory"), new[]
+        {
+            (Loc.Get("Diag_Label_InstalledRam"), FormatGb(s.TotalPhysicalMemoryBytes)),
+            (Loc.Get("Diag_Label_AvailableRam"), FormatGb(s.AvailablePhysicalMemoryBytes)),
+        });
+        if (s.AccountMemory.Count > 0)
+        {
+            // Label is the account's short id only — no display names, no local names, no
+            // cookies. This artifact gets pasted into Discord. A ReadOk-false reading carries a
+            // stale last-known-good byte figure; tag it "(stale)" so it never reads as a fresh,
+            // trustworthy sample (same precedent as MemoryWatchdog's own log payload).
+            AddSection(Loc.Get("Diag_Section_PerAccountMemory"), s.AccountMemory.Select(a => (
+                Label: a.AccountId.ToString("N")[..8],
+                Value: a.ReadOk ? FormatGb(a.PrivateBytes) : $"{FormatGb(a.PrivateBytes)}{Loc.Get("Diag_Stale")}")));
+        }
+        AddSection(Loc.Get("Diag_Section_Paths"), new[]
+        {
+            (Loc.Get("Diag_Label_Logs"), s.LogDirectory),
+            (Loc.Get("Diag_Label_Data"), s.DataDirectory),
+        });
+    }
+
+    /// <summary>The page's channel word, localized. Null means no identity was wired.</summary>
+    private static string ChannelLabel(InstallChannel? channel) => channel switch
+    {
+        InstallChannel.Store => Loc.Get("Diag_Channel_Store"),
+        InstallChannel.Sideload => Loc.Get("Diag_Channel_Sideload"),
+        InstallChannel.DirectDownload => Loc.Get("Diag_Channel_DirectDownload"),
+        InstallChannel.Dev => Loc.Get("Diag_Channel_Dev"),
+        _ => Loc.Get("Diag_NotDetected"),
+    };
+
+    /// <summary>The support bundle's channel word: English and invariant, whatever the UI language.</summary>
+    internal static string ChannelText(InstallChannel? channel) => channel switch
+    {
+        InstallChannel.Store => "Store",
+        InstallChannel.Sideload => "Sideload",
+        InstallChannel.DirectDownload => "DirectDownload",
+        InstallChannel.Dev => "Dev",
+        _ => "not detected",
+    };
+
+    private static string FormatGb(long bytes) => $"{bytes / 1024d / 1024d / 1024d:F1} GB";
+
+    private void AddSection(string title, IEnumerable<(string label, string value)> rows)
+    {
+        // F-064. This was the app's THIRD definition of a section heading — 12px SemiBold on
+        // CyanBrush — and it lived in C#, where no markup review would ever have found it. Accent
+        // colour was carrying structural work, which fails the same reader that grouping-by-fill
+        // fails. It now consumes the one shared style, whose larger top margin supplies the group
+        // separation the cyan used to fake.
+        var header = new TextBlock
+        {
+            Text = title,
+            Style = (Style)FindResource("SectionHeadingStyle"),
+        };
+        DetailsList.Children.Add(header);
+
+        foreach (var (label, value) in rows)
+        {
+            var grid = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var labelBlock = new TextBlock
+            {
+                Text = label,
+                FontSize = 11,
+                Foreground = (Brush)FindResource("MutedTextBrush"),
+            };
+            Grid.SetColumn(labelBlock, 0);
+            grid.Children.Add(labelBlock);
+
+            var valueBlock = new TextBlock
+            {
+                Text = value,
+                FontSize = 11,
+                FontFamily = new FontFamily("Consolas"),
+                Foreground = (Brush)FindResource("WhiteBrush"),
+                TextWrapping = TextWrapping.Wrap,
+            };
+            Grid.SetColumn(valueBlock, 1);
+            grid.Children.Add(valueBlock);
+
+            DetailsList.Children.Add(grid);
+        }
+    }
+
+    private void OnOpenLogFolderClick(object sender, RoutedEventArgs e)
+    {
+        OpenInExplorer(AppLogging.LogDirectory);
+    }
+
+    private void OnOpenDataFolderClick(object sender, RoutedEventArgs e)
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ROROROblox");
+        OpenInExplorer(path);
+    }
+
+    private static void OpenInExplorer(string path)
+    {
+        try
+        {
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true,
+                Verb = "open",
+            });
+        }
+        catch
+        {
+            // Best-effort.
+        }
+    }
+
+    private void OnSaveBundleClick(object sender, RoutedEventArgs e)
+    {
+        if (_snapshot is null)
+        {
+            StatusText.Text = Loc.Get("Diag_SnapshotNotReady");
+            return;
+        }
+
+        var dialog = new SaveFileDialog
+        {
+            Title = Loc.Get("Diag_SaveBundleTitle"),
+            Filter = Loc.Get("Diag_ZipFilter"),
+            FileName = $"rororoblox-support-{DateTime.Now:yyyyMMdd-HHmm}.zip",
+        };
+        if (dialog.ShowDialog(Window.GetWindow(this)) != true)
+        {
+            return;
+        }
+
+        try
+        {
+            SaveBundleButton.IsEnabled = false;
+            StatusText.Text = Loc.Get("Diag_BuildingBundle");
+            BuildSupportBundle(_snapshot, dialog.FileName);
+            StatusText.Text = Loc.Format("Diag_SavedFile", Path.GetFileName(dialog.FileName));
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = Loc.Format("Diag_CouldntSaveBundle", ex.Message);
+        }
+        finally
+        {
+            SaveBundleButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Compose a small zip with: snapshot.txt (the rendered diagnostics) and the latest log
+    /// files. Logs are scanned for inline secrets (.ROBLOSECURITY) and redacted before
+    /// inclusion as a defense-in-depth — the logger itself never writes them, but a future
+    /// caller or third-party library might.
+    /// </summary>
+    private static void BuildSupportBundle(DiagnosticsSnapshot snapshot, string outputZipPath)
+    {
+        if (File.Exists(outputZipPath))
+        {
+            File.Delete(outputZipPath);
+        }
+
+        using var zipStream = File.Create(outputZipPath);
+        using var archive = new ZipArchive(zipStream, ZipArchiveMode.Create);
+
+        // 1. Snapshot text.
+        var snapshotEntry = archive.CreateEntry("snapshot.txt");
+        using (var writer = new StreamWriter(snapshotEntry.Open(), Encoding.UTF8))
+        {
+            WriteSnapshotText(writer, snapshot);
+        }
+
+        // 2. Latest log files (up to 3 most recent).
+        if (Directory.Exists(snapshot.LogDirectory))
+        {
+            var logs = new DirectoryInfo(snapshot.LogDirectory)
+                .GetFiles("*.log")
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Take(3);
+
+            foreach (var log in logs)
+            {
+                var entry = archive.CreateEntry($"logs/{log.Name}");
+                using var entryStream = entry.Open();
+                using var writer = new StreamWriter(entryStream, Encoding.UTF8);
+
+                // Stream-redact: defense in depth in case a future code path logs a cookie.
+                using var reader = new StreamReader(log.FullName);
+                string? line;
+                while ((line = reader.ReadLine()) is not null)
+                {
+                    writer.WriteLine(RedactSecrets(line));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The body of snapshot.txt. Split out of <see cref="BuildSupportBundle"/> so a test can read
+    /// the lines without a zip; English and invariant by policy.
+    /// </summary>
+    internal static void WriteSnapshotText(TextWriter writer, DiagnosticsSnapshot snapshot)
+    {
+        // F-034: the header of the file a clan member attaches to a bug report. Everything
+        // else in this bundle is an identifier; this line is read by a person.
+        writer.WriteLine($"{Branding.ProductName} support snapshot");
+        writer.WriteLine($"Captured (UTC): {snapshot.CapturedAtUtc:O}");
+        writer.WriteLine();
+        writer.WriteLine($"App version       : {snapshot.AppVersion}");
+        writer.WriteLine($"Channel           : {ChannelText(snapshot.Channel)}");
+        writer.WriteLine($".NET runtime      : {snapshot.DotNetVersion}");
+        writer.WriteLine($"OS                : {snapshot.OsVersion}");
+        // The bundle body stays English by policy — a clan member pastes it into a bug report a
+        // maintainer reads. So these compose English from the snapshot's data, the same way the
+        // "yes"/"no" lines below already do, rather than reusing the localized UI-panel strings.
+        writer.WriteLine($"Multi-Instance    : {(snapshot.MultiInstanceHeld ? "ON" : "OFF")}");
+        writer.WriteLine($"Saved accounts    : {snapshot.AccountCount}");
+        writer.WriteLine($"Live clients      : {snapshot.LiveProcessCount}");
+        writer.WriteLine();
+        writer.WriteLine($"Roblox installed  : {(snapshot.RobloxInstalled ? "yes" : "no")}");
+        writer.WriteLine($"Roblox version    : {snapshot.RobloxInstalledVersion ?? "not detected"}");
+        writer.WriteLine();
+        writer.WriteLine($"WebView2 installed: {(snapshot.WebView2Installed ? "yes" : "no")}");
+        writer.WriteLine($"WebView2 version  : {snapshot.WebView2Version ?? "not detected"}");
+        writer.WriteLine();
+        writer.WriteLine($"Installed RAM     : {FormatGb(snapshot.TotalPhysicalMemoryBytes)}");
+        writer.WriteLine($"Available RAM     : {FormatGb(snapshot.AvailablePhysicalMemoryBytes)}");
+        if (snapshot.AccountMemory.Count > 0)
+        {
+            writer.WriteLine("Per-account memory:");
+            // Short id only — no display names, no local names, no cookies. This bundle
+            // gets pasted into Discord.
+            foreach (var a in snapshot.AccountMemory)
+            {
+                var shortId = a.AccountId.ToString("N")[..8];
+                var suffix = a.ReadOk ? string.Empty : "(stale)";
+                writer.WriteLine($"  {shortId}: {FormatGb(a.PrivateBytes)}{suffix}");
+            }
+        }
+        writer.WriteLine();
+        writer.WriteLine($"Logs path         : {snapshot.LogDirectory}");
+        writer.WriteLine($"Data path         : {snapshot.DataDirectory}");
+    }
+
+    private static string RedactSecrets(string line)
+    {
+        // Defense in depth — the logger never writes ROBLOSECURITY values, but redact anyway.
+        const string cookieName = ".ROBLOSECURITY";
+        var idx = line.IndexOf(cookieName, StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+        {
+            return line[..(idx + cookieName.Length)] + "=[REDACTED]";
+        }
+        return line;
+    }
+}

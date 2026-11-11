@@ -1,0 +1,629 @@
+using System.Net;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
+using ROROROblox.App.Discord;
+using ROROROblox.Core;
+using ROROROblox.Core.Discord;
+using ROROROblox.Core.Metrics;
+
+namespace ROROROblox.Tests.Discord;
+
+public class AlertDispatcherTests
+{
+    /// <summary>
+    /// Records the toasts. Every other <see cref="ITrayService"/> member is a no-op — this suite
+    /// only exercises the notification path, and a throw-on-unused double would fail on the
+    /// event wire-ups rather than on anything the tests care about.
+    /// </summary>
+    private sealed class SpyTrayService : ITrayService
+    {
+        private readonly List<string> _toasts = [];
+
+        /// <summary>
+        /// Locked because the concurrency test below toasts from sixteen threads at once. A racing
+        /// <c>List.Add</c> throws an IndexOutOfRangeException that the dispatcher swallows, which
+        /// would abort a dispatch BEFORE it reached the cooldown map — the test would then fail, or
+        /// report a short toast count, for a reason that has nothing to do with the map it is about.
+        /// </summary>
+        public void ShowToast(string title, string message, Guid? accountId = null)
+        {
+            lock (_toasts) { _toasts.Add($"{title}|{message}"); _accountIds.Add(accountId); }
+        }
+
+        /// <summary>A snapshot, so an assertion never enumerates the list while a producer appends.</summary>
+        public IReadOnlyList<string> Toasts
+        {
+            get { lock (_toasts) { return _toasts.ToArray(); } }
+        }
+
+        /// <summary>
+        /// The trailing account id each toast arrived with, in order. Recorded separately from the
+        /// title|message string so a null reads as a null rather than as an empty segment — the
+        /// distinction IS the behaviour under test (v1.33 item 4): a group about one account carries
+        /// it and a group about several carries nothing.
+        /// </summary>
+        public IReadOnlyList<Guid?> AccountIds
+        {
+            get { lock (_toasts) { return _accountIds.ToArray(); } }
+        }
+
+        private readonly List<Guid?> _accountIds = [];
+
+        public void Show() { }
+        public void UpdateStatus(MultiInstanceState state) { }
+        public void SetMemoryWarning(bool active) { }
+        public void Dispose() { }
+        public event EventHandler? RequestOpenMainWindow { add { } remove { } }
+        public event EventHandler? RequestToggleMutex { add { } remove { } }
+        public event EventHandler? RequestStopAllInstances { add { } remove { } }
+        public event EventHandler? RequestQuit { add { } remove { } }
+        public event EventHandler? RequestOpenDiagnostics { add { } remove { } }
+        public event EventHandler? RequestOpenLogs { add { } remove { } }
+        public event EventHandler? RequestOpenPreferences { add { } remove { } }
+        public event EventHandler? RequestOpenHistory { add { } remove { } }
+        public event EventHandler? RequestOpenPlugins { add { } remove { } }
+        public event EventHandler? RequestActivateMain { add { } remove { } }
+        public event EventHandler<Guid>? RequestFocusAccount { add { } remove { } }
+        public event EventHandler<MultiInstanceState>? StatusChanged { add { } remove { } }
+    }
+
+    private const string MineUrl = "https://discord.com/api/webhooks/1/mine";
+
+    private static AlertTrigger Dropped(Guid id, string name) =>
+        new(AlertKind.AccountDroppedOut, id, name, $"real_{name}", "Pet Simulator 99!", null, DateTimeOffset.UtcNow);
+
+    /// <summary>Any kind, for the suites that care about the kind rather than the wording.</summary>
+    private static AlertTrigger Of(AlertKind kind, Guid id) =>
+        new(kind, id, "BaronBloxwell", "real_BaronBloxwell", "Pet Simulator 99!", null, DateTimeOffset.UtcNow);
+
+    private static AlertTrigger Metric(Guid id) => Of(AlertKind.MetricBreach, id);
+
+    private static (DiscordWebhookSender Sender, StubHttpHandler Handler) Sender(HttpStatusCode status)
+    {
+        var handler = new StubHttpHandler(_ => new HttpResponseMessage(status));
+        return (new DiscordWebhookSender(new HttpClient(handler), NullLogger<DiscordWebhookSender>.Instance), handler);
+    }
+
+    private static AlertDispatcher Build(DiscordWebhookSender sender, ITrayService tray, DiscordConfig config) =>
+        new(sender, tray, () => config, new FakeTimeProvider(), NullLogger<AlertDispatcher>.Instance);
+
+    [Fact]
+    public async Task DispatchAsync_LocalDestination_RaisesATrayToastAndPostsNothing()
+    {
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "BaronBloxwell")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Contains("BaronBloxwell", Assert.Single(tray.Toasts), StringComparison.Ordinal);
+        Assert.Empty(handler.Bodies);
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Click-to-focus, generalised (v1.33 item 4).
+    //
+    // WHAT BROKE AND HOW QUIETLY. Through v1.32 a memory balloon was the only clickable one: the
+    // deleted App.WireMemoryWarningTray called ShowMemoryWarning(…, targetId), which stamped
+    // TrayService._lastMemoryWarningAccountId, and a shell balloon click replayed it on
+    // RequestFocusAccount. Item 3 collapsed every balloon onto this dispatcher's Local path, and
+    // ShowToast CLEARED that field by design so a click on an unrelated toast could not replay a
+    // stale account. So from item 3 until item 4 a memory-warning click did nothing, and not one
+    // test went red — the account id had never been part of any signature a test could see.
+    //
+    // The account now arrives WITH the notification, and these cases are what make that checkable.
+    // Behaviour, not shape: they go through the real Route + fan-out and read what the tray got.
+
+    [Fact]
+    public async Task DispatchAsync_AGroupAboutOneAccount_HandsTheToastThatAccount()
+    {
+        var id = Guid.NewGuid();
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([Dropped(id, "BaronBloxwell")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(tray.Toasts);
+        Assert.Equal(id, Assert.Single(tray.AccountIds));
+    }
+
+    [Fact]
+    public async Task DispatchAsync_AGroupAboutThreeAccounts_HandsTheToastNoAccount()
+    {
+        // The honest half. A coalesced group of three names three accounts in one balloon, and
+        // there is no single row to jump to — so it carries no id and is unclickable rather than
+        // clickable and arbitrary. Picking the first would be a coin flip dressed as a feature.
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([
+            Dropped(Guid.NewGuid(), "BaronBloxwell"),
+            Dropped(Guid.NewGuid(), "Koii"),
+            Dropped(Guid.NewGuid(), "Mothman"),
+        ]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(tray.Toasts);
+        Assert.Null(Assert.Single(tray.AccountIds));
+    }
+
+    [Fact]
+    public async Task DispatchAsync_TwoTriggersForOneAccount_StillHandsThatAccount()
+    {
+        // Count the ACCOUNTS, not the triggers. One flapping client can raise the same kind twice
+        // inside a coalescing window, and that balloon is still about exactly one row. A naive
+        // "triggers.Count == 1" test would read this as a group and drop the id.
+        var id = Guid.NewGuid();
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([Dropped(id, "BaronBloxwell"), Dropped(id, "BaronBloxwell")])
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(tray.Toasts);
+        Assert.Equal(id, Assert.Single(tray.AccountIds));
+    }
+
+    [Fact]
+    public async Task DispatchAsync_TheUptimeMark_HandsTheToastNoAccount()
+    {
+        // UptimeMark's carrier id is Guid.Empty by design (see AlertKind) — a global mark must not
+        // be silenced by any one account's mute, so it is about the machine rather than a row.
+        // Empty is one distinct id, so a plain distinct-count rule would call this single-account
+        // and hand a click an account that does not exist.
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig
+        {
+            UptimeMarkDestinations = [AlertDestination.Local],
+        });
+
+        await dispatcher.DispatchAsync([Of(AlertKind.UptimeMark, Guid.Empty)]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(tray.Toasts);
+        Assert.Null(Assert.Single(tray.AccountIds));
+    }
+
+    [Fact]
+    public async Task DispatchAsync_OneAccountFanningOutToTwoDestinations_CarriesTheAccountOnTheToastOnly()
+    {
+        // Fan-out does not multiply the account id onto the wrong destination: the webhook gets its
+        // post, the desktop gets its balloon, and only the balloon carries a clickable account.
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var id = Guid.NewGuid();
+        var dispatcher = Build(sender, tray, new DiscordConfig
+        {
+            DroppedOutDestinations = [AlertDestination.Local, AlertDestination.Mine],
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(id, "BaronBloxwell")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(handler.Bodies);
+        Assert.Single(tray.Toasts);
+        Assert.Equal(id, Assert.Single(tray.AccountIds));
+    }
+
+    [Fact]
+    public async Task DispatchAsync_MineDestination_PostsToTheWebhookAndNotTheTray()
+    {
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "BaronBloxwell")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Contains("BaronBloxwell", Assert.Single(handler.Bodies), StringComparison.Ordinal);
+        Assert.Empty(tray.Toasts);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_ClanDestination_UsesTheRealNameNotTheStreamerAlias()
+    {
+        // The one destination exempt from streamer mode. A clan channel is a room the user
+        // deliberately joined, full of people who already know which accounts are theirs — a board
+        // of invented names there is worse than useless, because nobody can act on it.
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var dispatcher = Build(sender, new SpyTrayService(), new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Clan,
+            ClanWebhookUrl = "https://discord.com/api/webhooks/2/clan",
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "CaptainNoodle")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var body = Assert.Single(handler.Bodies);
+        Assert.Contains("real_CaptainNoodle", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_PersonalChannel_StillMasksTheName()
+    {
+        // The exemption is scoped to the clan room and nowhere else. The personal channel can be
+        // in a server with other people in it, and the desktop toast renders on a screen that may
+        // be on stream — both keep the alias.
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var dispatcher = Build(sender, new SpyTrayService(), new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "CaptainNoodle")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var body = Assert.Single(handler.Bodies);
+        Assert.Contains("CaptainNoodle", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("real_CaptainNoodle", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_DesktopToast_StillMasksTheName()
+    {
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "CaptainNoodle")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.DoesNotContain("real_CaptainNoodle", Assert.Single(tray.Toasts), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_SameAccountTwice_SecondIsSuppressedByCooldown()
+    {
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+        var id = Guid.NewGuid();
+
+        await dispatcher.DispatchAsync([Dropped(id, "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DispatchAsync([Dropped(id, "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(tray.Toasts);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_AfterTheCooldownElapses_TheSameAccountAlertsAgain()
+    {
+        // Companion to the suppression test: the cooldown has to actually expire, or a client that
+        // drops once at 9am is silent for the rest of the day.
+        var (sender, _) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var time = new FakeTimeProvider();
+        var config = new DiscordConfig { DroppedOutDestination = AlertDestination.Local };
+        var dispatcher = new AlertDispatcher(sender, tray, () => config, time, NullLogger<AlertDispatcher>.Instance);
+        var id = Guid.NewGuid();
+
+        await dispatcher.DispatchAsync([Dropped(id, "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+        time.Advance(AlertCadence.DefaultQuietPeriod.Add(TimeSpan.FromSeconds(1)));
+        await dispatcher.DispatchAsync([Dropped(id, "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, tray.Toasts.Count);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_WebhookGone_MarksTheDestinationRejected()
+    {
+        var (sender, _) = Sender(HttpStatusCode.NotFound);
+        var dispatcher = Build(sender, new SpyTrayService(), new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(dispatcher.MineWebhookRejected);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_TwoRacingDispatches_KeepTheRejection()
+    {
+        // The dispatcher has two fire-and-forget producers, so two dispatches to the same webhook
+        // overlap in production. With `MineWebhookRejected |= await SendAsync(...)` the property is
+        // READ before the await and written after it, so the read-to-write window spans a whole
+        // HTTP round trip: the slow dispatch reads false, the fast one 404s and writes true, and
+        // the slow one's success then writes false straight over the verdict. The webhook is dead,
+        // the dispatcher keeps offering it, and Settings reports it healthy.
+        //
+        // Sequenced rather than merely raced: the gate holds the first POST open until the second
+        // has completely finished, so the window is straddled every run, not one run in a hundred.
+        var handler = new GatedWebhookHandler();
+        var sender = new DiscordWebhookSender(new HttpClient(handler), NullLogger<DiscordWebhookSender>.Instance);
+        var dispatcher = Build(sender, new SpyTrayService(), new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        var slow = Task.Run(() => dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "Slow")]));
+        await handler.FirstInFlight.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Runs to completion while the first POST is still open, so its 404 verdict is written
+        // before the first dispatch is allowed to write anything at all.
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "Fast")]).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(dispatcher.MineWebhookRejected, "the 404 dispatch did not mark the webhook rejected");
+
+        handler.ReleaseFirst();
+        await slow.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(dispatcher.MineWebhookRejected,
+            "a successful POST overwrote a concurrent dispatch's 404 verdict — the flag must only ever be written true");
+    }
+
+    /// <summary>
+    /// Sequences two concurrent webhook POSTs. The FIRST request in blocks until the test releases
+    /// it and then succeeds; every later request 404s immediately. That is the exact interleaving a
+    /// read-before-await write loses a rejection on, and it is deterministic rather than lucky.
+    /// </summary>
+    private sealed class GatedWebhookHandler : HttpMessageHandler
+    {
+        private readonly TaskCompletionSource _firstInFlight = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseFirst = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _seen;
+
+        /// <summary>Completes once the slow POST is open, so the test knows the racing dispatch has
+        /// already read the rejection flag and is now parked inside the await.</summary>
+        public Task FirstInFlight => _firstInFlight.Task;
+
+        public void ReleaseFirst() => _releaseFirst.TrySetResult();
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref _seen) == 1)
+            {
+                _firstInFlight.TrySetResult();
+
+                // Bounded so a wiring mistake fails this test rather than hanging the whole run.
+                await _releaseFirst.Task.WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        }
+    }
+
+    [Fact]
+    public async Task DispatchAsync_AfterAWebhookIsGone_StopsPostingAndFallsBackToTheTray()
+    {
+        // THE test for the 404-is-terminal claim. Marking a flag is not the same as acting on it:
+        // without this, a deleted webhook is re-POSTed on every single alert forever, and the
+        // alerts themselves vanish — the user is told nothing while we retry a dead URL all day.
+        var (sender, handler) = Sender(HttpStatusCode.NotFound);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "First")]).WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "Second")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(handler.Bodies);                                  // the dead URL is not tried twice
+        Assert.Contains("Second", Assert.Single(tray.Toasts), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_ARateLimitedPost_DoesNotKillTheDestination()
+    {
+        // 429 is transient. Treating it like a 404 would silently downgrade a working webhook to
+        // desktop-only for the rest of the session because Discord was briefly busy.
+        var (sender, _) = Sender(HttpStatusCode.TooManyRequests);
+        var dispatcher = Build(sender, new SpyTrayService(), new DiscordConfig
+        {
+            DroppedOutDestination = AlertDestination.Mine,
+            MineWebhookUrl = MineUrl,
+        });
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(dispatcher.MineWebhookRejected);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_NoTriggers_DoesNothing()
+    {
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig { DroppedOutDestination = AlertDestination.Local });
+
+        await dispatcher.DispatchAsync([]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(tray.Toasts);
+        Assert.Empty(handler.Bodies);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_EverythingOff_SendsNothingAnywhere()
+    {
+        // The shipped default. Nothing leaves the machine, and nothing pops on screen, until the
+        // user picks a destination.
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig());
+
+        await dispatcher.DispatchAsync([Dropped(Guid.NewGuid(), "A")]).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(tray.Toasts);
+        Assert.Empty(handler.Bodies);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_ManyProducersAtOnce_DoesNotCorruptTheCooldownMap()
+    {
+        // The dispatcher has TWO fire-and-forget producers wired in App.xaml.cs: the view model,
+        // raising on the UI thread, and the metric sink, raising on a thread-pool timer thread when a
+        // metric grouping window closes (a gRPC handler thread until 2026-09-15). While the view model
+        // was the only one, an unsynchronised Dictionary was safe. It stopped being safe the moment
+        // MetricBreach got a destination.
+        //
+        // Sixteen producers rather than two: two threads reproduce the corruption only by luck,
+        // and this test has to fail against the unfixed field, not merely be pointed at it.
+        const int Producers = 16;
+        const int RoundsEach = 200;
+        const int TriggersPerDispatch = 8;
+
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var dispatcher = Build(sender, tray, new DiscordConfig
+        {
+            // Every kind has to route SOMEWHERE, or DispatchAsync returns at the "routed nowhere"
+            // guard and never reaches the map write this test exists to stress. Local keeps the
+            // stress on the map instead of on an HTTP double.
+            DroppedOutDestinations = [AlertDestination.Local],
+            MemoryWarningDestinations = [AlertDestination.Local],
+            RecycledDestinations = [AlertDestination.Local],
+            UptimeMarkDestinations = [AlertDestination.Local],
+            // MetricBreachDestinations already defaults to Local.
+            AutoRejoinPausedDestinations = [AlertDestination.Local],
+        });
+
+        // Prove the routing before trusting anything below: one dispatch, one toast. Without this
+        // the whole test would pass while exercising nothing at all.
+        await dispatcher.DispatchAsync([Metric(Guid.NewGuid())]).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Single(tray.Toasts);
+
+        var kinds = Enum.GetValues<AlertKind>();
+        var work = Enumerable.Range(0, Producers).Select(producer => Task.Run(async () =>
+        {
+            for (var round = 0; round < RoundsEach; round++)
+            {
+                // Fresh ids every round, so nothing is suppressed by the cooldown and the map only
+                // ever grows — growth is when a Dictionary rehashes, and rehashing under a
+                // concurrent read is what corrupts the bucket chain.
+                var kind = kinds[(producer + round) % kinds.Length];
+                var triggers = Enumerable.Range(0, TriggersPerDispatch)
+                    .Select(_ => Of(kind, Guid.NewGuid()))
+                    .ToArray();
+                await dispatcher.DispatchAsync(triggers).ConfigureAwait(false);
+            }
+        })).ToArray();
+
+        // The timeout IS the assertion, as much as the toast count is. DispatchAsync swallows every
+        // exception by design, so a corrupted Dictionary that THROWS is invisible here — what it
+        // does visibly is spin forever inside a bucket chain that points at itself.
+        // The delay is cancelled the moment the race is decided. Left uncancelled it keeps a 60s
+        // timer alive after the test has returned its verdict, on every CI job, for nothing.
+        using var timeout = new CancellationTokenSource();
+        var all = Task.WhenAll(work);
+        var finished = await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(60), timeout.Token));
+        timeout.Cancel();
+        Assert.Same(all, finished);
+        await all;
+
+        // Each dispatch coalesces its triggers into exactly one RoutedAlert, so one toast each.
+        // A short count is the swallowed-throw half of the same corruption.
+        Assert.Equal((Producers * RoundsEach) + 1, tray.Toasts.Count);
+        Assert.Empty(handler.Bodies);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_AGroupedMetricBatch_IsOneToastAndOnePost_NamingTheCount()
+    {
+        var rule = new MetricRule("battle.points", MetricRuleKind.Level, 1000, TimeSpan.Zero, Label: "Points");
+        AlertTrigger Breach(string name) =>
+            new(AlertKind.MetricBreach, Guid.NewGuid(), name, $"real_{name}", rule.MetricId, null,
+                DateTimeOffset.UtcNow, 250, rule);
+
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var config = new DiscordConfig
+        {
+            MetricBreachDestinations = [AlertDestination.Local, AlertDestination.Mine],
+            MineWebhookUrl = MineUrl,
+        };
+
+        await Build(sender, tray, config).DispatchAsync([Breach("A"), Breach("B"), Breach("C")]);
+
+        Assert.StartsWith("3 accounts running here — Points fell below 1,000|", Assert.Single(tray.Toasts), StringComparison.Ordinal);
+        // The POST body is JSON, which escapes the em dash, so assert on the ASCII runs either side.
+        var body = Assert.Single(handler.Bodies);
+        Assert.Contains("3 accounts", body, StringComparison.Ordinal);
+        Assert.Contains("Points fell below 1,000", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_AnEightAccountGroup_ToastsWhatFitsTheBalloon_AndPostsEveryName()
+    {
+        // Final-review Important 1, 2026-09-15: the payload is built once per destination, so the
+        // desktop toast gets the balloon's 63/255 envelope while the webhook keeps 250/992.
+        var rule = new MetricRule("battle.points", MetricRuleKind.Rate, 5000, TimeSpan.FromMinutes(10), Label: "Points");
+        var triggers = Enumerable.Range(1, 8)
+            .Select(i => new AlertTrigger(AlertKind.MetricBreach, Guid.NewGuid(), $"CElCPap{i}", $"real_CElCPap{i}",
+                rule.MetricId, null, DateTimeOffset.UtcNow, 1234.5, rule))
+            .ToArray();
+
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var config = new DiscordConfig
+        {
+            MetricBreachDestinations = [AlertDestination.Local, AlertDestination.Mine],
+            MineWebhookUrl = MineUrl,
+        };
+
+        await Build(sender, tray, config).DispatchAsync(triggers).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var toast = Assert.Single(tray.Toasts).Split('|');
+        Assert.True(toast[0].Length <= 63, $"toast title is {toast[0].Length} characters");
+        Assert.True(toast[1].Length <= 255, $"toast text is {toast[1].Length} characters");
+        Assert.EndsWith("\nand 5 more", toast[1], StringComparison.Ordinal);
+        Assert.DoesNotContain("CElCPap8", toast[1], StringComparison.Ordinal);
+
+        var body = Assert.Single(handler.Bodies);
+        Assert.Contains("CElCPap8", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("more", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DispatchAsync_TwoStatsBreachingForOneAccountInOneRead_BothAlert_AndARepeatDoesNot()
+    {
+        // Controller ruling C1, 2026-09-15. One plugin read breaches Points and Diamonds for the same
+        // account. The batcher makes those two groups, so two dispatches at the same instant. Keyed
+        // per (account, kind), the first stamped the account's MetricBreach slot and the second was
+        // dropped as "inside the cooldown". Keyed per (account, metric id), both reach the desktop,
+        // and Points breaching again inside the cooldown still stays quiet.
+        var points = new MetricRule("battle.points", MetricRuleKind.Level, 1000, TimeSpan.Zero, Label: "Points");
+        var diamonds = new MetricRule("ps99.diamonds", MetricRuleKind.Level, 0, TimeSpan.Zero,
+            AlertWhenBelow: false, Label: "Diamonds");
+        var account = Guid.NewGuid();
+        AlertTrigger Breach(MetricRule rule, double value) =>
+            new(AlertKind.MetricBreach, account, "A", "real_A", rule.MetricId, null, DateTimeOffset.UnixEpoch,
+                value, rule);
+
+        var (sender, handler) = Sender(HttpStatusCode.NoContent);
+        var tray = new SpyTrayService();
+        var clock = new FakeTimeProvider(DateTimeOffset.UnixEpoch);
+        var config = new DiscordConfig { MetricBreachDestinations = [AlertDestination.Local] };
+        var dispatcher = new AlertDispatcher(sender, tray, () => config, clock, NullLogger<AlertDispatcher>.Instance);
+
+        // The real batcher on the same clock, wired the way App wires the sink's event.
+        using var batcher = new MetricBreachBatcher(clock, NullLogger.Instance);
+        var dispatches = new List<Task>();
+        batcher.Flushed += (_, group) => dispatches.Add(dispatcher.DispatchAsync(group));
+
+        batcher.Add([Breach(points, 250), Breach(diamonds, 2_974_993)]);
+        clock.Advance(MetricBreachBatcher.Window);
+        await Task.WhenAll(dispatches).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, dispatches.Count);   // two groups, two calls: the shape C1 is about
+        Assert.Equal(2, tray.Toasts.Count);
+        Assert.Contains(tray.Toasts, t => t.StartsWith("A — Points fell below 1,000|", StringComparison.Ordinal));
+        Assert.Contains(tray.Toasts, t => t.StartsWith("A — Diamonds went above 0|", StringComparison.Ordinal));
+
+        batcher.Add([Breach(points, 240)]);
+        clock.Advance(MetricBreachBatcher.Window);
+        await Task.WhenAll(dispatches).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(3, dispatches.Count);
+        Assert.Equal(2, tray.Toasts.Count);   // the same stat again, inside its cooldown
+        Assert.Empty(handler.Bodies);
+    }
+}

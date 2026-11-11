@@ -1,0 +1,562 @@
+using System.IO;
+using ROROROblox.Core;
+
+namespace ROROROblox.Tests;
+
+public class AppSettingsTests : IDisposable
+{
+    private readonly string _tempDir;
+    private readonly string _filePath;
+
+    public AppSettingsTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"ROROROblox-settings-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+        _filePath = Path.Combine(_tempDir, "settings.json");
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+        {
+            Directory.Delete(_tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ColdStart_ReadsBackPersistedValue()
+    {
+        // Retargeted from SetDefaultPlaceUrlAsync to a string setting that still has a setter; this
+        // test is about the cold-start read path, not about which preference it round-trips.
+        var first = new AppSettings(_filePath);
+        await first.SetActiveThemeIdAsync("midnight");
+        first.Dispose();
+
+        using var second = new AppSettings(_filePath);
+        var themeId = await second.GetActiveThemeIdAsync();
+
+        Assert.Equal("midnight", themeId);
+    }
+
+    [Fact]
+    public async Task AlertCadence_OnASettingsFileWrittenBeforeV133_ReadsTheShippedFiveMinutes()
+    {
+        // The no-migration contract, and the one that matters most for this setting: a blob with
+        // neither key must resolve to exactly the pace AlertRouter.Cooldown held through v1.32, or
+        // the upgrade retunes everyone's alerts without asking.
+        File.WriteAllText(_filePath, """
+            {
+              "version": 1,
+              "activeThemeId": "midnight",
+              "metricAlertsEnabled": true
+            }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Equal(5, await settings.GetAlertCadenceMinutesAsync());
+        Assert.Equal(string.Empty, await settings.GetAlertCadenceOverridesJsonAsync());
+        Assert.Equal(
+            ROROROblox.Core.Discord.AlertCadence.DefaultQuietPeriod,
+            ROROROblox.Core.Discord.AlertCadence.FromSettings(
+                await settings.GetAlertCadenceMinutesAsync(),
+                await settings.GetAlertCadenceOverridesJsonAsync()).Global);
+    }
+
+    [Fact]
+    public async Task AlertCadence_RoundTripsBothKeys_IncludingZero()
+    {
+        var first = new AppSettings(_filePath);
+        await first.SetAlertCadenceMinutesAsync(0);
+        await first.SetAlertCadenceOverridesJsonAsync("""{"MemoryWarning":30}""");
+        first.Dispose();
+
+        using var second = new AppSettings(_filePath);
+
+        // Zero survives the round trip as zero, not as "unset" — it is a real choice here.
+        Assert.Equal(0, await second.GetAlertCadenceMinutesAsync());
+        Assert.Equal("""{"MemoryWarning":30}""", await second.GetAlertCadenceOverridesJsonAsync());
+    }
+
+    [Fact]
+    public async Task AlertCadenceOverridesJson_ExplicitNullInTheFile_ReadsAsEmpty()
+    {
+        // System.Text.Json does not enforce the record's non-nullable string, so a hand-edited or
+        // older-tool-written null lands in the blob. The accessor absorbs it rather than pushing a
+        // null check into every reader.
+        File.WriteAllText(_filePath, """
+            { "version": 1, "alertCadenceOverridesJson": null }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Equal(string.Empty, await settings.GetAlertCadenceOverridesJsonAsync());
+    }
+
+    [Fact]
+    public async Task AlertCadenceOverridesJson_BlankInput_NormalisesToEmpty()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        await settings.SetAlertCadenceOverridesJsonAsync("   ");
+        Assert.Equal(string.Empty, await settings.GetAlertCadenceOverridesJsonAsync());
+
+        await settings.SetAlertCadenceOverridesJsonAsync(null);
+        Assert.Equal(string.Empty, await settings.GetAlertCadenceOverridesJsonAsync());
+    }
+
+    [Fact]
+    public async Task AlertSound_OnASettingsFileWrittenBeforeV133_ReadsTheChime()
+    {
+        // Every settings.json in the wild has no such key. Item 4 took the shell balloon away and
+        // with it the OS notification sound, so an absent key resolving to Silent would ship the
+        // defect as the default on every upgrade.
+        File.WriteAllText(_filePath, """
+            {
+              "version": 1,
+              "activeThemeId": "midnight"
+            }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Equal("Chime", await settings.GetAlertSoundAsync());
+        Assert.Equal(
+            ROROROblox.Core.Discord.AlertSound.Chime,
+            ROROROblox.Core.Discord.AlertSoundSetting.FromSetting(await settings.GetAlertSoundAsync()));
+    }
+
+    [Fact]
+    public async Task AlertSound_RoundTripsIncludingSilence()
+    {
+        // Silence is the one value a user has to be able to CHOOSE, which is a different thing from
+        // the value a corrupt file degrades to. Both directions matter and this is the one that
+        // must survive a restart.
+        var first = new AppSettings(_filePath);
+        await first.SetAlertSoundAsync(
+            ROROROblox.Core.Discord.AlertSoundSetting.ToSetting(ROROROblox.Core.Discord.AlertSound.Silent));
+        first.Dispose();
+
+        using var second = new AppSettings(_filePath);
+
+        Assert.Equal("Silent", await second.GetAlertSoundAsync());
+        Assert.Equal(
+            ROROROblox.Core.Discord.AlertSound.Silent,
+            ROROROblox.Core.Discord.AlertSoundSetting.FromSetting(await second.GetAlertSoundAsync()));
+    }
+
+    [Fact]
+    public async Task AlertSound_ACorruptValueInTheFile_StillResolvesToTheChime()
+    {
+        // The accessor hands back what is in the file, exactly as GetAlertCadenceOverridesJsonAsync
+        // does — the degrade lives in one place. What this pins is that the pair of them together
+        // land on a noise: a garbage value must not be able to silence the alert system.
+        File.WriteAllText(_filePath, """
+            { "version": 1, "alertSound": "quack" }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Equal("quack", await settings.GetAlertSoundAsync());
+        Assert.Equal(
+            ROROROblox.Core.Discord.AlertSound.Chime,
+            ROROROblox.Core.Discord.AlertSoundSetting.FromSetting(await settings.GetAlertSoundAsync()));
+    }
+
+    [Fact]
+    public async Task AlertSound_ExplicitNullOrBlank_ReadsAsEmptyAndResolvesToTheChime()
+    {
+        // System.Text.Json does not enforce the record's non-nullable string, so a hand-edited null
+        // lands in the blob — the same hole GetAlertCadenceOverridesJsonAsync absorbs.
+        File.WriteAllText(_filePath, """
+            { "version": 1, "alertSound": null }
+            """);
+
+        using (var settings = new AppSettings(_filePath))
+        {
+            Assert.Equal(string.Empty, await settings.GetAlertSoundAsync());
+        }
+
+        using var written = new AppSettings(_filePath);
+        await written.SetAlertSoundAsync("   ");
+        Assert.Equal(string.Empty, await written.GetAlertSoundAsync());
+        Assert.Equal(
+            ROROROblox.Core.Discord.AlertSound.Chime,
+            ROROROblox.Core.Discord.AlertSoundSetting.FromSetting(await written.GetAlertSoundAsync()));
+    }
+
+    [Fact]
+    public async Task TamperedJson_ReturnsNullDefault()
+    {
+        File.WriteAllText(_filePath, "{ this is not valid JSON");
+        using var settings = new AppSettings(_filePath);
+
+        // Retargeted by F-093 from GetDefaultPlaceUrlAsync, which no longer exists. This test is
+        // about the degrade path for unreadable JSON, not about which preference it happens to read.
+        var themeId = await settings.GetActiveThemeIdAsync();
+
+        Assert.Null(themeId);
+    }
+
+    [Fact]
+    public async Task SaveAsync_RemovesTempFile_OnSuccess()
+    {
+        using var settings = new AppSettings(_filePath);
+        await settings.SetActiveThemeIdAsync("flatline");
+
+        var tempPath = _filePath + ".tmp";
+        Assert.False(File.Exists(tempPath));
+        Assert.True(File.Exists(_filePath));
+    }
+
+    [Fact]
+    public async Task GetLaunchMainOnStartupAsync_DefaultsToFalse()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        Assert.False(await settings.GetLaunchMainOnStartupAsync());
+    }
+
+    [Fact]
+    public async Task LaunchMainOnStartup_RoundTripsTrueAndFalse()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        await settings.SetLaunchMainOnStartupAsync(true);
+        Assert.True(await settings.GetLaunchMainOnStartupAsync());
+
+        await settings.SetLaunchMainOnStartupAsync(false);
+        Assert.False(await settings.GetLaunchMainOnStartupAsync());
+    }
+
+    [Fact]
+    public async Task LaunchMainOnStartup_PersistsAcrossInstances()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            await first.SetLaunchMainOnStartupAsync(true);
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetLaunchMainOnStartupAsync());
+    }
+
+    [Fact]
+    public async Task BloxstrapWarningDismissed_DefaultsToFalse()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        Assert.False(await settings.GetBloxstrapWarningDismissedAsync());
+    }
+
+    [Fact]
+    public async Task BloxstrapWarningDismissed_PersistsAcrossInstances()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            await first.SetBloxstrapWarningDismissedAsync(true);
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetBloxstrapWarningDismissedAsync());
+    }
+
+    [Fact]
+    public async Task BloxstrapWarningDismissed_RoundTripsTrueAndFalse()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        await settings.SetBloxstrapWarningDismissedAsync(true);
+        Assert.True(await settings.GetBloxstrapWarningDismissedAsync());
+
+        await settings.SetBloxstrapWarningDismissedAsync(false);
+        Assert.False(await settings.GetBloxstrapWarningDismissedAsync());
+    }
+
+    [Fact]
+    public async Task DismissedFpsCapWarningSignature_DefaultsNull_ThenRoundTripsAcrossInstances()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.Null(await first.GetDismissedFpsCapWarningSignatureAsync());
+
+            await first.SetDismissedFpsCapWarningSignatureAsync("none,20,45");
+            Assert.Equal("none,20,45", await first.GetDismissedFpsCapWarningSignatureAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.Equal("none,20,45", await second.GetDismissedFpsCapWarningSignatureAsync());
+    }
+
+    [Fact]
+    public async Task DismissedFpsCapWarningSignature_CanBeClearedBackToNull()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        await settings.SetDismissedFpsCapWarningSignatureAsync("20,45");
+        Assert.Equal("20,45", await settings.GetDismissedFpsCapWarningSignatureAsync());
+
+        await settings.SetDismissedFpsCapWarningSignatureAsync(null);
+        Assert.Null(await settings.GetDismissedFpsCapWarningSignatureAsync());
+    }
+
+    /// <summary>
+    /// A v1-shaped settings file written before this field existed -- no
+    /// dismissedFpsCapWarningSignature property at all, not even null -- must still load cleanly
+    /// with the field defaulting to null, exactly like every other field added to SettingsBlob
+    /// after v1. Proves the back-compat comment on SettingsBlob is actually true, not just
+    /// asserted.
+    /// </summary>
+    [Fact]
+    public async Task OlderSettingsFile_MissingDismissedFpsCapWarningSignature_LoadsWithNullDefault()
+    {
+        File.WriteAllText(_filePath, """
+            {
+              "version": 1,
+              "defaultPlaceUrl": "https://www.roblox.com/games/920587237/Adopt-Me",
+              "bloxstrapWarningDismissed": true
+            }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Null(await settings.GetDismissedFpsCapWarningSignatureAsync());
+        // And the older fields the file DID carry still load correctly alongside the new default.
+        //
+        // F-093: this file also carries "defaultPlaceUrl", a key the app no longer has a property
+        // for. It is deliberately NOT asserted, because there is nothing to assert against — and
+        // that is the deletion's whole answer to the deserialization question. System.Text.Json
+        // ignores unknown members, so the file loads clean, and the dead value is dropped on the
+        // next write rather than being carried forever by a property nothing could read.
+        Assert.True(await settings.GetBloxstrapWarningDismissedAsync());
+    }
+
+    [Fact]
+    public async Task MuteIdleAlerts_DefaultsFalse_RoundTrips()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        Assert.False(await settings.GetMuteIdleAlertsAsync());
+
+        await settings.SetMuteIdleAlertsAsync(true);
+        Assert.True(await settings.GetMuteIdleAlertsAsync());
+    }
+
+    [Fact]
+    public async Task IdleWarnThresholdMinutes_DefaultsFifteen_RoundTrips()
+    {
+        using var settings = new AppSettings(_filePath);
+
+        Assert.Equal(15, await settings.GetIdleWarnThresholdMinutesAsync());
+
+        await settings.SetIdleWarnThresholdMinutesAsync(12);
+        Assert.Equal(12, await settings.GetIdleWarnThresholdMinutesAsync());
+    }
+
+    [Fact]
+    public async Task CarefulSquadLaunch_DefaultsFalse_RoundTripsAcrossInstances()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.False(await first.GetCarefulSquadLaunchAsync());
+
+            await first.SetCarefulSquadLaunchAsync(true);
+            Assert.True(await first.GetCarefulSquadLaunchAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetCarefulSquadLaunchAsync());
+    }
+
+    [Fact]
+    public async Task AlwaysShowRecycle_DefaultsFalse_RoundTripsAcrossInstances()
+    {
+        // Off by default keeps the row silhouette that shipped in v1.12 — Recycle appears when the
+        // memory warning latches. On, it rides every running row, because since v1.14 it also puts
+        // the account back in the server it was in, which has nothing to do with memory.
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.False(await first.GetAlwaysShowRecycleAsync());
+
+            await first.SetAlwaysShowRecycleAsync(true);
+            Assert.True(await first.GetAlwaysShowRecycleAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetAlwaysShowRecycleAsync());
+    }
+
+    [Fact]
+    public async Task StreamerMode_DefaultsFalse_ThenPersists()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.False(await first.GetStreamerModeAsync());
+
+            await first.SetStreamerModeAsync(true);
+            Assert.True(await first.GetStreamerModeAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetStreamerModeAsync());
+    }
+
+    [Fact]
+    public async Task MemoryWatchdogEnabled_DefaultsTrue_ThenPersists()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.True(await first.GetMemoryWatchdogEnabledAsync());
+
+            await first.SetMemoryWatchdogEnabledAsync(false);
+            Assert.False(await first.GetMemoryWatchdogEnabledAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.False(await second.GetMemoryWatchdogEnabledAsync());
+    }
+
+    [Fact]
+    public async Task ProjectionWarnMinutes_DefaultsOneTwenty_ThenPersists()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.Equal(120, await first.GetProjectionWarnMinutesAsync());
+
+            await first.SetProjectionWarnMinutesAsync(45);
+            Assert.Equal(45, await first.GetProjectionWarnMinutesAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.Equal(45, await second.GetProjectionWarnMinutesAsync());
+    }
+
+    [Fact]
+    public async Task MemoryReserveMb_DefaultsNull_ThenPersists()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.Null(await first.GetMemoryReserveMbAsync());
+
+            await first.SetMemoryReserveMbAsync(1536);
+            Assert.Equal(1536, await first.GetMemoryReserveMbAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.Equal(1536, await second.GetMemoryReserveMbAsync());
+    }
+
+    /// <summary>
+    /// The one that matters most: MemoryCapMb == 0 is a deliberate user choice ("disable the cap
+    /// trigger") and must survive a save/load cycle as 0, never silently reverting to null
+    /// ("never set" -> re-derive). Proves both states are distinguishable, not just that one of
+    /// them happens to survive.
+    /// </summary>
+    [Fact]
+    public async Task MemoryCapMb_ZeroRoundTripsDistinctlyFromNull()
+    {
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.Null(await first.GetMemoryCapMbAsync());   // untouched instance: null, not 0
+
+            await first.SetMemoryCapMbAsync(0);
+            Assert.Equal(0, await first.GetMemoryCapMbAsync());
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.Equal(0, await second.GetMemoryCapMbAsync());   // fresh instance after reload: 0, not null
+        Assert.NotNull(await second.GetMemoryCapMbAsync());
+    }
+
+    [Fact]
+    public async Task CompactMode_DefaultsFalse_RoundTripsBothWaysAcrossInstances()
+    {
+        // Both directions, not just the on-flip: compact mode is the one setting a user turns OFF
+        // as deliberately as they turn it on, and a write that only ever persists `true` would pass
+        // a one-way test while leaving the window compact forever.
+        {
+            using var first = new AppSettings(_filePath);
+            Assert.False(await first.GetCompactModeAsync());
+
+            await first.SetCompactModeAsync(true);
+            Assert.True(await first.GetCompactModeAsync());
+        }
+
+        {
+            using var second = new AppSettings(_filePath);
+            Assert.True(await second.GetCompactModeAsync());
+
+            await second.SetCompactModeAsync(false);
+            Assert.False(await second.GetCompactModeAsync());
+        }
+
+        using var third = new AppSettings(_filePath);
+        Assert.False(await third.GetCompactModeAsync());
+    }
+
+    /// <summary>
+    /// The no-migration claim, tested rather than assumed. An existing <c>settings.json</c> written
+    /// before v1.18 has no <c>compactMode</c> key at all; it must load and read off, with no shim
+    /// and no version bump.
+    /// <para>
+    /// The sibling assertions are the discriminator and the reason this is not a one-liner. A
+    /// corrupt or unreadable file ALSO yields <c>CompactMode == false</c>, because
+    /// <c>AppSettings.LoadAsync</c> falls back to a default blob on <c>JsonException</c>. Asserting
+    /// only the false would pass on a file that failed to parse — which is the opposite of what
+    /// "loads without error" means. Reading back the keys that ARE in the file proves the deserialize
+    /// actually succeeded.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CompactMode_AbsentFromAnExistingFile_LoadsCleanlyAndDefaultsOff()
+    {
+        File.WriteAllText(_filePath, """
+            {
+              "version": 1,
+              "defaultPlaceUrl": null,
+              "launchMainOnStartup": true,
+              "activeThemeId": "midnight",
+              "idleWarnThresholdMinutes": 12
+            }
+            """);
+
+        using var settings = new AppSettings(_filePath);
+
+        Assert.False(await settings.GetCompactModeAsync());
+
+        // Discriminators: the file parsed, so the false above is the field's default and not the
+        // corrupt-file fallback wearing the same value.
+        Assert.True(await settings.GetLaunchMainOnStartupAsync());
+        Assert.Equal("midnight", await settings.GetActiveThemeIdAsync());
+        Assert.Equal(12, await settings.GetIdleWarnThresholdMinutesAsync());
+    }
+
+    /// <summary>
+    /// Writing compact mode onto a pre-v1.18 file preserves everything already in it. A "migration"
+    /// that rewrote the blob from defaults would lose the user's theme and their idle threshold, and
+    /// the round-trip test above would still be green.
+    /// </summary>
+    [Fact]
+    public async Task CompactMode_WrittenOntoAnExistingFile_KeepsTheOtherSettings()
+    {
+        File.WriteAllText(_filePath, """
+            {
+              "version": 1,
+              "launchMainOnStartup": true,
+              "activeThemeId": "midnight",
+              "idleWarnThresholdMinutes": 12
+            }
+            """);
+
+        {
+            using var first = new AppSettings(_filePath);
+            await first.SetCompactModeAsync(true);
+        }
+
+        using var second = new AppSettings(_filePath);
+        Assert.True(await second.GetCompactModeAsync());
+        Assert.True(await second.GetLaunchMainOnStartupAsync());
+        Assert.Equal("midnight", await second.GetActiveThemeIdAsync());
+        Assert.Equal(12, await second.GetIdleWarnThresholdMinutesAsync());
+    }
+}

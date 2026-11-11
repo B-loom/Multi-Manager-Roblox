@@ -1,0 +1,217 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace ROROROblox.Core.Diagnostics;
+
+public sealed class ActivityMonitor : IActivityMonitor, IDisposable
+{
+    private sealed class Record
+    {
+        public DateTimeOffset LastActivityAt;
+        public bool WarnLatched;
+    }
+
+    private readonly IForegroundWindowProbe _foreground;
+    private readonly ISystemInputClock _input;
+    private readonly IForegroundAccountResolver _resolver;
+    private readonly IClock _clock;
+    private readonly ILogger<ActivityMonitor> _log;
+    private readonly ConcurrentDictionary<Guid, Record> _records = new();
+
+    /// <summary>How often the foreground is sampled into the history ring.</summary>
+    internal static readonly TimeSpan SamplePeriod = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Ring capacity: 32 samples at 100 ms is 3.2 s of foreground history.</summary>
+    internal const int ForegroundHistory = 32;
+
+    private readonly (uint Tick, int Pid)[] _ring = new (uint, int)[ForegroundHistory];
+    private int _ringHead;   // next write slot
+    private int _ringCount;
+
+    private uint _lastSeenInputTick;
+
+    public TimeSpan WarnThreshold { get; set; } = TimeSpan.FromMinutes(15);
+
+    public event EventHandler<IReadOnlyList<Guid>>? WarnThresholdCrossed;
+
+    public ActivityMonitor(
+        IForegroundWindowProbe foreground,
+        ISystemInputClock input,
+        IForegroundAccountResolver resolver,
+        IClock clock,
+        ILogger<ActivityMonitor>? log = null)
+    {
+        _log = log ?? NullLogger<ActivityMonitor>.Instance;
+        _foreground = foreground ?? throw new ArgumentNullException(nameof(foreground));
+        _input = input ?? throw new ArgumentNullException(nameof(input));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+
+        // Baseline is captured at construction, not on first Sample(). ISystemInputClock.LastInputTick
+        // (GetLastInputInfo in production) is always a real, nonzero value -- its first *observation*
+        // is not an actual advance. Seeding here means the first Sample() only stamps an account when
+        // input has genuinely moved since the monitor was built, closing the cold-start false positive
+        // where an idle user's foreground account got falsely marked "just active."
+        _lastSeenInputTick = _input.LastInputTick;
+    }
+
+    public void OnAccountLaunched(Guid accountId)
+        => _records[accountId] = new Record { LastActivityAt = _clock.UtcNow, WarnLatched = false };
+
+    public void OnAccountExited(Guid accountId)
+        => _records.TryRemove(accountId, out _);
+
+    private System.Threading.Timer? _timer;
+    private bool _disposed;
+
+    // 0 idle, 1 sampling. System.Threading.Timer callbacks can overlap if a tick runs long;
+    // Sample() is a single-writer over _lastSeenInputTick + _records, so a re-entrant tick would
+    // race it. SafeSample skips (not queues) an overlapping tick rather than blocking the timer
+    // thread pool -- the next tick picks up cleanly.
+    private int _sampling;
+
+    public void Start()
+    {
+        if (_disposed) return;
+        _timer ??= new System.Threading.Timer(_ => SafeSample(), null,
+            dueTime: TimeSpan.FromSeconds(2), period: SamplePeriod);
+    }
+
+    public void Stop()
+    {
+        _timer?.Dispose();
+        _timer = null;
+    }
+
+    private void SafeSample()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _sampling, 1) == 1) return; // already sampling; skip this tick
+        try { Sample(); }
+        catch { /* never let a sample tick crash the timer thread */ }
+        finally { System.Threading.Interlocked.Exchange(ref _sampling, 0); }
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        Stop();
+    }
+
+    public void Sample()
+    {
+        var now = _clock.UtcNow;
+
+        // 1. foreground + input stamping. The baseline was captured at construction, so even the
+        // first Sample() call only counts as "advanced" when input has genuinely moved since the
+        // monitor was built -- a repeated tick (including matching the ctor baseline) means no
+        // input happened, and idle accounts age instead of getting falsely re-stamped.
+        var nowTick = _input.NowTick;
+        var haveFg = _foreground.TryGetForegroundPid(out var fgPid);
+        PushForeground(nowTick, haveFg ? fgPid : 0);
+
+        var currentTick = _input.LastInputTick;
+        var advanced = currentTick != _lastSeenInputTick;
+        _lastSeenInputTick = currentTick;
+
+        // Credit the window that was foreground at the input's own tick, not at sample time: the user
+        // can tap in B and bring C back before this sample runs (#221).
+        if (advanced
+            && TryPidAtTick(currentTick, out var pid, fallbackPid: haveFg ? fgPid : 0)
+            && pid > 0
+            && _resolver.TryResolveAccountByPid(pid, out var accountId)
+            && _records.TryGetValue(accountId, out var rec))
+        {
+            rec.LastActivityAt = now;
+        }
+
+        // 2. threshold edge evaluation (coalesced)
+        List<Guid>? crossed = null;
+        var tracked = 0;
+        foreach (var kv in _records)
+        {
+            tracked++;
+            var since = now - kv.Value.LastActivityAt;
+            if (since >= WarnThreshold)
+            {
+                if (!kv.Value.WarnLatched)
+                {
+                    kv.Value.WarnLatched = true;
+                    // The monitor knows accounts by id only; labels live in the view model.
+                    _log.LogInformation(
+                        "idle: account {AccountId} crossed the warn threshold, idle {IdleMinutes:F1} min, threshold {ThresholdMinutes:F0} min",
+                        kv.Key, since.TotalMinutes, WarnThreshold.TotalMinutes);
+                    (crossed ??= new List<Guid>()).Add(kv.Key);
+                }
+            }
+            else if (kv.Value.WarnLatched)
+            {
+                kv.Value.WarnLatched = false; // re-arm
+            }
+        }
+
+        // Trace, not Debug: Sample() runs ten times a second and the app's Serilog floor is Debug
+        // (AppLogging.cs), so a Debug line here would write ~860k lines a day for nothing.
+        // The crossing line above is the diagnostic surface; this one is for a Trace session.
+        _log.LogTrace(
+            "idle: sampled {Count} account(s), input advanced={Advanced}, threshold {ThresholdMinutes:F0} min, crossed {Crossed}",
+            tracked, advanced, WarnThreshold.TotalMinutes, crossed?.Count ?? 0);
+
+        if (crossed is { Count: > 0 })
+        {
+            WarnThresholdCrossed?.Invoke(this, crossed);
+        }
+    }
+
+    private void PushForeground(uint tick, int pid)
+    {
+        _ring[_ringHead] = (tick, pid);
+        _ringHead = (_ringHead + 1) % ForegroundHistory;
+        if (_ringCount < ForegroundHistory) _ringCount++;
+    }
+
+    // Greatest ring tick <= inputTick, oldest to newest. The comparison is the signed difference so a
+    // uint wrap between the entry and the input still orders correctly (valid within ~24 days).
+    // No qualifying entry (input older than the whole ring) falls back to the current foreground.
+    private bool TryPidAtTick(uint inputTick, out int pid, int fallbackPid)
+    {
+        pid = fallbackPid;
+        var found = false;
+        var start = (_ringHead - _ringCount + ForegroundHistory) % ForegroundHistory;
+        for (var i = 0; i < _ringCount; i++)
+        {
+            var e = _ring[(start + i) % ForegroundHistory];
+            if (unchecked((int)(inputTick - e.Tick)) >= 0)
+            {
+                pid = e.Pid;
+                found = true;
+            }
+        }
+        return found || fallbackPid > 0;
+    }
+
+    public void MarkActive(Guid accountId, DateTimeOffset nowUtc)
+    {
+        if (_records.TryGetValue(accountId, out var rec))
+        {
+            rec.LastActivityAt = nowUtc;
+            rec.WarnLatched = false; // re-arm — mirrors Sample()'s else-if re-arm branch
+        }
+        // Untracked id → no-op (account not launched / already exited).
+    }
+
+    public IReadOnlyList<AccountActivity> GetSnapshot()
+    {
+        var now = _clock.UtcNow;
+        var list = new List<AccountActivity>(_records.Count);
+        foreach (var kv in _records)
+        {
+            var since = now - kv.Value.LastActivityAt;
+            if (since < TimeSpan.Zero) since = TimeSpan.Zero; // clock-skew guard
+            list.Add(new AccountActivity(kv.Key, kv.Value.LastActivityAt, since));
+        }
+        return list;
+    }
+}

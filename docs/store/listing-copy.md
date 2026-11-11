@@ -1,0 +1,326 @@
+# Microsoft Store listing copy — RORORO
+
+> **Translations (wave 1, added 2026-09-05):** this file is the English source of truth; the
+> paste-ready translations live beside it as `listing-copy-fr.md`, `-de`, `-ru`, `-pt-br`,
+> `-pl`, `-es` (per `localization-plan.md`). An edit to a block here owes the same edit to all
+> six — the Phase 2 listing audit covers them together.
+
+> **Stake:** v1.1.0.0 was rejected under clause **10.1.1.1 Inaccurate Representation** for containing the name of another product (Roblox) in the Product Name field. The fix was to rename the product to **RORORO** (drops the `blox` suffix entirely; keeps the stutter that ties to the icon and the brand DNA). v1.1.2.0 ships with the new name across every user-visible surface; nominative use of "Roblox" in the description body is permitted under fair-use precedent and is clearly disclaimed.
+
+## Pre-submission checklist (do this BEFORE Partner Center)
+
+- [ ] Confirm Partner Center reservation still uses `626LabsLLC.RoRoRoBlox` as the Identity Name (Microsoft asked for a Listing-side fix; not a re-reservation)
+- [ ] Build sideload MSIX locally and `Add-AppxPackage` to verify it installs + runs (see `scripts/install-local-msix.ps1`)
+- [ ] Privacy policy URL is live and crawlable: `https://estevanhernandez-stack-ed.github.io/ROROROblox/privacy/`
+- [ ] Screenshots captured per `docs/store/screenshots-checklist.md`
+- [ ] Trademark disclaimer present in: Store description, Store copyright field, MSIX `Description`, About box, README, privacy policy
+
+## Identity
+
+| Field | Value | Notes |
+|---|---|---|
+| **App name (Product Name)** | RORORO | The fix for 10.1.1.1. Drops `blox` entirely; keeps the stutter pattern that ties to the three-block voxel icon. **Open question (2026-08-22):** every other user-facing surface now spells it **RoRoRo** (About box, README, release names, this file's description body). If the reserved Product Name still displays all-caps, changing its casing is a listing-side edit worth making at a convenient submission — casing-only, so 10.1.1.1 is not re-opened. Este's call. |
+| **Publisher display name** | 626Labs LLC | Matches Partner Center reservation. |
+| **Copyright** | © 2026 626 Labs LLC. "Roblox" is a trademark of Roblox Corporation. RORORO is not affiliated with, endorsed by, or sponsored by Roblox Corporation. | Disclaimer in copyright field. |
+| **Category** | Utilities & tools | Not "Games" — RORORO is a launcher, not a game. |
+| **Sub-category** | (none — Partner Center doesn't show one for Utilities & tools) | |
+
+## Short description (200 characters max, inclusive — Store snippet)
+
+> **Rewritten 2026-11-05 (v1.36.0.0): launcher first.** The account manager and the Library make a
+> one-account install a complete product, so the snippet leads with what one account gets (your games,
+> FPS caps, phone alerts, themes) and offers alts second, per the v1.36 spec §7.7. "7 languages" counts
+> English; the old "6 languages" counted only the translations. 184/200 chars.
+
+> **Audited 2026-09-20 for v1.30.0.0 — unchanged.** Nothing in 1.30 makes this snippet
+> incomplete: the crossing rule and recovery alerts refine alerting, which the snippet already
+> claims, and the plugin-install fix is a repair to a claimed feature rather than a new one.
+> Two questions raised against the long description in the same audit were RULED ON by the owner
+> the same day and closed; see there.
+
+> Refreshed 2026-09-07 (v1.26.0.0) — "now in 6 languages" leads the snippet (the app's UI is
+> localized this release); "auto-update" dropped to fit the cap (it keeps its feature entry and
+> long-description claim). 197/200 chars.
+>
+> Refreshed 2026-09-05 (v1.25.0.0) — phone alerts joined the list; "account vault" tightened to
+> "vault" to stay under the cap. 192/200 chars.
+>
+> Refreshed 2026-08-22 for the v1.22.0.0 submission — the previous block predated the memory
+> watchdog, presence status, themes, and the tools window.
+
+```
+One place to launch Roblox on Windows: your games, FPS caps, alerts to your phone, themes, in 7 languages. Alts when you want them: several saved accounts side by side, one click each.
+```
+
+## Long description
+
+> **Rewritten 2026-11-05 (v1.36.0.0).** The first paragraph is the one-account story; the multi-account
+> paragraph that used to open the listing follows it with every claim intact. Three bullets added
+> (accounts at a glance, health badges, the Library); the tools-window bullet says Library, not Games;
+> the privacy paragraph says where the new facts come from and where they are kept. Same edits in all
+> six sheets.
+
+> **Audited 2026-09-20 for v1.30.0.0 — unchanged. Two questions raised, both RULED ON by the
+> owner the same day: no change needed.** Recorded in full because they will look like drift again
+> next release, and the reasoning is what stops them being re-opened.
+>
+> 1. *Does the alerts bullet need to name metric alerts, now that a reporter is installable?* **No.**
+>    Owner's ruling: a Store install arrives with no plugin, so there are no metric alerts to
+>    enumerate. The bullet describes what RoRoRo itself alerts on; a plugin is a separate process
+>    the user chose to add, and the listing's plugin bullet already covers that.
+> 2. *Does the privacy paragraph need to account for a plugin's own network calls?* **No**, for the
+>    same reason. The paragraph is a claim about this app. Nothing the user has not installed and
+>    granted makes a call.
+>
+> **The one fact that qualifies the ruling, checked rather than assumed.** The plugin MARKETPLACE
+> is gated to unpackaged builds (`PluginsViewModel.MarketplaceEnabled => !IsPackaged`), which is
+> what keeps the Store build inside the v1.4 reviewer letter's promise never to read a curated list
+> from a server. **Install-from-URL is NOT gated** — `PluginsPage.xaml`'s manifest-URL box is
+> outside that block — so a Store user CAN paste a URL and install a plugin. That is deliberate
+> and consented (the sheet, per-capability grants, policy 10.2.2: core observes, plugins act). So
+> "no plugins on Store" is true of the DEFAULT STATE, not of what is reachable, and the ruling
+> rests on the former. If a future listing ever claims plugins are unavailable on Store outright,
+> that claim would be false.
+
+> Refreshed 2026-09-23 (v1.31.0.0), owner-approved per `submission-packet-1.31.0.0.md` §2: the
+> privacy sentence now says nothing *about you* leaves the machine and names the GitHub
+> downloads (updates, the compatibility settings, the known Roblox issues list), a gap that
+> predates 1.31; the tools-window bullet names the seventh page. Same edits in all six sheets.
+>
+> Refreshed 2026-09-08 (v1.27.0.0) — the "speaks your language" bullet now covers the messages the
+> app composes while you use it, not just the screens, and says switching is instant. The v1.26
+> wording ("every menu, setting, tooltip, and window") claimed the whole interface before that was
+> true: only the static screens were translated, and everything RoRoRo wrote at runtime stayed
+> English. v1.27 makes the claim accurate rather than aspirational.
+>
+> Refreshed 2026-09-05 (v1.25.0.0): the Discord-alerts bullet became the multi-destination
+> alerts bullet (phone via Pushover/ntfy, fan-out, the new alert kinds), and the privacy
+> paragraph now names the push services — it claimed nothing leaves your machine except Roblox
+> calls and your webhook, which stopped being the whole truth the moment phone alerts shipped.
+>
+> Refreshed 2026-08-22 (v1.22.0.0). The old block described the v1.4-era app. Brand casing
+> updated RORORO → RoRoRo to match the About box, README, and release names; the Partner
+> Center *Product Name field* is a separate question — see the note under Identity.
+
+```
+One place to launch Roblox on Windows.
+
+Add your Roblox account once, through Roblox's own login page, and RoRoRo becomes your launcher: every game you play in one Library, one click into a game or a saved private server, a frame-rate cap that sticks, and an alert on your phone if the game drops. Your account shows its Robux, Plus and friends online at a glance, and tells you when it needs attention.
+
+When you want alts, RoRoRo runs several Roblox clients on one PC at the same time, each signed in as a different saved account you own. Launch any of them with one click: into their default game, a saved private server, or any game link you paste.
+
+What you get:
+• Multi-instance with one click. Holds the Roblox singleton mutex so additional clients open instead of focusing the first one.
+• DPAPI-encrypted account vault. Saved cookies are encrypted with Windows' Data Protection API, tied to your Windows user account — a copy of the vault file moved to another PC will not decrypt. Moving accounts between your own PCs is a deliberate, passphrase-protected export.
+• Live status for every account. See which account is in which game, who is idle and for how long, and per-account frame-rate caps that stick.
+• Every account at a glance. Robux, Plus and friends online sit under each account, with a note of your own. Open an account to see its recent games, favourites and private servers, and play any of them in one click.
+• Knows when an account needs you. Session expired, needs verification, limited by Roblox: each has its own badge, and one click starts the fix.
+• One Library for every game. Everything you have played, favourited or saved as a private server, in a grid or a list. Search it, filter it, paste a game link, and choose which account plays.
+• Squad Launch + Friend Follow. Send every selected account into the same private server, follow a friend into theirs, or land your accounts together in one public server.
+• Memory watchdog + Recycle. RoRoRo learns what a Roblox client actually costs in RAM on your machine and warns before you run out. One click closes a heavy client and puts it back in the same server it was in.
+• Rejoin if it drops out. Turn it on per account, and an alt whose Roblox window is still open but has fallen out of the game (an idle kick, a failed join) is closed and joined again on its own. At most three times an hour, never your main, and your own Stop always wins.
+• One tools window. Library, Settings, History, Diagnostics, Plugins, Known Roblox issues and About are pages of one window that sits beside your accounts. Keyboard shortcuts throughout — F1 shows the list.
+• Themes. Four built-in, including one that carries no meaning in colour alone, plus a builder to make your own from ten colours and share it as a file.
+• Optional alerts — desktop, Discord, or your phone. Route each alert to any mix of desktop notifications, a Discord webhook you create, and your phone through Pushover or ntfy. Drops, memory warnings, idle accounts, recycle completions, and an every-two-hours all-good mark while your accounts run. Choose how often each may repeat and what it sounds like. A fresh install makes no alert calls at all — nothing fires until you set a destination up.
+• System tray UX. A state-coloured tray icon shows the multi-instance state at a glance; double-click launches your main account.
+• Plugin system. Optional plugins run as separate processes and hold no permissions until you grant each one by name.
+• Auto-update via Velopack. Remote config tracks the current known-good Roblox version and mutex name, so a Roblox-side rename doesn't break you for long.
+• Accessible by measurement. Every control announces its name to assistive tech, and contrast is verified against rendered pixels in every theme.
+• Speaks your language. The whole interface — every menu, setting, tooltip and window, and the messages RoRoRo writes as you use it — is translated into French, German, Russian, Portuguese (Brazil), Polish, and Spanish, following your Windows language or your pick in Settings. Switching takes effect instantly, and the picker only offers a language that's fully translated, so you never land on a half-English screen.
+
+Privacy & security:
+Your Roblox password is never seen by RoRoRo. Login happens entirely inside Roblox's own page, embedded in a Microsoft Edge WebView2 frame — same HTML, same HTTPS connection your browser would make. RoRoRo captures only the session cookie that Roblox sets after successful login, and encrypts it before writing it to disk. Account facts (Robux, Plus, friends online) are read from Roblox with that account's own session and kept only in the same encrypted vault. No telemetry. No analytics. Nothing about you leaves your machine except the Roblox-side calls during launch — the same calls Roblox.com makes from your browser — and, only if you set them up yourself, alerts to your own Discord webhook or to the phone push service you chose (Pushover or ntfy). RoRoRo also downloads its own signed files from its GitHub releases — updates, the Roblox compatibility settings, and the known Roblox issues list — and sends nothing about you to get them.
+
+Important: trademark and affiliation notice.
+"Roblox" and the Roblox logo are trademarks of Roblox Corporation. RoRoRo is an independent third-party tool, not affiliated with, endorsed by, or sponsored by Roblox Corporation. The trademarked term is used solely to describe compatibility with the Roblox platform. RoRoRo launches the official Roblox client unmodified — it does not inject into, hook into, or alter the Roblox process in any way; it only holds a Windows named-mutex before launch so that subsequent client instances see the singleton check as already-claimed.
+
+A 626 Labs product.
+```
+
+## Product features (paste each as one feature; Partner Center accepts up to 20, ≤200 chars each)
+
+> **2026-11-05 (v1.36.0.0):** still 20/20. The two frame-rate entries merge into Live status, freeing a
+> slot for accounts at a glance (facts, note, health badge); join-by-link folds into the new Library
+> entry; the tools-window entry says Library. Same edits in all six sheets.
+
+> **2026-09-29 (v1.32.0.0), owner's ruling:** the phone-alert and alert fan-out entries are merged
+> into one, freeing the slot for "Rejoin if it drops out". Still 20/20. The long description gains a
+> Rejoin bullet after Memory watchdog + Recycle. All seven sheets carry the same change.
+>
+> One entry added 2026-09-23 (v1.31.0.0): Known Roblox issues. **20/20 entries used — the
+> field is full.** A new entry now means merging or retiring one (the alert fan-out and phone
+> alert entries are the obvious pair). The same pass translated the frame-rate entry below into
+> all six sheets, so every language serves 20 and the gap recorded next is CLOSED.
+>
+> One entry added 2026-09-09: per-account frame-rate control gets its own entry again. It
+> had been folded into the live-status line, but the live listing carried it standalone and
+> it is a control, not a readout. 19/20 entries used.
+>
+> **That entry never reached the six translated sheets, and it is live that way.** Read off the
+> published v1.30 submission on 2026-09-21: `en-us` serves 19 feature entries, `de`/`es`/`fr`/
+> `pl`/`pt-br`/`ru` serve 18 each — uniformly one short, and the missing one is this entry.
+> German #4 is the RAM watchdog (English #5); the standalone frame-rate bullet has no
+> counterpart. The translated live-status line does mention the FPS limit, so the capability is
+> not unclaimed, but it loses its own row in six of the ten listings.
+>
+> Pre-existing and not caused by any release since: it entered English on a branch
+> (`store/fps-feature-bullet`, merged at `189573e`) after the translated sheets were written, and
+> nothing has diffed the counts across languages since. **First item for the next release's
+> listing audit** — translate one entry into six sheets and it closes. Not worth its own
+> submission on its own.
+>
+> One entry edited 2026-09-08 (v1.27.0.0): the language entry now says switching is instant and
+> covers the whole app rather than the screens alone. No new entry — v1.27 completes a claim the
+> v1.26 entry already made. Still 18/20 entries used.
+>
+> One entry added 2026-09-07 (v1.26.0.0): the interface is now localized to six languages
+> (fr, de, ru, pt-BR, pl, es). 18/20 entries used.
+>
+> Three entries added 2026-09-05 (v1.25.0.0): phone alerts, uptime marks, and alert fan-out.
+>
+> Two entries added 2026-08-30 (v1.24.0.0): run-on-login and Discord join activation — both
+> newly working on Store installs, which is what earns them a listing claim now and not before.
+>
+> Refreshed 2026-08-22 (v1.22.0.0). The "up to 7" cap this section used to claim was wrong —
+> the live field held 12 entries with room for more; Microsoft's actual cap is 20. The live
+> field had also drifted from this file: it carried three internal changelog lines pasted as
+> features, one of which said "Internal: improved cookie capture compatibility" — changelog
+> voice AND "cookie capture" phrasing in a public field. This list replaces the live set 1:1.
+
+```
+One-click multi-instance launcher for Roblox on Windows
+DPAPI-encrypted account vault with passphrase-protected export
+Live status for every account — which game it's in, idle time, and frame-rate caps that stick, raised, lowered or lifted per client
+Every account at a glance — Robux, Plus, friends online and your note, with a one-click fix badge when a session expires or needs verification
+Memory watchdog that learns each client's real RAM cost, plus one-click Recycle back into the same server
+Squad Launch and Friend Follow — same private server, or one public server together
+One Library for every game you play — grid or list, search and filters, paste any roblox.com link, and choose which account plays
+One tools window for Library, Settings, History and more, with keyboard shortcuts throughout
+Four built-in themes plus a build-your-own theme editor
+Optional Discord alerts to a webhook you create
+System tray with state-coloured icon and double-click main launch
+Plugin system with per-capability consent and out-of-process isolation
+Auto-update that keeps working when Roblox changes underneath
+Start with Windows if you want — one toggle, and Windows' own Startup list stays in control
+Discord Join starts RoRoRo even when it's closed, and always asks before launching anything
+Alerts on your phone through Pushover or ntfy, and to desktop and Discord channels in any mix per alert — an alt drops and your phone buzzes
+Uptime marks — an all-good buzz every two hours while your accounts run, so silence means something's wrong
+Available in six languages — the whole app, screens and messages alike, in French, German, Russian, Portuguese (Brazil), Polish, or Spanish, switching instantly, following Windows or your pick
+Known Roblox issues — Roblox-side problems, what to do, and the RoRoRo feature that helps, kept current without an app update
+Rejoin if it drops out — an alt that's kicked or stuck outside the game is closed and joined again on its own, never your main
+```
+
+## Copyright (single line)
+
+> The disclaimer is part of this field — the submission checklist requires it on the Store
+> copyright surface, and the identity table has always carried it. The plain
+> "All rights reserved." form here was drift the translation verifier surfaced (2026-09-06).
+
+```
+© 2026 626 Labs LLC. All rights reserved. "Roblox" is a trademark of Roblox Corporation. RoRoRo is not affiliated with, endorsed by, or sponsored by Roblox Corporation.
+```
+
+## Trademark info
+
+```
+"Roblox" and the Roblox logo are trademarks of Roblox Corporation. RORORO is an independent third-party tool, not affiliated with, endorsed by, or sponsored by Roblox Corporation. The trademarked term is used solely to describe compatibility with the Roblox platform. RORORO launches the official Roblox client unmodified.
+```
+
+## Additional license terms
+
+```
+RORORO source code is licensed under the MIT License. Full text: https://github.com/estevanhernandez-stack-ed/ROROROblox/blob/main/LICENSE
+
+RORORO is provided "as is," without warranty of any kind. Use of RORORO to access the Roblox platform is governed by Roblox Corporation's own Terms of Use, which you must accept separately when you sign in to a Roblox account. Roblox Corporation has stated that multi-instancing tools "may be considered malicious behaviour"; while RORORO does not modify the Roblox client and only holds a Windows named-mutex before launch, the user accepts any risk of Roblox-side enforcement on their accounts.
+
+No warranty is offered or implied for compatibility with future versions of the Roblox client. The bundled remote-config update mechanism is best-effort.
+```
+
+## Developed by
+
+```
+626 Labs LLC
+```
+
+## Keywords
+
+(Partner Center allows ~7 keywords. Order by intent: most common first.)
+
+```
+roblox, multi instance, multi-account, launcher, account manager, alt accounts, multibox
+```
+
+> Avoid "cheat", "exploit", "bypass" — those will trigger reviewer concerns even if irrelevant.
+
+## What's new in this version
+
+> **This section moved.** Since v1.21 the paste-ready What's-new block lives in a per-version
+> file, `docs/store/whats-new-<version>.md`, written next to that release's reviewer letter so
+> the two are drafted against the same facts. Current:
+> [`whats-new-1.36.0.0.md`](whats-new-1.36.0.0.md). Previous:
+> [`whats-new-1.35.0.0.md`](whats-new-1.35.0.0.md). (This pointer had gone six versions stale,
+> still naming v1.22 as current at the v1.28 cut, and four more by the v1.32.1.0 cut — worth
+> knowing that it is hand-maintained and nothing fails when it rots.) The v1.14 and v1.12 blocks that used to sit
+> here are preserved in git history and in their `release-notes-*.md` files.
+>
+> House rules that carry across versions: Store field only; do not mention the plugin
+> marketplace or contract versions; write for the customer's vocabulary ("the server you were
+> in," never "instance"); do not describe defect mechanics in a public field.
+
+## Screenshot captions (one per image, in file-number order)
+
+Partner Center takes one caption per screenshot. These are in the order the files sort:
+`01-accounts.png`, `02-account-panel.png`, `03-account-health.png`, `04-library.png`, `05-multi-instance.png`, `06-history.png`, `07-themes.png`, `08-theme-builder.png`, `09-plugins.png`, `10-compact.png` (v1.36 order, 2026-11-05; see `screenshots/README.md`).
+
+```
+Every account at a glance: Robux, Plus, friends online, your note, and the game each one is in right now.
+Open an account and its games are right there: recent, favourites and private servers, one click to play.
+When an account needs you it says so. Session expired, needs verification, limited by Roblox, each with a one-click fix.
+Every game you have played, favourited or saved, in one Library. Search, filter, and choose which account plays.
+Eight Roblox clients, eight accounts, one PC. Each window title carries the account signed into it, so you always know which is which.
+Every launch is recorded, so you can see which account played what and for how long.
+Four built-in themes. Flatline carries no meaning in colour at all, so nothing is lost to colour blindness, a bad panel, or direct sun.
+Build a theme from ten colours and it shows up in the picker. It is a JSON file, so you can hand it to someone else.
+Plugins run as separate processes and ask first. You grant each capability by name, and you can revoke it later.
+Compact mode shows only what is running. Pin it to a corner of the screen and get back to the game.
+```
+
+## Multi-feature value justification (10.1.4.4.b — DO NOT SKIP)
+
+A reviewer reading our description must see **multiple** features spanning discovery, engagement, and retention — not one trick. The list above is engineered around that:
+
+| Feature | Maps to | Why it counts |
+|---|---|---|
+| Multi-instance via mutex hold | Discovery + retention | The reason most users find us. |
+| DPAPI-encrypted account vault | Engagement + trust | Daily-use feature; trust signal that justifies Store distribution over a random GitHub binary. |
+| Per-game launch routing | Engagement | Personalization that locks users into the workflow. |
+| System tray UX with state colours | Engagement + retention | Glanceable status — users keep the tray icon visible. |
+| Squad Launch + Friend Follow | Engagement | Social use case beyond pure utility. |
+| Join by link | Engagement | Reduces switch-cost from any Roblox URL to a launch action. |
+| Velopack auto-update + remote config | Retention + reliability | Drift-resistance is a feature; users who installed v1.0 keep working when Roblox renames its mutex. |
+| Diagnostics bundle | Retention | Bug-report ergonomics — users stay through a Roblox-side break. |
+| Memory watchdog + Recycle (v1.12+, learns per-machine v1.22) | Retention | Solves the reported "alts close on their own" failure; keeps long sessions alive. |
+| Presence status + idle times (v1.5+) | Engagement | The main window is a live dashboard, not just a launcher list. |
+| Themes incl. builder (v1.17+) | Engagement | Personalization + a shareable artifact (theme files travel between users). |
+| One tools window + keyboard shortcuts (v1.22) | Engagement | Daily-driver ergonomics; the app stays open beside the game. |
+| Phone alerts + fan-out routing (v1.25) | Retention | The app reaches you when an alt drops or a two-hour all-good mark goes missing — long unattended sessions become safe to walk away from. |
+| Localization — six languages (v1.26) | Discovery + engagement | Reaches the non-English majority of Roblox's player base in their own language; a first-in-category localized multi-launcher. |
+
+## Response protocol if rejected (post-rename)
+
+Per Sanduhr playbook:
+
+1. Quote the specific clause number from reviewer feedback in the Notes-to-Publisher response.
+2. Identify the root cause, not the symptom. Don't argue the symptom.
+3. Add a regression test for that bug class if it's code-side.
+4. Increment the version (`Identity Version` in `Package.appxmanifest`) — every resubmission gets a new version.
+5. Frame the response as collaborative engineering, not pushback.
+
+## References
+
+- [`docs/PRIVACY.md`](../PRIVACY.md) — privacy policy (host this URL publicly before submission)
+- [`docs/store/age-rating.md`](age-rating.md) — age-rating questionnaire answers
+- [`docs/store/screenshots-checklist.md`](screenshots-checklist.md) — screenshots to capture
+- [`docs/store/submission-checklist.md`](submission-checklist.md) — pre-flight + post-flight procedure
+- [`docs/store/reviewer-letter.md`](reviewer-letter.md) — Notes-for-certification letter (post-rename version with rename context)
+- [`docs/store/rename-plan.md`](rename-plan.md) — comprehensive rename plan (executed in v1.1.2.0)

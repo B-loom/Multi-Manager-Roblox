@@ -1,0 +1,355 @@
+{
+  "schemaVersion": 1,
+  "app": "RoRoRo",
+  "stage": "waves",
+  "adapter": "winui-powershell",
+  "evidenceDir": "docs/ui-evidence",
+  "designLanguagePath": "docs/superpowers/specs/2026-08-04-rororo-settings-navigation-conventions.md",
+  "findingsRegisterPath": "docs/superpowers/research/2026-08-04-rororo-settings-ui-audit-findings.md",
+  "themes": [
+    "brand",
+    "midnight",
+    "magenta-heat"
+  ],
+  "invariants": [
+    "Color belongs to the theme system; identity lives in structure — every surface binds DynamicResource brushes and users ship their own JSON themes, so a finding that prescribes a color is invalid. Findings must argue layout, weight, spacing, or shape.",
+    "The 626 Labs duo is never split — cyan #17d4fa and magenta #f22f89 appear together or not at all. CORRECTED 2026-08-04: JoinByLinkWindow.xaml:27-33 and WelcomeWindow.xaml:38-43 already breach this.",
+    "Type roles are fixed — Space Grotesk display, Inter body, JetBrains Mono for small meta labels only (uppercase, 0.12em tracking). Findings may argue size, weight, and hierarchy, never a different family.",
+    "WPF-UI (lepoco) owns control chrome — findings target our composition, not the library's control internals. The themed MenuItem check-glyph behavior is already worked around deliberately in two places and is not a defect to re-litigate.",
+    "No emoji in UI copy. AMENDED 2026-08-04 by Este: the die on Reroll identity and the clipboard on Copy AI prompt STAY — thematic to streamer mode's deliberately silly naming, not decoration. The defect at that site is placement, not the glyph; moving Reroll identity off the dashboard (goal 1) is the fix. Do not strip them in a copy wave.",
+    "Token-contract extensions must be optional-with-fallback — Theme has exactly ten required slots and user themes on disk supply all of them. A new slot breaks every existing user theme unless it defaults."
+  ],
+  "waves": [
+    {
+      "id": 1,
+      "name": "Games naming knot + streamer mode leaves the dashboard",
+      "status": "shipped",
+      "findings": [
+        "F-006",
+        "F-008"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "Window conventions — ownership, Esc, placement",
+      "status": "open",
+      "findings": [
+        "F-084",
+        "F-054",
+        "F-060"
+      ],
+      "notes": "F-054 was re-measured and had overstated itself — 22 windows already dismissed on Esc; the real gap was four. Its [new-mechanism] half became F-112. F-041/F-048/F-079, the style-consolidation trio originally planned for this wave, are NOT in it and stay open."
+    },
+    {
+      "id": 11,
+      "name": "Chrome consolidation — Close, window classes, modal theming",
+      "status": "open",
+      "findings": [
+        "F-041",
+        "F-048",
+        "F-079"
+      ],
+      "notes": "All three had moved since they were written and none had been flipped. F-079's stated claim was already fully resolved; F-048's headline example (Preferences locked) was fixed by wave 2; F-041's rank was settled by wave 5. Two new fences so the conventions stop depending on anyone remembering them."
+    },
+    {
+      "id": 2,
+      "name": "Settings nav rail — five pages, shape-based selection, resizable",
+      "status": "clean",
+      "findings": [
+        "F-002",
+        "F-003"
+      ],
+      "note": "Merged as 159fe4b. Residue recorded, not hidden: C5 is still unmet INSIDE a page — the nine section cards remain fill-only and collapse under flatline. Splitting them across five pages did not make cards load-bearing. That is a C5 conformance gap, not an F-002 miss, and it stays open."
+    },
+    {
+      "id": 3,
+      "name": "Tools container — six nav buttons become Settings + Tools, and the ad copy goes",
+      "status": "clean",
+      "findings": [
+        "F-009",
+        "F-010",
+        "F-011",
+        "F-012"
+      ],
+      "note": "Merged as 3fc838b. F-001 was in the batch and did NOT close: its fix direction also lists Stop all, Open log folder and the Welcome tour, none of which has a view-model command (the tray raises events handled in App.xaml.cs). F-001 stays open with exactly those three named. The gate also caught an accessibility regression — the first Tools control announced as a plain button with no ExpandCollapse — fixed with a custom peer after all three stock controls each failed a different half."
+    },
+    {
+      "id": 4,
+      "name": "Page chrome — goal 4, the window-title system and the two header grammars",
+      "status": "clean",
+      "findings": [
+        "F-004",
+        "F-005",
+        "F-007",
+        "F-014",
+        "F-015",
+        "F-016",
+        "F-017"
+      ],
+      "note": "Merged as 3d41846 (PR #92). LEDGER ENTRY WRITTEN LATE, 2026-08-05: that merge updated the register rows to clean and added the f076 entry but never wrote wave 4's own entry here, so the ledger claimed three waves while the register showed four waves' worth of closed rows. Recorded now from the register rows rather than from memory. The wave itself: a title rule made enforceable by a test that scans XAML AND code-behind Title= assignments (the one runtime-assembled title had shipped the repo name for months), plus a shared PageHeader replacing 12 of 13 hand-rolled headers. About keeps its own, deliberately — its heading is a clickable named TextBlock with a handler."
+    },
+    {
+      "id": 5,
+      "name": "The component vocabulary — secondary buttons get an edge that clears 3:1",
+      "status": "clean",
+      "findings": [
+        "F-025",
+        "F-030",
+        "F-031",
+        "F-035"
+      ],
+      "note": "Merged as bf1fdef (PR #94). All four rows closed. Scope was REVISED mid-wave after Este's constraint about users who already authored their own themes: the original plan would have repainted every separator and card edge in every user theme. Divider turned out to do two jobs — decorative separator and control boundary — and WCAG 1.4.11 governs only the second. The fix derives InteractiveEdgeBrush via ContrastGuard rather than adding an eleventh slot (invariant 6 holds), a role-based test fences it off from decoration, and a per-theme consent prompt asks before changing a theme somebody wrote. REVIEW GATE (two Opus reviewers, local): ten findings addressed, one disagreed with on the merits. The two worst were cases where a test agreed with a false claim — ContrastGuard checked the ratio of an un-quantized triple then rounded on the way out, so 9,569 of 147,511 failing pairs came back under 3:1 (all three built-ins cleared it by luck, midnight by 0.019); and the sweep commit's 'zero Buttons left on DividerBrush' was true of the markup and false of the app, since two buttons are built in C# and every test in the wave parses XAML. Also: the answer could be persisted against the wrong theme across the modal's message pump, and dismissing the dialog with the title-bar X wrote a permanent decline — the first fix for that DID NOT WORK (WPF closes a modal with DialogResult false, not null) and only live WM_CLOSE testing caught it. DISAGREED: the gate flagged that our own theme template ships a 1.26:1 divider so anyone following our docs trips the dialog. Real, but changing the template hex would rebuild the bug — a faint divider is CORRECT for a hairline. Fixed the dialog copy and AGENT_PROMPT instead, so it no longer implies the author erred. CLOSE-OUT: re-captured main window and the Alerts page under brand and flatline (87-90). Under flatline the converted controls carry visible edges and the webhook TextBox beside the converted Show toggle has none — the stage-5 residue is now visible rather than theoretical. Comment drift: ControlStyles.xaml implied the dictionary reached every button; corrected to name the two code-behind exceptions. Gate surfaced three register additions: F-077, F-078, F-079."
+    },
+    {
+      "id": 6,
+      "name": "Text inputs are controls too — surfaces, inputs, and the heading hiding in C#",
+      "status": "clean",
+      "findings": [
+        "F-029",
+        "F-047",
+        "F-049",
+        "F-064",
+        "F-077"
+      ],
+      "note": "Merged as deb8d23 (PR #95). All five rows closed. Wave 5's own close-out capture is what scoped this: under flatline the Alerts panel showed a converted Show button with a clear outline beside a webhook field with no boundary at all. 16 interactive controls (11 TextBox, 3 PasswordBox, 2 ComboBox) moved to the derived edge; the 7 card Borders and one ContextMenu stayed on DividerBrush, because those are separators and 1.4.11 does not govern separators. THREE DELIBERATE CALLS. (1) The input styles set no Background — two fills are in use and both are right, RowBg on a card and Navy on chrome, so forcing one would flatten a real distinction. (2) The ComboBox style is IMPLICIT and is the only one here that is: F-049 IS 'somebody added a ComboBox and it inherited nothing', so keying it would have preserved the exact failure mode. Buttons and text boxes stay keyed because each has more than one legitimate recipe. (3) F-026 was NOT slipped in. CardBorderStyle consolidates nine hand-copies but does not fix C5 — a card is a fill and a radius, and under RowBg == Bg the grouping still vanishes. The structural fix is F-026, tagged [new-mechanism], and it now costs one edit instead of nine. NO REVIEW GATE ON THIS ONE — Este's call to merge directly. The two blast-radius risks I had flagged were verified by hand instead: the implicit style turned out to govern all 6 ComboBoxes app-wide including 4 never touched (the per-row game and FPS pickers, and both alert routers), so those were captured and checked before merge (93); and the C# FindResource key, which fails at runtime rather than compile time, was exercised by opening Diagnostics through Tools (92). CLOSE-OUT: comment drift clean — the only stale-looking mentions of the old 12px/cyan heading are inside the comment describing its removal. C8 updated: the card line now points at the style and says plainly that the recipe is still fill-only, and an input line was ADDED, since C8 never named one — which is why two input recipes drifted and why every input sat below 3:1 through wave 5."
+    },
+    {
+      "id": 7,
+      "name": "Client lifetime — the ones a human found and no instrument did",
+      "status": "open",
+      "findings": [
+        "F-103",
+        "F-100",
+        "F-099"
+      ],
+      "notes": "F-095 and F-101 were re-checked against the tree first and were already clean, so the wave is three rows, not five. Two of the three were understated by their own row: F-100 had a second off switch behind the one it named (the doubles discarded every subscription), and F-099's window drew the ignored plugin copy as a real row rather than merely staying silent. F-106 was split out of F-100 rather than absorbed into its close-out."
+    },
+    {
+      "id": 8,
+      "name": "Stop actually stops",
+      "status": "open",
+      "findings": [
+        "F-111",
+        "F-109"
+      ],
+      "notes": "Both fixed by asking a different question. RoRoRo had been sending WM_CLOSE, which Roblox ignores, and trusting a return value that means 'message posted'. Scoped from eight probes because two designs died in them â€” SC_CLOSE closes a bare client and only raises a confirm on an in-game one, and that confirm is drawn inside the game surface where no automated probe can see it. The user's screenshot is what corrected it."
+    },
+    {
+      "id": 9,
+      "name": "The leftover that happens every time",
+      "status": "open",
+      "findings": [
+        "F-110"
+      ],
+      "notes": "Fixed by establishing the premise first, which the row demanded: a clean stop deterministically spawns a headless client, so the dialog about it was firing on the ordinary path. Also corrected the row's own account of its origin â€” the six modals came from a windowed test client, not this."
+    },
+    {
+      "id": "f076",
+      "name": "Mask the saved webhook credential in Settings",
+      "status": "clean",
+      "findings": [
+        "F-076"
+      ],
+      "note": "Not a wave — a single standalone finding, fixed and verified in one PR (merged 9587ee6b). F-076 was itself added BY wave 2, whose capture tooling photographed a live webhook token. Masking logic lives in Core with nine unit tests; the reveal toggle is wired to Checked/Unchecked rather than Click because UI Automation's TogglePattern never raises Click — the first version looked right and did nothing under automation. Este declined rotating the exposed webhook (2026-08-04); it never left the machine and was never committed."
+    },
+    {
+      "id": 12,
+      "name": "Accessibility floor — automation reaches the controls",
+      "status": "open",
+      "findings": [
+        "F-102",
+        "F-045",
+        "F-073",
+        "F-052"
+      ],
+      "notes": "F-102 closed and its tray twin found by asking the question the row said to ask — the assumption that MenuItem was fine was wrong and a test measured it. F-045 was almost entirely already fixed. F-073 and F-052 stay open on purpose: one needs a layout re-proved on a render, the other is a 49-control [new-mechanism] remediation now held by a ceiling."
+    },
+    {
+      "id": 13,
+      "name": "The tray, and the things it hides",
+      "status": "open",
+      "findings": [
+        "F-034",
+        "F-018",
+        "F-039",
+        "F-038",
+        "F-061"
+      ],
+      "notes": "Two of the five rows were low when re-measured, both in the same direction: F-034 named three remaining brand-leak sites and there were four (the idle toast, titled ROROROblox three files from a balloon already titled RoRoRo), F-061 named three casing sites and there are five (two of them instructions naming the button by its old label). F-018's fix is a subscription rather than six notifications, because six call sites are six chances to miss the ERROR arm. Wave 13's own capture found what the code could not report: About is fixed-height NoResize and the new line pushed the DPAPI paragraph off the bottom, which then revealed the trademark disclaimer had ALREADY been clipped mid-sentence — F-113, fixed in-wave and recorded as its own row because only half of it belongs here. THE FIRST FIX WAS A NUMBER AND THAT WAS WRONG: raising 460 to 540 made the window render and left the class alone, and Este photographing the clipped panel from an older build is what said so. About now uses SizeToContent with Auto rows — the app's own existing pattern, EdgeRemediationWindow and LaunchHeadroomWindow already ship it — so there is no height to be wrong. The remaining 12 fixed-height NoResize windows are counted and recorded as F-115, open, not fixed. F-114 added open: the Add-account window binds zero theme brushes and holds 14 hex literals; F-066 counted it out of scope and closed clean against the narrower scope, correctly. F-071 re-measured, not closed — its eight sites are four, so it is now a cheap product decision instead of an expensive one, and the decision is still the user's."
+    },
+    {
+      "id": 14,
+      "name": "The themes reach where they land",
+      "status": "open",
+      "findings": [
+        "F-090",
+        "F-050",
+        "F-114"
+      ],
+      "notes": "F-115 was proposed for this batch and dropped from it: it is window SIZING, not theming, and eleven windows each need their layout re-proved on a render. Doing it here would have been eleven shallow edits. F-090: the derived edge was computed against Navy and painted on two surfaces; EnsureAgainstAll walks once and clears every surface, and EdgeRemediation.Decide takes the worst of them so a divider passing Navy and failing the card is asked about instead of ignored. The finding turned out to be inside its own control group — a fixture constant named GoodDivider measured 3.07 on Navy and 2.89 on the same theme's cards. F-050: the row's surface was stale (CtaButtonStyle is Cyan-on-Navy; the magenta pair survives on five pills) AND its fix direction was insufficient by its own numbers — picking the better slot closes two themes of four, so the winner is nudged the rest of the way. ContrastPairGateTests now has an EMPTY exemption list. F-114 closed one day after opening and emptied an allow-list entry that had outlived F-066 by eight days. Two rows added open: F-116 (a second filesystem-timing intermittent, twice in ~8 full runs, never in isolation) and F-117 (the Modals/ allow-list entry cites two clean rows and now covers a single literal — a permission no test polices, because NoExemptionOutlivesItsFinding reads a different list). POST-PUSH, 2026-08-21: PR #122's x64 runner went red on RobloxProcessTrackerTests.InstallerRunning_ButRpbNeverAppears_BoundedByExtendedCap_ThenFails ('ran 2854ms, well past the 600ms cap') while arm64 passed the identical commit and the test passes locally. Nothing in the wave touches it. F-116 re-measured on the spot from one test to four, and split into two sub-shapes that do NOT share a fix: wait-for-an-effect (pollable) and assert-a-bound (not pollable — the assertion is the wall clock, so it needs an injected budget)."
+    },
+    {
+      "id": 15,
+      "name": "The type ladder, and the harness under it",
+      "status": "open",
+      "findings": [
+        "F-115",
+        "F-057",
+        "F-044"
+      ],
+      "notes": "F-105 was in the batch and did NOT close. Its reproducer was re-confirmed at HEAD in both directions — 115 of 120 render tests fail with RoRoRo running, 120/120 with it closed — but every one of those failures is wave 7's RequireClean guard naming the cause, not the raw pack:// crash. So the local half is handled loudly and what remains is the CI-headless half plus an unknown mechanism with four prior negative probes and a documented failed fix. Not attempted here; the wave spent its budget on the three rows that could move. F-115: eleven windows to SizeToContent, plus TWO instruments — a markup fence for the condition and WindowContentFitsTests for the consequence, the latter being what F-113 said did not exist. Pointed at About's shipped 460px it quantifies the bug at 28.6px undrawn. F-057 and F-044 each closed HALF of what their row claimed and the halves became F-118: MainWindow went nine sizes to four and app-wide eleven to eight, but 163 declarations still sit at 11px, which is 50% of the app's text and under F-044's own 12px prose floor. The structural cause no row had named: 326 font-size declarations and no size resource of any kind. F-119 recorded as CAUSED by this wave, not discovered — raising the 9px follow chips pushed a strip that was already truncating names into truncating one more, and the fix for that is a layout decision on the densest surface rather than a side effect of a type wave."
+    },
+    {
+      "id": 16,
+      "name": "Finish the type",
+      "status": "open",
+      "findings": [
+        "F-118",
+        "F-119"
+      ],
+      "notes": "Both rows were wrong about their own size and measuring settled each in minutes. F-118 was priced as per-site judgement over 163 sites; classifying them by the ladder's own meta definition (mono, uppercase, tracked) returned 2 mono and 0 uppercase, one of those a scanner false positive - so the tier was 162 prose and 1 label and the judgement did not exist. Migration went past the row's ask because stopping at 11px leaves the ladder half-used: 12 to Body, 13 and 14 to Heading, 22 to Display. 326 raw declarations in 11 sizes became 16 in 3, the remainder being hero chrome where the value carries brand identity. F-119 went the other way: recorded as a truncated name, it was HIDING THREE ENTIRE ACCOUNTS from a seven-target follow strip, so following them was impossible from the main window - cosmetic row, functional defect. Two wrong fixes before the right one, and the first is the lesson: a WrapPanel changed NOTHING because a horizontal StackPanel measures children with infinite width, so it never saw a boundary. The fix had to be the parent (DockPanel). It looked correct in the diff and was inert on screen; only the capture said so."
+    },
+    {
+      "id": 17,
+      "name": "The suite tells the truth",
+      "status": "open",
+      "findings": [
+        "F-116",
+        "F-117"
+      ],
+      "notes": "Scoped to two rows, not the four infra rows offered at wave 15. F-107 is tagged [new-mechanism] (xUnit 2.9.3 has no assembly-level skip) and gets its own wave; F-105's own row says the next step is a bisect of App.OnStartup, which is a research session rather than a wave item. F-116 was chosen because it had stopped being theoretical - it blocked TWO merges today, both RobloxProcessTrackerTests, both green on re-run. Fixed by sub-shape exactly as the row directed: assert-a-bound got an injected IClock and wait so tests drive virtual time (and the bounded test's tolerance TIGHTENED from 1800ms against a 600ms cap to cap plus one poll - the old slack existed only to survive a loaded runner); wait-for-an-effect got a poke-until-it-answers loop instead of a 600ms guess at when a FileSystemWatcher is armed. FpsCapSettlerTests deliberately untouched: it already uses FakeTimeProvider and its residue is its own pump's real-time observation budget, a thread-pool scheduling problem whose prior diagnosis is recorded in that file down to ThreadPool.PendingWorkItemCount and 18->36 thread injection. F-116 stays open on that family."
+    },
+    {
+      "id": 18,
+      "name": "The vocabulary finishes",
+      "status": "open",
+      "findings": [
+        "F-067",
+        "F-094",
+        "F-075",
+        "F-092",
+        "F-073",
+        "F-093"
+      ],
+      "notes": "F-093 and F-073 were announced in this batch and did NOT ship - said plainly rather than quietly dropped; they carry to the next wave. F-067: MonoFontFamily and DisplayFontFamily declared beside the size ladder, 25 mono declarations unified, and the display role given its first expression anywhere in the app. Both fallback stacks, no font files, so this stayed a vocabulary change rather than a packaging one. The seven bare-Consolas sites survived because neither brand font is installed on the authoring machine - both recipes fall through to Consolas and look identical, so the defect was invisible exactly where it was being written. Written with DynamicResource from the start; the StaticResource mistake that cost two CI runs on MetaFontSize was caught in review this time. F-094: Compose returns a severity, and THREE arms are failures rather than the two the row named - the never-pasted-a-webhook case is the least obvious, because nothing is broken and the user simply believes they finished. Brush driven from a Tag trigger in XAML so the colour stays visible to the theme gates. F-075 and F-092 closed-as-ruled with no code: both were rulings sitting in the open column, and counting them as work overstated the backlog by two. FINISHED 2026-08-21: F-073 and F-093 shipped as the owed follow-up. F-073's reorder half needed a DockPanel to become a Grid - a DockPanel cannot separate declaration order from visual position, which is the entire defect - and was proved by UIA (text at element 14, button at 15) plus a pixel-identical capture, which is the proof the earlier pass asked for rather than an argument. F-093 deleted the field AND the legacy LaunchAsync overload together, because the overload's third resolution tier WAS the field. Production compiled clean with both gone; every remaining reference was a test. 13 tests went, 2 were ported to the typed path because they covered behaviour that still exists, and a first pass that removed 3 more by string-matching was reverted and redone by name."
+    },
+    {
+      "id": 19,
+      "name": "The History window",
+      "status": "open",
+      "findings": [
+        "F-072",
+        "F-059"
+      ],
+      "notes": "F-072 took THREE attempts and the first two failed silently, which is the lesson. AutomationProperties.SetName on the row's Border produced nothing (510 Text nodes, 0 named rows); on a ContentControl, nothing either (one Custom element for a hundred rows). WPF builds automation peers for CONTROLS, so a name on a decorator is a name nowhere - both diffs read as correct and only the automation tree disagreed. HistoryRowPresenter, a Border subclass whose peer reports ListItem and IsControlElement, is the same answer wave 3 reached for the Tools control. Verified live: 620 elements / 0 named rows became 720 / 100. HistoryRowRhythmTests caught the type rename immediately and its own failure message asked to be re-pointed rather than re-derived, which is exactly what a good gate does. F-059 closed by re-measurement alone: it describes six nav buttons with inconsistent icons and the app has three with none, satisfying the row's own 'or none do'. F-098 was considered and NOT taken - its remaining piece is button rank, not History structure."
+    },
+    {
+      "id": 20,
+      "name": "The remainder that could actually be finished",
+      "status": "open",
+      "findings": [
+        "F-083",
+        "F-096"
+      ],
+      "notes": "Asked to take every remaining row that could be finished in a wave. Four candidates; TWO said in their own rows that they could not be, and were scoped out with their own words as the evidence: F-098's remainder is under a standing ruling to wait for the Store submission run (auditing capture-ui.ps1 means driving a live app; auditing the packaging scripts means building an MSIX to audit the script that builds it), and F-106 is [new-mechanism] with an explicit 'do not batch it'. F-083 shipped in full to its own spec - p75 of settled clients, pressure samples discarded, clamped, seeded, version-reset - and feeds the ADVISOR ONLY, enforced by where the value is threaded rather than by a comment. A test of mine was wrong before the code was: the p75 case expected 3000 from a 15/5 split, which is simply the wrong arithmetic, and the failure said so. F-096 is partly closed: its named-mutex fix lives in rororo-ur-task, a different repo, but the row's own second sentence asks whether the author guide should require it of every plugin - it now does, with the real symptom, and with a verbatim-string bug caught in the sample while writing it."
+    },
+    {
+      "id": "f105-research",
+      "name": "F-105 research session",
+      "status": "open",
+      "findings": [
+        "F-105"
+      ],
+      "notes": "Research, not a wave. Mechanism STILL UNKNOWN and recorded as such. What the session produced: (1) the full stack trace, which nobody had - the throw is in WPF-UI's ContextMenuLoader resolving a pack URI for an editor context-menu style nothing here renders, arriving via ExceptionWrapper as a DISPATCHER callback, which is exactly why it killed the host rather than failing a test. (2) Four more eliminations by measurement: the tray icon, RobloxWindowDecorator, the deferred startup checks (WebView2 sweep + Velopack), and file-locks/output-folder - RoRoRo run from %TEMP% crashes identically, so it is the process, not the files. (3) The row's own 'crash after exactly 3 tests' regularity DOES NOT HOLD: 15, 71, 14, 128 observed. (4) Blast radius closed: the host now survives that dispatcher exception, so the run COMPLETES (128, twice) where it ABORTED - which kills the reporting hazard the row's verdict calls the real danger, without claiming the bug is fixed. (5) RORORO_RENDER_IGNORE_APP=1 study seam, because a guard you cannot switch off is a guard nobody can investigate. Production code untouched: App.xaml.cs was instrumented for the bisect and reverted byte-for-byte."
+    },
+    {
+      "id": "f105-closed",
+      "name": "F-105 root cause, both halves",
+      "status": "open",
+      "findings": [
+        "F-105"
+      ],
+      "notes": "Root cause: WindowRenderHost builds the real App for App.xaml's resources, on a comment asserting that new App() cannot raise OnStartup. It can, and did. With an instance running, startup hit the single-instance guard and called Shutdown(0), disposing the Application underneath renders in flight - the pack-URI exception was a disposed Application, not a scheme registration. Found by staging OnStartup (clean before the guard, crashing after) and confirmed by a bare PowerShell process holding ONLY that mutex name, with no RoRoRo running at all; an unrelated name is clean. Every earlier probe fits the explanation. The CI half had the same cause - real startup means a network update check inside a 60s render budget - tested by lifting the skip as one revertible commit: CI returned Skipped:0 Total:1798 on both legs. Nine gates back on CI. Second defect found on the way: every render run was writing to the user's real log, scanning the plugin registry and STARTING A REAL PLUGIN PROCESS."
+    },
+    {
+      "id": "f107-closed",
+      "name": "F-107 closed by measurement",
+      "status": "open",
+      "findings": [
+        "F-107"
+      ],
+      "notes": "The dirty-environment premise no longer reproduces. RoRoRo half: fixed and fenced by F-105 (wave 20). Client half re-measured at HEAD three ways: stub RobloxPlayerBeta process fails 126 of 1798 at once, every failure the guard own throw; guard bypassed with the stub is 1798/1798; a REAL windowed client (1.1 GB WS, alive across runs) with guard bypassed is 1798/1798 three consecutive runs at 7s. Founding evidence was confounded: the 2026-08-20 client-up measurements predate startup suppression by 27 hours, so real OnStartup ran inside the test host, and a live client routes it into the blocked branch (already-running modal ShowDialog on the render thread, network update check in the 60s budget). The measured client was idle, which saturates no GPU; CPU saturation was already clean 2026-08-12. Client guard removed with its tests; StartupSuppressionFenceTests stays; investigation doc banner-corrected. Same PR records F-096 re-measurement: guide half verified complete, rororo-ur-task at origin tip still has no mutex, row stays open for the cross-repo half."
+    },
+    {
+      "id": "f013-prereq-discord-owner",
+      "name": "F-013 prerequisite: DiscordConfig single owner",
+      "status": "open",
+      "findings": [
+        "F-013"
+      ],
+      "notes": "PR A of the F-013 wave. DiscordConfigService (Core) replaces the two whole-record writers that modality used to serialize: MutateAsync is the only write path (gated read-modify-write, persist-then-publish, throw leaves Current untouched), Current is the torn-free synchronous read, Changed keeps views current. PreferencesWindow dropped its snapshot and repaints on Changed; the row mute goes through the gate; presence subscribes via App wiring; DiscordConfigCache deleted. Lazy first-load inside the gate so a mutation racing startup composes against disk, not defaults. Fixed three pre-existing defects: mid-session mute invisible to AlertDispatcher, failed-save cache incoherence, ordering-mistake wipe class. Suite 1798 unit + 22 integration green. Row stays open for PR B, the shell fold."
+    },
+    {
+      "id": "f013-shell",
+      "name": "F-013 closed: six modal islands become one shell",
+      "status": "open",
+      "findings": [
+        "F-013"
+      ],
+      "notes": "PR B. ShellWindow (non-modal destination, MinW/MinH, dynamic title = active page) hosts Games/Settings/History/Diagnostics/Plugins/About as lazily-created pages behind a persistent 164px rail; NavItemStyle promoted to ControlStyles.xaml and classified Excluded in the rendered style gate with a measured no-fill reason. One App.OpenShellPage is every door (toolbar, Tools menu, tray, plugins command) - single instance, retires the double-Preferences class. Close-moment reconciliations became event-driven or per-edit; the main-window idle re-push gap fixed on the way. Pages dispose via the shell. Six Close buttons retired (page is a destination, not a dialog). Routes survived on the dynamic title; one literal change (About). F-106 re-measured 12 to 7 and recorded. Suite 1798 unit + 22 integration green after the fold."
+    },
+    {
+      "id": "f116-quiet-pool",
+      "name": "F-116 closed: the pump gets a quiet pool",
+      "status": "open",
+      "findings": [
+        "F-116"
+      ],
+      "notes": "The last flake family closed by removing its condition: FpsCapSettlerTests now runs in the suite first parallel-disabled xUnit collection, so the pump continuations no longer share a contended pool with the parallel suite - the scheduler-of-their-own hypothesis the row left untested, shipped without touching production code. Evidence: the row own recorded isolation delta (isolated 25/25 clean vs in-suite intermittent locally and on CI x64) plus the refuted SetMinThreads mitigation; a fresh local reproduction attempt (six full-suite runs under twelve CPU burners) was clean BEFORE the fix too, so no local delta exists - consistent with in-process contention as the mechanism. Fence ThePumpKeepsItsQuietPool proven failable by mutation. Twelve loaded runs green. Suite 1799 unit after (one new fence test). Same commit annotates F-096: guard authored in rororo-ur-task PR, row flips on its merge."
+    },
+    {
+      "id": "f112-keyboard-vocabulary",
+      "name": "F-112 closed: the keyboard vocabulary",
+      "status": "open",
+      "findings": [
+        "F-112"
+      ],
+      "notes": "One table (Input/KeyboardVocabulary.cs) consumed by three surfaces: MainWindow KeyBindings (Ctrl+N/L/J/F + six destinations: Ctrl+G, Ctrl+Comma, Ctrl+H, Ctrl+D, Ctrl+P, F1), ShellWindow page navigation + Ctrl+1-6 along the rail, and the About page discoverable list (where F1 lands from either window). Hints layered per Windows convention: InputGestureText in Tools, tooltip suffixes + AcceleratorKey on toolbar/CTAs. Fences: gesture uniqueness, Ur Task global-hotkey denylist (Ctrl+Shift+R/P/A/L - RegisterHotKey wins system-wide), markup-hint drift fence with vacuity floor - drift fence proven failable by mutation. Deliberate absences documented in the table: Stop all (destructive), per-row actions, smallness itself. Fits-matrix enrollment for the shell reframed to chrome-only: pages scroll by design (F-113 carried into the fold), so a page taller than the frame is reachable, not clipped. Suite 1805 unit green."
+    },
+    {
+      "id": "f106-dialog-seams",
+      "name": "F-106 closed: every remaining dialog behind a seam",
+      "status": "open",
+      "findings": [
+        "F-106"
+      ],
+      "notes": "Closed with the codebase ruling, not the row sketch: one delegate seam per dialog (StopAllConfirm pattern, which ShellPageOpener already extended) instead of an IWindowHost factory. SquadLaunchPicker / JoinByLinkPicker / FriendFollowPicker (result-bearing; the friend pick carries presence + name because EvaluateFollow owns the launch decision), RenamePrompt, the two not-installed interruptions, DpapiCorruptPrompt, and a QuitApplication seam. Ten tests in MainViewModelWindowSeamTests are the first these flows have ever had - cancel paths, picked-target dispatch, the privacy-hidden follow block, corrupt-store start-fresh vs quit, rename round-trip. Suite 1815 unit green. Register scoreboard 110 clean / 2 open (F-096 waits on rororo-ur-task PR 32; F-098 waits on the Store run by ruling)."
+    },
+    {
+      "id": "f096-flipped",
+      "name": "F-096 closed: the plugin guards itself",
+      "status": "open",
+      "findings": [
+        "F-096"
+      ],
+      "notes": "rororo-ur-task PR 32 merged 2026-08-22 (unit + host-integration CI green); guard verified at that repo origin tip by reading the tree. Named mutex on the plugin id as the first act of OnStartup, before the evidence layer; quiet loser skips the shared log on exit; verbatim-string mutex name pinned by a test asserting the CR trap this row documented. Register: 111 clean / 1 open (F-098, Store-run-gated) / 7 closed-as-ruled."
+    }
+  ],
+  "scope": {
+    "area": "Settings, plus the app's navigation and page chrome around it",
+    "goal": "1) Get the items that are really settings INTO Settings — streamer mode, and probably About, History, Diagnostics, which currently hang off the main window. 2) Settings was already getting tall before Discord and alerts landed on it, so work out how to split it up. 3) Main-window buttons are fine to keep or change — including a separate container for tools if that is the right answer — but each one has to lead where it says it leads. 4) Fix the page titles: they read like an app being readied for a hackathon, explaining each page at the top like an ad rather than reading as app chrome. OPEN: History and Diagnostics are tools, not preferences — 'under Settings' may be the wrong home for them; the user's word was 'maybe' and this campaign decides it on evidence.",
+    "surfaces": [
+      "main-window",
+      "main-window-empty",
+      "preferences",
+      "preferences-scrolled",
+      "about",
+      "history",
+      "diagnostics",
+      "library",
+      "plugins",
+      "theme-builder",
+      "tray-menu"
+    ]
+  }
+}

@@ -1,0 +1,165 @@
+<UserControl x:Class="ROROROblox.App.History.SessionHistoryPage"
+             x:ClassModifier="internal"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:loc="clr-namespace:ROROROblox.App.Localization"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:ROROROblox.App.Controls">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <controls:PageHeader Heading="{loc:Loc SessionHistoryPage_History}" />
+
+            <!-- F-038. Diagnostics has carried a line like this since it shipped ("Collecting…",
+                 then a capture time or "Couldn't collect diagnostics: {message}") and History never
+                 did — so a read that failed and a user with no launches produced the identical
+                 screen. LiveSetting is Polite because this text changes without focus moving:
+                 a screen reader would otherwise announce nothing at all when a load fails. -->
+            <TextBlock x:Name="StatusText"
+                       FontSize="{DynamicResource BodyFontSize}"
+                       Foreground="{DynamicResource MutedTextBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,8,0,0"
+                       AutomationProperties.LiveSetting="Polite" />
+        </StackPanel>
+
+        <Grid Grid.Row="1" Margin="0,20,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- Session stats (v1.23, spec §1). Six numbers from the local rollup — nothing here
+                 leaves the machine. Collapsed until the presenter reports HasAnything, so a fresh
+                 install shows the history empty-state alone rather than a wall of zeros
+                 pretending to be data.
+
+                 Peak concurrent alts is the flagship — it is this product's entire thesis as one
+                 number, so it gets the cyan and the biggest type. The streak carries magenta so
+                 the signature duo appears together, per brand. Labels are mono + meta-size
+                 uppercase, the app's established small-label idiom.
+
+                 Fills and text here are existing measured pairings only (RowBg under White /
+                 Muted is the contrast gate's first named pair); no new Background+Foreground
+                 combination is introduced on any single element, so the gate's scan sees nothing
+                 unvetted. -->
+            <StackPanel x:Name="StatsBlock" Grid.Row="0" Visibility="Collapsed" Margin="0,0,0,16">
+                <UniformGrid Columns="3" x:Name="StatsCards">
+                    <Border Background="{DynamicResource RowBgBrush}" CornerRadius="8"
+                            Margin="0,0,8,0" Padding="14,10">
+                        <StackPanel>
+                            <TextBlock Text="{loc:Loc SessionHistoryPage_PeakAltsAtOnce}"
+                                       FontFamily="{DynamicResource MonoFontFamily}"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}" />
+                            <TextBlock x:Name="PeakAltsText"
+                                       FontSize="{DynamicResource DisplayFontSize}" FontWeight="Bold"
+                                       Foreground="{DynamicResource CyanBrush}"
+                                       Margin="0,2,0,0" />
+                            <TextBlock x:Name="PeakAltsCaption" Text="{loc:Loc SessionHistoryPage_SinceHistoryBegan}"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}" />
+                        </StackPanel>
+                    </Border>
+                    <Border Background="{DynamicResource RowBgBrush}" CornerRadius="8"
+                            Margin="0,0,8,0" Padding="14,10">
+                        <StackPanel>
+                            <TextBlock Text="{loc:Loc SessionHistoryPage_TotalUptime}"
+                                       FontFamily="{DynamicResource MonoFontFamily}"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}" />
+                            <TextBlock x:Name="TotalUptimeText"
+                                       FontSize="{DynamicResource DisplayFontSize}" FontWeight="Bold"
+                                       Foreground="{DynamicResource WhiteBrush}"
+                                       Margin="0,2,0,0" />
+                            <TextBlock x:Name="MostPlayedText"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}"
+                                       TextTrimming="CharacterEllipsis" />
+                        </StackPanel>
+                    </Border>
+                    <Border Background="{DynamicResource RowBgBrush}" CornerRadius="8"
+                            Padding="14,10">
+                        <StackPanel>
+                            <TextBlock Text="{loc:Loc SessionHistoryPage_DayStreak}"
+                                       FontFamily="{DynamicResource MonoFontFamily}"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}" />
+                            <TextBlock x:Name="StreakText"
+                                       FontSize="{DynamicResource DisplayFontSize}" FontWeight="Bold"
+                                       Foreground="{DynamicResource MagentaBrush}"
+                                       Margin="0,2,0,0" />
+                            <TextBlock x:Name="StreakCaption"
+                                       FontSize="{DynamicResource MetaFontSize}"
+                                       Foreground="{DynamicResource MutedTextBrush}" />
+                        </StackPanel>
+                    </Border>
+                </UniformGrid>
+
+                <!-- The per-alt leaderboard and longest session, one quiet line each; rows are
+                     built in code the same way HistoryList's are. -->
+                <StackPanel x:Name="LeaderboardList" Margin="2,10,2,0" />
+
+                <TextBlock x:Name="IntegrityNoteText"
+                           FontSize="{DynamicResource MetaFontSize}"
+                           Foreground="{DynamicResource MutedTextBrush}"
+                           TextWrapping="Wrap"
+                           Margin="2,6,2,0"
+                           Visibility="Collapsed" />
+            </StackPanel>
+
+            <Border Grid.Row="1"
+                BorderBrush="{DynamicResource DividerBrush}"
+                BorderThickness="1"
+                CornerRadius="8">
+            <Grid>
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="HistoryList" Margin="8" />
+                </ScrollViewer>
+                <StackPanel x:Name="EmptyState"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Visibility="Collapsed">
+                    <!-- Text is set in code from CoreMessageCatalog.SessionHistory.Placeholder — an empty
+                         history and an unreadable one say different things (F-038). The literals
+                         that used to live here were the "no launches yet" arm, which was shown for
+                         both. TextWrapping matters now: the unreadable arm is two sentences. -->
+                    <TextBlock x:Name="EmptyHeadline"
+                               FontSize="{DynamicResource HeadingFontSize}"
+                               Foreground="{DynamicResource MutedTextBrush}"
+                               HorizontalAlignment="Center"
+                               TextAlignment="Center"
+                               TextWrapping="Wrap"
+                               MaxWidth="420" />
+                    <TextBlock x:Name="EmptyDetail"
+                               FontSize="{DynamicResource BodyFontSize}"
+                               Foreground="{DynamicResource MutedTextBrush}"
+                               HorizontalAlignment="Center"
+                               TextAlignment="Center"
+                               TextWrapping="Wrap"
+                               MaxWidth="420"
+                               Margin="0,4,0,0"
+                               Opacity="0.7" />
+                </StackPanel>
+            </Grid>
+            </Border>
+        </Grid>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <!-- Clear history is one of the three sites DestructiveButtonStyle is assigned to by name
+                 (spec §6): it destroys the session log and there is no undo. Nothing in this page is
+                 filled, and that is right — History performs no action, it reports one. The Close
+                 button left with the window (F-013): a shell page is a destination, not a dialog,
+                 and the shell's title bar owns closing. -->
+            <Button x:Name="ClearButton" Content="{loc:Loc SessionHistoryPage_ClearHistory}"
+                    Padding="12,8"
+                    Style="{StaticResource DestructiveButtonStyle}"
+                    Click="OnClearClick" />
+        </StackPanel>
+    </Grid>
+</UserControl>

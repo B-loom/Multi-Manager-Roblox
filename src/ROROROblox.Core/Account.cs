@@ -1,0 +1,44 @@
+namespace ROROROblox.Core;
+
+/// <summary>
+/// Public, sanitized account record — never carries the cookie. The cookie lives only in the
+/// DPAPI-encrypted blob managed by <see cref="IAccountStore"/> and is retrieved on demand via
+/// <see cref="IAccountStore.RetrieveCookieAsync"/>.
+/// </summary>
+public sealed record Account(
+    Guid Id,
+    string DisplayName,
+    string AvatarUrl,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? LastLaunchedAt,
+    bool IsMain = false,
+    int SortOrder = 0,
+    bool IsSelected = true,
+    string? CaptionColorHex = null,
+    int? FpsCap = null,
+    string? LocalName = null,
+    long? RobloxUserId = null,
+    IReadOnlyList<string>? Tags = null,
+    long? BrowserTrackerId = null,
+    bool JoinViaFriend = false,
+    string? StreamerName = null,
+    string? StreamerAvatarId = null,
+    bool AutoRejoin = false,
+    AccountFacts? Facts = null,
+    string? Note = null,
+    bool? PanelExpanded = null)
+{
+    /// <summary>Longest note the store keeps, in characters. Spec 2026-11-01 §2.4.</summary>
+    public const int MaxNoteLength = 200;
+
+    /// <summary>Trim; empty or whitespace becomes null; cap at <see cref="MaxNoteLength"/>. The one rule every path a note enters (the store, the panel's box) applies.</summary>
+    public static string? NormalizeNote(string? note)
+    {
+        if (string.IsNullOrWhiteSpace(note))
+        {
+            return null;
+        }
+        var trimmed = note.Trim();
+        return trimmed.Length > MaxNoteLength ? trimmed[..MaxNoteLength].TrimEnd() : trimmed;
+    }
+}

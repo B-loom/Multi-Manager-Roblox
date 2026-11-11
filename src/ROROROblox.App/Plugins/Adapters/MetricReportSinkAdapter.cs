@@ -1,0 +1,152 @@
+using Microsoft.Extensions.Logging;
+using ROROROblox.Core.Discord;
+using ROROROblox.Core.Metrics;
+
+namespace ROROROblox.App.Plugins.Adapters;
+
+/// <summary>
+/// The seam between "a plugin reported a number" and "the alert system knows". Owns the
+/// <see cref="MetricAlertCoordinator"/>, enforces the opt-in setting, refuses observations from a
+/// clock that disagrees with ours, resolves the subject to the names an alert carries, and RAISES
+/// the resulting triggers rather than sending them — grouped per (metric id, rule) by
+/// <see cref="MetricBreachBatcher"/>, so one plugin read is one alert (2026-09-15).
+///
+/// <para>
+/// Raising is the whole design, and it is why this class does not know what a webhook is.
+/// <c>App</c> wires <see cref="AlertsRaised"/> to <c>AlertDispatcher.DispatchAsync</c>, exactly as
+/// it already wires <c>MainViewModel.AlertsRaised</c>. Everything downstream — per-account mute,
+/// the cooldown (keyed per (account, metric id) for a metric breach, corrected 2026-09-15; every
+/// other kind keeps (account, kind)), coalescing, fallback-to-Local — therefore applies to a metric
+/// breach for free, and cannot be bypassed from here.
+/// </para>
+/// </summary>
+/// <param name="rules">Reads the local rules file (<see cref="ROROROblox.App.Metrics.LocalFileMetricRuleSource"/>)
+/// — the permanent rule source; the signed manifest once planned to replace it was dropped
+/// 2026-09-11. Re-read on every report, so an edited rule takes effect without a restart.</param>
+/// <param name="isEnabled">The opt-in gate, read PER REPORT. A user who turns the feature off must
+/// have it off on the next report, not on the next launch. A func rather than
+/// <c>IAppSettings</c> because this path is synchronous and must not block a gRPC thread on a
+/// file read.</param>
+/// <param name="resolveNames">Account id to (masked display name, real name). Masked comes first
+/// because it is the one nearly every destination gets; only the clan channel is allowed the real
+/// one. Off the UI thread this must read <c>MainViewModel.AccountsSnapshot</c>, never
+/// <c>Accounts</c>.</param>
+/// <param name="isRunningHere">Is this saved account running on THIS PC right now (2026-10-19). A metric
+/// alert names only such accounts; a trigger for an account that is not running here still fires
+/// (the metric crossed its rule on the same numbers) but is marked
+/// <see cref="AlertTrigger.NotRunningHere"/> so the alert text does not send the user to the wrong
+/// machine. Same thread rule as <paramref name="resolveNames"/>: read
+/// <c>MainViewModel.AccountsSnapshot</c>, never <c>Accounts</c>.</param>
+public sealed class MetricReportSinkAdapter(
+    IMetricRuleSource rules,
+    Func<bool> isEnabled,
+    Func<Guid, (string Display, string Real)> resolveNames,
+    Func<Guid, bool> isRunningHere,
+    TimeProvider time,
+    ILogger<MetricReportSinkAdapter> log) : IMetricReportSink, IDisposable
+{
+    /// <summary>
+    /// How far into the host's future a reported instant may sit before it is treated as a skewed
+    /// clock rather than ordinary jitter. A hard "no future instants" rule would reject reports
+    /// from any machine running a second fast, which is most of them; this keeps the check a skew
+    /// detector rather than a clock-synchronisation requirement.
+    /// </summary>
+    private static readonly TimeSpan FutureTolerance = TimeSpan.FromSeconds(30);
+
+    private readonly MetricAlertCoordinator _coordinator = new(time);
+    private readonly MetricBreachBatcher _batcher = new(time, log);
+
+    /// <summary>Fired once per (metric id, rule) group, <see cref="MetricBreachBatcher.Window"/> after
+    /// the group's first breach, on a thread-pool timer thread. <c>App</c> subscribes this to the alert
+    /// dispatcher. Forwarded to the batcher rather than raised here, so every subscriber sees groups and
+    /// no subscriber can see a single ungrouped breach.</summary>
+    public event EventHandler<IReadOnlyList<AlertTrigger>>? AlertsRaised
+    {
+        add => _batcher.Flushed += value;
+        remove => _batcher.Flushed -= value;
+    }
+
+    public void Report(string subjectId, string metricId, double value, long observedAtUnixMs)
+    {
+        try
+        {
+            if (!isEnabled()) return;
+            if (string.IsNullOrWhiteSpace(metricId)) return;
+
+            var observedAt = DateTimeOffset.FromUnixTimeMilliseconds(observedAtUnixMs);
+            var now = time.GetUtcNow();
+
+            if (observedAt - now > FutureTolerance)
+            {
+                // Named out loud because the failure is otherwise invisible and ASYMMETRIC: a
+                // skewed clock puts every sample outside the rate window, so Rate rules go
+                // permanently quiet while Level and Event keep working. "Half the feature stopped"
+                // is indistinguishable from "the feature never worked" without this line.
+                log.LogInformation(
+                    "Dropped a metric report for {MetricId} stamped {Skew} in the future — check the reporter's clock; it is sending local time, not UTC.",
+                    metricId, observedAt - now);
+                return;
+            }
+
+            var active = rules.CurrentRules();
+            if (active.Count == 0) return;
+
+            // Guid.Empty is the documented global carrier, shared with AlertKind.UptimeMark: an
+            // observation that belongs to no account must still reach the user rather than vanish
+            // because a plugin guessed an id wrong.
+            var accountId = Guid.TryParse(subjectId, out var parsed) ? parsed : Guid.Empty;
+            var (display, real) = resolveNames(accountId);
+
+            // Anything past FutureTolerance already returned above without reaching this line, so
+            // "clamped, not dropped" never applies to the case the decision above forbids clamping
+            // for; `now` was captured once, above, and is not re-read here, so this cap can never
+            // land on a report that would have been dropped. What lands here is at most
+            // FutureTolerance of ordinary jitter, and MetricHistory.RatePerMinute windows samples
+            // against ITS OWN now (this same TimeProvider) with a strict "at or before now" filter
+            // — a sample stamped even one tick ahead of that shared now fails that filter on THIS
+            // evaluation and is not lost, just late: MetricHistory.Add is unconditional, so the
+            // sample sits in the series and clears the filter on the next report once the host
+            // clock has caught up to its stamp, at most FutureTolerance later. The real cost is a
+            // systematic one-sample lag — every rate is computed one observation stale, and a
+            // two-sample series produces no rate at all until a third report arrives — for any
+            // machine whose clock runs even a fraction of a second fast, which is most of them,
+            // permanently. Capping the accepted stamp at our own now removes that lag instead of
+            // just tolerating it, without reintroducing a second, uncoordinated definition of "now"
+            // into a class that already has one.
+            var recordedAt = observedAt > now ? now : observedAt;
+
+            _coordinator.SetRules(active);
+            var triggers = _coordinator.Observe(
+                new MetricObservation(accountId, metricId, value, recordedAt), display, real);
+
+            if (triggers.Count == 0) return;
+
+            // Scoping by who is NAMED, not by what is OBSERVED (Este's ruling, 2026-10-19). The
+            // observation above already reached the coordinator unfiltered, so history, Rate series
+            // and the rule's verdict run on exactly the numbers they always did; dropping a not-running
+            // account's row there would have changed the rule's input (a clan-wide Level can cross
+            // while none of this PC's accounts moved) and punched a gap into a Rate series. Only the
+            // alert's text changes: an account that is not running here is marked so WebhookPayload
+            // leaves it out and says so when nobody is left to name. Guid.Empty is the global carrier,
+            // an observation about no account, and has no machine to be wrong about.
+            if (accountId != Guid.Empty && !isRunningHere(accountId))
+                triggers = [.. triggers.Select(t => t with { NotRunningHere = true })];
+
+            _batcher.Add(triggers);
+        }
+        catch (Exception ex)
+        {
+            // Degrade-safe, like every other alert surface: an alert is a passenger. This runs on
+            // a gRPC handler thread and must never take the plugin host down. This also catches
+            // ArgumentOutOfRangeException from DateTimeOffset.FromUnixTimeMilliseconds on a
+            // garbage stamp, so the metric id is named here too, not just on the future-dated path.
+            log.LogWarning(ex, "A metric report for {MetricId} was dropped.", metricId);
+        }
+    }
+
+    /// <summary>Stops the grouping timers and drops any group still inside its window. Called from
+    /// <c>App.OnExit</c> right after the plugin host stops, then again (a no-op) by the container
+    /// (corrected 2026-09-15: until then only the container called it, at the very end of exit).
+    /// A report after this raises nothing.</summary>
+    public void Dispose() => _batcher.Dispose();
+}
