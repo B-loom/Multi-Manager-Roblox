@@ -3192,6 +3192,7 @@ Alerts will arrive in that server — on your phone too, as long as Discord is i
 • New layout: sidebar with every destination, wider window.
 • Library, Settings, History, Diagnostics, Plugins and About open inside the main window instead of a separate one.
 • Language chosen at first launch (English or French); the whole app, changelog included, follows it.
+• New version notification: the app tells you when an update is out and downloads it for you.
 • Updates now come from the Multi Manager Roblox repository.
 • Based on RoRoRo 1.36.0 (MIT license).</value>
   </data>

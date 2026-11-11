@@ -7,6 +7,22 @@
 
 <p align="center"><a href="#français">🇫🇷 Version française plus bas</a></p>
 
+> [!CAUTION]
+> ## ⚠️ USE AT YOUR OWN RISK
+> **The author of this repository is NOT responsible for anything that happens from using this software:** account bans or restrictions, data loss, crashes or any other damage. **Roblox does not officially support running several clients at once.** The software is provided "as is", without any warranty.
+>
+> **🤖 Made by AI:** all the changes in Multi Manager Roblox were **created by Claude**, Anthropic's AI assistant.
+>
+> **📦 Not an original project:** it is a modified version of **RoRoRo** by 626 Labs → https://github.com/estevanhernandez-stack-ed/ROROROblox
+
+> [!CAUTION]
+> ## ⚠️ UTILISATION À VOS RISQUES
+> **L'auteur de ce dépôt N'EST PAS responsable de ce qui peut arriver en utilisant ce logiciel :** bannissement ou restriction de compte, perte de données, plantage ou tout autre dommage. **Roblox ne prend pas officiellement en charge plusieurs clients en même temps.** Le logiciel est fourni « tel quel », sans aucune garantie.
+>
+> **🤖 Créé par une IA :** toutes les modifications de Multi Manager Roblox ont été **créées par Claude**, l'assistant IA d'Anthropic.
+>
+> **📦 Pas un projet original :** c'est une version modifiée de **RoRoRo** de 626 Labs → https://github.com/estevanhernandez-stack-ed/ROROROblox
+
 ---
 
 ## English

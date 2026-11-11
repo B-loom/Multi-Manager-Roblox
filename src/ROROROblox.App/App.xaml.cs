@@ -882,8 +882,9 @@ public partial class App : Application
 
         try
         {
-            var updateChecker = _services.GetRequiredService<IUpdateChecker>();
-            await updateChecker.CheckForUpdatesAsync();
+            // Multi Manager Roblox: tell the user about a new release and offer to download it,
+            // instead of RoRoRo's silent download-and-apply-on-exit.
+            await Updates.ReleaseNotifier.CheckAndPromptAsync(_services.GetRequiredService<MainWindow>());
         }
         catch (Exception ex)
         {

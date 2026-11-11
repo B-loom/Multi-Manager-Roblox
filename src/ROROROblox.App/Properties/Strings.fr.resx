@@ -3726,6 +3726,7 @@ Les alertes arriveront sur ce serveur — sur votre téléphone aussi, tant que 
 • Nouvelle disposition : barre latérale avec toutes les pages, fenêtre plus large.
 • Bibliothèque, Paramètres, Historique, Diagnostics, Plugins et À propos s'ouvrent dans la fenêtre principale au lieu d'une fenêtre séparée.
 • Langue choisie au premier lancement (anglais ou français) ; toute l'application, changelog compris, la suit.
+• Notification de nouvelle version : l'application vous prévient quand une mise à jour sort et la télécharge pour vous.
 • Les mises à jour viennent désormais du dépôt Multi Manager Roblox.
 • Basé sur RoRoRo 1.36.0 (licence MIT).</value>
   </data>

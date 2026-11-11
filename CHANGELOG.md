@@ -12,6 +12,7 @@ Semantic versioning. / Versionnage sémantique.
 - New layout: sidebar with every destination, wider window.
 - Language chosen at first launch (English or French); the whole app, changelog included, follows it.
 - Changelog and website link on the About page.
+- New version notification: the app tells you when an update is out and downloads it for you.
 
 **Changed**
 - Library, Settings, History, Diagnostics, Plugins and About open inside the main window instead of a separate one.
@@ -32,6 +33,7 @@ Based on RoRoRo 1.36.0 by 626 Labs (MIT license).
 - Nouvelle disposition : barre latérale avec toutes les pages, fenêtre plus large.
 - Langue choisie au premier lancement (anglais ou français) ; toute l'application, changelog compris, la suit.
 - Changelog et lien vers le site sur la page À propos.
+- Notification de nouvelle version : l'application vous prévient quand une mise à jour sort et la télécharge pour vous.
 
 **Modifié**
 - Bibliothèque, Paramètres, Historique, Diagnostics, Plugins et À propos s'ouvrent dans la fenêtre principale au lieu d'une fenêtre séparée.
