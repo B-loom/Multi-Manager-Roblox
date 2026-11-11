@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi Manager Roblox</title>
+<meta name="description" content="Run several Roblox clients side by side, each signed in as a different account.">
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07041a;--card:rgba(26,16,64,.62);--line:rgba(182,156,255,.18);--fg:#f1edff;--sub:#a59cc8;--v:#b69cff;--p:#ff8fe0;--grad:linear-gradient(120deg,#b69cff,#ff8fe0)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 Inter,system-ui,sans-serif;overflow-x:hidden}
+html[data-lang=en] [lang=fr],html[data-lang=fr] [lang=en]{display:none!important}
+/* sky */
+.sky{position:fixed;inset:0;z-index:-1;background:
+ radial-gradient(60vw 60vw at 85% -10%,rgba(123,63,228,.42),transparent 60%),
+ radial-gradient(55vw 55vw at -10% 110%,rgba(255,95,210,.22),transparent 60%),
+ radial-gradient(40vw 40vw at 50% 55%,rgba(60,40,160,.18),transparent 70%),var(--bg)}
+.stars,.stars2{position:fixed;inset:-50%;z-index:-1;background-image:
+ radial-gradient(1px 1px at 20px 30px,#fff,transparent),radial-gradient(1px 1px at 120px 80px,#cbbcff,transparent),
+ radial-gradient(1.5px 1.5px at 200px 160px,#fff,transparent),radial-gradient(1px 1px at 60px 210px,#ffd6f3,transparent),
+ radial-gradient(1px 1px at 260px 20px,#fff,transparent);background-size:300px 260px;opacity:.55;animation:drift 160s linear infinite}
+.stars2{background-size:520px 470px;opacity:.35;animation-duration:260s}
+@keyframes drift{to{transform:translateY(260px)}}
+@media (prefers-reduced-motion:reduce){.stars,.stars2{animation:none}}
+.wrap{max-width:1040px;margin:0 auto;padding:0 20px}
+nav{display:flex;align-items:center;justify-content:space-between;padding:18px 0}
+.brand{display:flex;align-items:center;gap:10px;font:700 17px 'Space Grotesk',sans-serif;color:var(--fg);text-decoration:none}
+.brand img{width:34px;height:34px}
+.navr{display:flex;gap:6px;align-items:center}
+.navr a{color:var(--sub);text-decoration:none;padding:6px 10px;border-radius:10px;font-size:14px}
+.navr a:hover{color:var(--fg);background:rgba(182,156,255,.1)}
+.lang{display:flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin-left:6px}
+.lang button{background:none;border:0;color:var(--sub);font:600 13px Inter;padding:6px 12px;cursor:pointer}
+.lang button.on{background:var(--grad);color:#14092e}
+.hero{text-align:center;padding:56px 0 40px}
+.hero img{width:170px;height:170px;filter:drop-shadow(0 18px 50px rgba(150,100,255,.45));animation:float 7s ease-in-out infinite}
+@keyframes float{50%{transform:translateY(-10px) rotate(-2deg)}}
+h1{font:700 clamp(38px,7vw,68px)/1.05 'Space Grotesk',sans-serif;margin:18px 0 12px;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:clamp(17px,2.4vw,20px);color:var(--sub);max-width:620px;margin:0 auto 28px}
+.btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:13px 22px;border-radius:14px;font-weight:600;text-decoration:none;color:var(--fg);border:1px solid var(--line);background:rgba(26,16,64,.5);transition:transform .2s,box-shadow .2s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 10px 30px rgba(150,100,255,.25)}
+.btn.main{background:var(--grad);color:#14092e;border:0}
+.btn.off{opacity:.55;cursor:default}.btn.off:hover{transform:none;box-shadow:none}
+.ver{margin-top:22px;display:inline-flex;gap:10px;align-items:center;padding:7px 14px;border:1px solid var(--line);border-radius:999px;font-size:14px;color:var(--sub);background:rgba(26,16,64,.4)}
+.ver b{color:var(--fg)}.ver a{color:var(--v)}
+.meta{color:var(--sub);font-size:13px;margin-top:10px}
+section{padding:46px 0}
+h2{font:700 30px 'Space Grotesk',sans-serif;margin:0 0 22px}
+h2 span.g{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;backdrop-filter:blur(8px)}
+.card h3{margin:0 0 6px;font:600 18px 'Space Grotesk',sans-serif}
+.card p{margin:0;color:var(--sub);font-size:15px}
+.ico{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:rgba(182,156,255,.14);margin-bottom:12px;font-size:20px}
+ol{padding-left:20px;margin:0}ol li{margin:6px 0;color:var(--sub)}ol li b{color:var(--fg)}
+code,pre{font-family:ui-monospace,Consolas,monospace}
+code{background:rgba(182,156,255,.12);padding:2px 7px;border-radius:7px;font-size:14px;color:var(--fg)}
+pre{white-space:pre-wrap;color:var(--sub);font-size:13px;margin:0}
+.log h3{display:flex;align-items:center;gap:10px;margin:0 0 4px;font:700 22px 'Space Grotesk',sans-serif}
+.tag{font:600 12px Inter;padding:3px 9px;border-radius:999px;background:var(--grad);color:#14092e}
+.log h4{margin:16px 0 6px;color:var(--v);font-size:14px;text-transform:uppercase;letter-spacing:.08em}
+.log ul{margin:0;padding-left:20px}.log li{margin:5px 0;color:var(--sub)}
+.warn{border-color:rgba(255,143,224,.4)}
+.warn h3{color:var(--p)}
+.warn p+p{margin-top:12px}
+footer{padding:36px 0 50px;color:var(--sub);font-size:14px;text-align:center;border-top:1px solid var(--line);margin-top:30px}
+footer a{color:var(--v)}
+@media (max-width:640px){.navr a.hide{display:none}.hero{padding-top:30px}}
+</style>
+</head>
+<body>
+<div class="sky"></div><div class="stars"></div><div class="stars2"></div>
+<div class="wrap">
+<nav>
+  <a class="brand" href="#"><img src="logo.png" alt="">Multi Manager Roblox</a>
+  <div class="navr">
+    <a class="hide" href="#features"><span lang="en">Features</span><span lang="fr">Fonctions</span></a>
+    <a class="hide" href="#changelog">Changelog</a>
+    <a class="hide" href="#license"><span lang="en">License</span><span lang="fr">Licence</span></a>
+    <div class="lang"><button data-set="en">EN</button><button data-set="fr">FR</button></div>
+  </div>
+</nav>
+
+<header class="hero">
+  <img src="logo.png" alt="Multi Manager Roblox logo">
+  <h1>Multi Manager Roblox</h1>
+  <p class="lead"><span lang="en">Run several Roblox clients side by side, each signed in as a different account. All in one galaxy-themed window.</span><span lang="fr">Lancez plusieurs clients Roblox côte à côte, chacun connecté avec un compte différent. Le tout dans une seule fenêtre au thème galaxy.</span></p>
+  <div class="btns">
+    <span class="btn main off" title="Coming soon"><span lang="en">Installer coming soon</span><span lang="fr">Installateur bientôt disponible</span></span>
+    <a class="btn" href="https://github.com/B-loom/Multi-Manager-Roblox"><span lang="en">Source code</span><span lang="fr">Code source</span></a>
+  </div>
+  <div class="ver"><span lang="en">Version</span><span lang="fr">Version</span> <b>1.0.0</b> · <a href="#changelog"><span lang="en">What's new</span><span lang="fr">Nouveautés</span></a></div>
+  <p class="meta"><span lang="en">Windows 10 / 11 · English and French</span><span lang="fr">Windows 10 / 11 · anglais et français</span></p>
+</header>
+
+<section id="features">
+  <h2><span lang="en">What it <span class="g">does</span></span><span lang="fr">Ce que fait <span class="g">l'application</span></span></h2>
+  <div class="grid">
+    <div class="card"><div class="ico">🪐</div><h3>Multi-instance</h3><p><span lang="en">Open as many Roblox clients as you want at the same time.</span><span lang="fr">Ouvrez autant de clients Roblox que vous voulez en même temps.</span></p></div>
+    <div class="card"><div class="ico">👥</div><h3><span lang="en">Accounts</span><span lang="fr">Comptes</span></h3><p><span lang="en">Save your accounts, name them, launch each one in its own client. Sign-in happens on Roblox's own page.</span><span lang="fr">Enregistrez vos comptes, nommez-les, lancez chacun dans son propre client. La connexion se fait sur la page de Roblox.</span></p></div>
+    <div class="card"><div class="ico">🎮</div><h3><span lang="en">Library</span><span lang="fr">Bibliothèque</span></h3><p><span lang="en">Save games and private servers, then launch an account straight into them.</span><span lang="fr">Enregistrez des jeux et des serveurs privés, puis lancez un compte directement dedans.</span></p></div>
+    <div class="card"><div class="ico">🚀</div><h3><span lang="en">Squad Launch</span><span lang="fr">Lancement en équipe</span></h3><p><span lang="en">Launch several accounts one after another, without them fighting each other.</span><span lang="fr">Lancez plusieurs comptes l'un après l'autre, sans qu'ils se gênent.</span></p></div>
+    <div class="card"><div class="ico">✨</div><h3><span lang="en">One window</span><span lang="fr">Une seule fenêtre</span></h3><p><span lang="en">Library, Settings, History, Diagnostics and Plugins open in the main window, from the sidebar.</span><span lang="fr">Bibliothèque, Paramètres, Historique, Diagnostics et Plugins s'ouvrent dans la fenêtre principale, depuis la barre latérale.</span></p></div>
+    <div class="card"><div class="ico">🌐</div><h3><span lang="en">English or French</span><span lang="fr">Anglais ou français</span></h3><p><span lang="en">Chosen at first launch. The whole app, changelog included, follows it.</span><span lang="fr">Choisie au premier lancement. Toute l'application, changelog compris, la suit.</span></p></div>
+  </div>
+</section>
+
+<section id="install">
+  <h2><span lang="en">Getting <span class="g">it</span></span><span lang="fr">L'<span class="g">obtenir</span></span></h2>
+  <div class="card">
+    <p style="margin-bottom:14px"><span lang="en">No installer is published yet. Until then, build it from the source code:</span><span lang="fr">Aucun installateur n'est encore publié. En attendant, compilez-le depuis le code source :</span></p>
+    <ol>
+      <li><span lang="en">Install the <b>.NET 10 SDK</b>.</span><span lang="fr">Installez le <b>SDK .NET 10</b>.</span></li>
+      <li><span lang="en">Download the source code, then run</span><span lang="fr">Téléchargez le code source, puis lancez</span> <code>dotnet build ROROROblox.slnx -c Release</code></li>
+      <li><span lang="en">Start</span><span lang="fr">Démarrez</span> <code>ROROROblox.App.exe</code> <span lang="en">from</span><span lang="fr">depuis</span> <code>src\ROROROblox.App\bin\Release\…</code></li>
+    </ol>
+  </div>
+</section>
+
+<section id="changelog" class="log">
+  <h2>Changelog</h2>
+  <div class="card">
+    <h3>1.0.0 <span class="tag">2026-11-11</span></h3>
+    <h4><span lang="en">Added</span><span lang="fr">Ajouté</span></h4>
+    <ul lang="en">
+      <li>New name: Multi Manager Roblox, with its own logo and icon.</li>
+      <li>Galaxy theme: violet palette, nebula glows and a starfield background.</li>
+      <li>New layout: sidebar with every destination, wider window.</li>
+      <li>Language chosen at first launch (English or French); the whole app, changelog included, follows it.</li>
+      <li>Changelog and website link on the About page.</li>
+    </ul>
+    <ul lang="fr">
+      <li>Nouveau nom : Multi Manager Roblox, avec son propre logo et sa propre icône.</li>
+      <li>Thème Galaxy : palette violette, nébuleuses et fond étoilé.</li>
+      <li>Nouvelle disposition : barre latérale avec toutes les pages, fenêtre plus large.</li>
+      <li>Langue choisie au premier lancement (anglais ou français) ; toute l'application, changelog compris, la suit.</li>
+      <li>Changelog et lien vers le site sur la page À propos.</li>
+    </ul>
+    <h4><span lang="en">Changed</span><span lang="fr">Modifié</span></h4>
+    <ul lang="en">
+      <li>Library, Settings, History, Diagnostics, Plugins and About open inside the main window instead of a separate one.</li>
+      <li>Rounded buttons, gradient main button, translucent header and footer.</li>
+      <li>Updates now come from the Multi Manager Roblox repository.</li>
+    </ul>
+    <ul lang="fr">
+      <li>Bibliothèque, Paramètres, Historique, Diagnostics, Plugins et À propos s'ouvrent dans la fenêtre principale au lieu d'une fenêtre séparée.</li>
+      <li>Boutons arrondis, bouton principal en dégradé, en-tête et pied de page translucides.</li>
+      <li>Les mises à jour viennent désormais du dépôt Multi Manager Roblox.</li>
+    </ul>
+    <p style="margin-top:14px;color:var(--sub);font-size:14px"><span lang="en">Based on RoRoRo 1.36.0 by 626 Labs (MIT license).</span><span lang="fr">Basé sur RoRoRo 1.36.0 de 626 Labs (licence MIT).</span></p>
+  </div>
+</section>
+
+<section id="warning">
+  <h2><span lang="en">Read this <span class="g">first</span></span><span lang="fr">À lire <span class="g">avant</span></span></h2>
+  <div class="card warn">
+    <h3><span lang="en">No responsibility is taken.</span><span lang="fr">Aucune responsabilité n'est assumée.</span></h3>
+    <p><span lang="en">The author is not responsible for anything that happens from using this software: account bans or restrictions, lost data, crashes or any other damage. Roblox does not officially support running several clients at once. You use it at your own risk.</span><span lang="fr">L'auteur n'est responsable de rien de ce qui peut arriver en utilisant ce logiciel : bannissement ou restriction de compte, perte de données, plantage ou tout autre dommage. Roblox ne prend pas officiellement en charge plusieurs clients en même temps. Vous l'utilisez à vos risques.</span></p>
+    <p><span lang="en"><b>Not an original project.</b> Multi Manager Roblox is a modified version of <a style="color:var(--v)" href="https://github.com/estevanhernandez-stack-ed/ROROROblox">RoRoRo by 626 Labs</a>, which deserves the credit for the underlying work.</span><span lang="fr"><b>Ce n'est pas un projet original.</b> Multi Manager Roblox est une version modifiée de <a style="color:var(--v)" href="https://github.com/estevanhernandez-stack-ed/ROROROblox">RoRoRo de 626 Labs</a>, à qui revient le mérite du travail de fond.</span></p>
+    <p><span lang="en"><b>Made with Claude.</b> All the changes were created by Claude, Anthropic's AI assistant.</span><span lang="fr"><b>Créé avec Claude.</b> Toutes les modifications ont été créées par Claude, l'assistant IA d'Anthropic.</span></p>
+  </div>
+</section>
+
+<section id="license">
+  <h2><span lang="en">License</span><span lang="fr">Licence</span></h2>
+  <div class="card"><pre>MIT License
+
+Copyright (c) 2026 626 Labs LLC
+Copyright (c) 2026 B-loom (Multi Manager Roblox modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.</pre></div>
+</section>
+</div>
+<footer><div class="wrap">Multi Manager Roblox 1.0.0 · <a href="https://github.com/B-loom/Multi-Manager-Roblox">GitHub</a> · <span lang="en">Not affiliated with Roblox Corporation. Roblox is a trademark of Roblox Corporation.</span><span lang="fr">Non affilié à Roblox Corporation. Roblox est une marque de Roblox Corporation.</span></div></footer>
+<script>
+(function(){
+  var root=document.documentElement,btns=document.querySelectorAll('.lang button');
+  function set(l){root.setAttribute('data-lang',l);root.lang=l;btns.forEach(function(b){b.classList.toggle('on',b.dataset.set===l)});try{localStorage.setItem('mmr-lang',l)}catch(e){}}
+  var saved=null;try{saved=localStorage.getItem('mmr-lang')}catch(e){}
+  set(saved==='fr'?'fr':'en');
+  btns.forEach(function(b){b.addEventListener('click',function(){set(b.dataset.set)})});
+})();
+</script>
+</body>
+</html>
