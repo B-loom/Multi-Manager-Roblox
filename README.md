@@ -39,14 +39,11 @@
 
 ### Install
 
-No installer is published yet. To build it yourself:
+1. Download **[MultiManagerRoblox-win-Setup.exe](https://github.com/B-loom/Multi-Manager-Roblox/releases/latest/download/MultiManagerRoblox-win-Setup.exe)** (latest release).
+2. Run it. Windows SmartScreen may warn you because the app is not signed with a paid certificate: click **More info**, then **Run anyway**.
+3. The app installs and opens by itself. New versions are offered inside the app.
 
-1. Install the [.NET 10 SDK](https://dotnet.microsoft.com/download).
-2. Run:
-   ```powershell
-   dotnet build ROROROblox.slnx -c Release
-   ```
-3. Start `src\ROROROblox.App\bin\Release\net10.0-windows10.0.19041.0\ROROROblox.App.exe`.
+To build from source instead: install the [.NET 10 SDK](https://dotnet.microsoft.com/download), then run `dotnet build ROROROblox.slnx -c Release`.
 
 ### Use
 
@@ -86,14 +83,11 @@ The original project is **RoRoRo** by 626 Labs: https://github.com/estevanhernan
 
 ### Installation
 
-Aucun installateur n'est encore publié. Pour compiler vous-même :
+1. Téléchargez **[MultiManagerRoblox-win-Setup.exe](https://github.com/B-loom/Multi-Manager-Roblox/releases/latest/download/MultiManagerRoblox-win-Setup.exe)** (dernière version).
+2. Lancez-le. Windows SmartScreen peut afficher un avertissement car l'application n'est pas signée avec un certificat payant : cliquez sur **Informations complémentaires**, puis **Exécuter quand même**.
+3. L'application s'installe et s'ouvre toute seule. Les nouvelles versions vous sont proposées dans l'application.
 
-1. Installez le [SDK .NET 10](https://dotnet.microsoft.com/download).
-2. Lancez :
-   ```powershell
-   dotnet build ROROROblox.slnx -c Release
-   ```
-3. Démarrez `src\ROROROblox.App\bin\Release\net10.0-windows10.0.19041.0\ROROROblox.App.exe`.
+Pour compiler depuis le code source : installez le [SDK .NET 10](https://dotnet.microsoft.com/download), puis lancez `dotnet build ROROROblox.slnx -c Release`.
 
 ### Utilisation
 
