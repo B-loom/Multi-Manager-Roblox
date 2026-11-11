@@ -45,6 +45,14 @@
 
 To build from source instead: install the [.NET 10 SDK](https://dotnet.microsoft.com/download), then run `dotnet build ROROROblox.slnx -c Release`.
 
+### Uninstall
+
+1. Quit the app, including its icon next to the clock (right-click → Quit).
+2. Open **Windows Settings → Apps → Installed apps**, find **Multi Manager Roblox**, then **⋯ → Uninstall**.
+   - Not in the list? Close Settings completely and reopen it, or press **Win + R**, type `appwiz.cpl` and press Enter.
+   - Or press **Win + R** and run: `"%LOCALAPPDATA%\MultiManagerRoblox\Update.exe" --uninstall`
+3. Your accounts and settings stay in `%LOCALAPPDATA%\ROROROblox`. Delete that folder too to remove everything (it is shared with RoRoRo if you also use it).
+
 ### Use
 
 1. On first launch, pick **English** or **Français**.
@@ -88,6 +96,14 @@ The original project is **RoRoRo** by 626 Labs: https://github.com/estevanhernan
 3. L'application s'installe et s'ouvre toute seule. Les nouvelles versions vous sont proposées dans l'application.
 
 Pour compiler depuis le code source : installez le [SDK .NET 10](https://dotnet.microsoft.com/download), puis lancez `dotnet build ROROROblox.slnx -c Release`.
+
+### Désinstallation
+
+1. Quittez l'application, y compris son icône près de l'horloge (clic droit → Quitter).
+2. Ouvrez **Paramètres Windows → Applications → Applications installées**, cherchez **Multi Manager Roblox**, puis **⋯ → Désinstaller**.
+   - Pas dans la liste ? Fermez complètement Paramètres et rouvrez-le, ou faites **Win + R**, tapez `appwiz.cpl` puis Entrée.
+   - Ou faites **Win + R** et lancez : `"%LOCALAPPDATA%\MultiManagerRoblox\Update.exe" --uninstall`
+3. Vos comptes et réglages restent dans `%LOCALAPPDATA%\ROROROblox`. Supprimez aussi ce dossier pour tout effacer (il est partagé avec RoRoRo si vous l'utilisez aussi).
 
 ### Utilisation
 
